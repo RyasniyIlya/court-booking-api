@@ -1,0 +1,237 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  CANCELLED
+}
+
+enum BookingSource {
+  WIDGET
+  ADMIN
+}
+
+enum UserRole {
+  OWNER
+  ADMIN
+}
+
+/// Спортивний клуб = один тенант SaaS
+model Club {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String   @unique
+  /// IANA-таймзона, напр. "Europe/Kyiv". Уся конвертація рахується від неї.
+  timezone  String   @default("Europe/Kyiv")
+  phone     String?
+  /// Крок сітки за замовчуванням, хв
+  slotMinutes Int    @default(60)
+  /// За скільки хвилин до старту ще можна забронювати онлайн
+  leadTimeMinutes Int @default(60)
+  /// На скільки днів уперед відкрита сітка
+  horizonDays Int    @default(14)
+  /// Чи бронь одразу CONFIRMED, чи чекає підтвердження адміна
+  autoConfirm Boolean @default(true)
+  /// Куди слати сповіщення про нову бронь
+  telegramChatId String?
+
+  isActive    Boolean  @default(true)
+  trialEndsAt DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  courts    Court[]
+  hours     ClubHours[]
+  bookings  Booking[]
+  blocks    Block[]
+  users     User[]
+  customers Customer[]
+  passes    Pass[]
+}
+
+/// Розклад роботи по днях тижня (0 = неділя ... 6 = субота)
+model ClubHours {
+  id        String @id @default(uuid()) @db.Uuid
+  clubId    String @db.Uuid
+  club      Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  weekday   Int
+  /// Хвилини від опівночі за локальним часом клубу: 08:00 -> 480
+  openMinute  Int
+  closeMinute Int
+  isClosed    Boolean @default(false)
+
+  @@unique([clubId, weekday])
+}
+
+model Court {
+  id        String  @id @default(uuid()) @db.Uuid
+  clubId    String  @db.Uuid
+  club      Club    @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  name      String
+  /// Ціна за годину в копійках. 45000 = 450,00 грн
+  pricePerHour Int  @default(0)
+  /// Перевизначає Club.slotMinutes, якщо задано
+  slotMinutes Int?
+  sortOrder Int     @default(0)
+  isActive  Boolean @default(true)
+
+  bookings  Booking[]
+  blocks    Block[]
+
+  @@index([clubId, isActive])
+}
+
+model Booking {
+  id        String  @id @default(uuid()) @db.Uuid
+  /// Денормалізовано навмисно: усі адмінські вибірки йдуть по клубу
+  clubId    String  @db.Uuid
+  club      Club    @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  courtId   String  @db.Uuid
+  court     Court   @relation(fields: [courtId], references: [id], onDelete: Cascade)
+
+  /// Копія на момент броні — імʼя в картці клієнта може змінитись пізніше
+  customerName  String
+  /// Нормалізований E.164
+  customerPhone String
+  comment       String?
+
+  /// Картка клієнта. Nullable: історичні броні до впровадження обліку
+  customerId String?   @db.Uuid
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  /// Завжди UTC
+  startTime DateTime @db.Timestamptz(3)
+  endTime   DateTime @db.Timestamptz(3)
+
+  status    BookingStatus @default(CONFIRMED)
+  source    BookingSource @default(WIDGET)
+  /// Зафіксована ціна на момент броні, копійки
+  priceTotal Int          @default(0)
+  /// Токен для самостійного скасування клієнтом за посиланням
+  cancelToken String      @unique @default(uuid())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  cancelledAt DateTime?
+
+  @@index([clubId, startTime])
+  @@index([courtId, startTime])
+}
+
+/// Блокування часу: ремонт, турнір, тривога, техперерва
+model Block {
+  id        String  @id @default(uuid()) @db.Uuid
+  clubId    String  @db.Uuid
+  club      Club    @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  /// null = блокується весь клуб
+  courtId   String? @db.Uuid
+  court     Court?  @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  reason    String?
+  startTime DateTime @db.Timestamptz(3)
+  endTime   DateTime @db.Timestamptz(3)
+
+  createdAt DateTime @default(now())
+
+  @@index([clubId, startTime])
+}
+
+model User {
+  id           String   @id @default(uuid()) @db.Uuid
+  clubId       String   @db.Uuid
+  club         Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  email        String   @unique
+  passwordHash String
+  role         UserRole @default(OWNER)
+  createdAt    DateTime @default(now())
+}
+
+enum PassType {
+  /// Пакет занять: 10 тренувань
+  PACKAGE
+  /// Безліміт на період: місяць
+  UNLIMITED
+}
+
+/// Картка учасника клубу. Створюється автоматично при першій броні —
+/// жодної реєстрації з боку клієнта не потрібно, ідентифікатор = телефон.
+model Customer {
+  id     String @id @default(uuid()) @db.Uuid
+  clubId String @db.Uuid
+  club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+
+  name  String
+  /// Нормалізований E.164, напр. +380671234567
+  phone String
+  /// Останні 7 цифр — пошук на ресепшені за 4+ цифрами
+  phoneTail String
+
+  telegramChatId String?
+  note           String?
+  /// Чорний список: не пускати онлайн-бронювання
+  isBlocked Boolean @default(false)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bookings Booking[]
+  passes   Pass[]
+
+  /// Телефон унікальний у межах клубу, а не глобально:
+  /// одна людина може ходити у два клуби — це різні картки.
+  @@unique([clubId, phone])
+  @@index([clubId, phoneTail])
+}
+
+model Pass {
+  id         String   @id @default(uuid()) @db.Uuid
+  clubId     String   @db.Uuid
+  club       Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  customerId String   @db.Uuid
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  type PassType
+
+  /// Для PACKAGE: скільки занять куплено. Для UNLIMITED — null
+  totalSessions Int?
+  /// Скільки використано. Списання = інкремент, тому історія не втрачається
+  usedSessions  Int @default(0)
+
+  validFrom  DateTime @db.Timestamptz(3)
+  validUntil DateTime @db.Timestamptz(3)
+
+  /// Сплачено, копійки
+  price Int @default(0)
+
+  createdAt DateTime @default(now())
+  /// Скасований адміном достроково
+  revokedAt DateTime?
+
+  usages PassUsage[]
+
+  @@index([clubId, customerId])
+  @@index([clubId, validUntil])
+}
+
+/// Кожне списання — окремий запис. Дозволяє скасувати списання,
+/// показати клієнту історію і не сперечатись з ним «я не ходив».
+model PassUsage {
+  id        String   @id @default(uuid()) @db.Uuid
+  passId    String   @db.Uuid
+  pass      Pass     @relation(fields: [passId], references: [id], onDelete: Cascade)
+  /// Бронь, за яку списано. Null = списано вручну адміном
+  bookingId String?  @unique @db.Uuid
+  usedAt    DateTime @default(now())
+  /// Хто списав: SYSTEM або email адміна
+  by        String   @default("SYSTEM")
+  revertedAt DateTime?
+
+  @@index([passId])
+}

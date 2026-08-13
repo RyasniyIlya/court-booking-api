@@ -1,0 +1,16 @@
+# Render Blueprint. Підключаєш репозиторій — сервіс піднімається сам.
+services:
+  - type: web
+    name: court-booking-api
+    runtime: docker
+    plan: starter
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        sync: false        # вставити рядок з Neon вручну в дашборді
+      - key: JWT_SECRET
+        generateValue: true
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: PORT
+        value: 3000
