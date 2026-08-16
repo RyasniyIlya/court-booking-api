@@ -8,9 +8,21 @@ datasource db {
 }
 
 enum BookingStatus {
+  /// Або чекає підтвердження адміна, або чекає оплати (тоді заповнено expiresAt)
   PENDING
   CONFIRMED
   CANCELLED
+  /// Не оплатив за відведений час. Слот звільняється — EXCLUDE-констрейнт
+  /// не рахує EXPIRED зайнятим.
+  EXPIRED
+}
+
+enum PaymentStatus {
+  PENDING
+  PAID
+  FAILED
+  EXPIRED
+  REFUNDED
 }
 
 enum BookingSource {
@@ -30,7 +42,13 @@ model Club {
   slug      String   @unique
   /// IANA-таймзона, напр. "Europe/Kyiv". Уся конвертація рахується від неї.
   timezone  String   @default("Europe/Kyiv")
+  /// Телефон адміністратора. Показується у шапці віджета посиланням tel:
   phone     String?
+  /// Адреса клубу для шапки віджета: "Київ, вул. Хрещатик, 1"
+  address   String?
+  /// Логотип для шапки віджета. Абсолютний https-URL на чужому хостингу
+  /// або на боці клубу — файли ми не зберігаємо.
+  logoUrl   String?
   /// Крок сітки за замовчуванням, хв
   slotMinutes Int    @default(60)
   /// За скільки хвилин до старту ще можна забронювати онлайн
@@ -41,6 +59,17 @@ model Club {
   autoConfirm Boolean @default(true)
   /// Куди слати сповіщення про нову бронь
   telegramChatId String?
+
+  // ── Передоплата ──────────────────────────────────────────────────────
+  /// Увімкнена передоплата 100%: бронь підтверджується тільки після оплати
+  prepayEnabled Boolean @default(false)
+  /// 'mono' | 'mock'. mock — заглушка для локальної розробки
+  paymentProvider String?
+  /// Токен еквайрингу КЛУБУ, зашифрований AES-256-GCM (див. src/lib/crypto.ts).
+  /// Гроші йдуть на рахунок клубу, ми не посередник у розрахунках.
+  paymentTokenEnc String?
+  /// Скільки хвилин тримати слот під неоплачену бронь
+  payHoldMinutes Int @default(15)
 
   isActive    Boolean  @default(true)
   trialEndsAt DateTime?
@@ -55,6 +84,37 @@ model Club {
   users     User[]
   customers Customer[]
   passes    Pass[]
+  payments  Payment[]
+  trainers  Trainer[]
+}
+
+/// Тренер клубу.
+///
+/// Робочих годин і відпусток свідомо не ведемо — клуб сам знає, хто коли
+/// працює, а повноцінний розклад тренерів це вже CRM, куди ми не лізем.
+/// Від накладок захищає перевірка при створенні броні (див. routes/public.ts):
+/// у віджеті видно тільки вільних на цю годину.
+model Trainer {
+  id     String @id @default(uuid()) @db.Uuid
+  clubId String @db.Uuid
+  club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+
+  name  String
+  phone String?
+  /// Ставка за годину в копійках. Додається до ціни корту.
+  pricePerHour Int @default(0)
+  /// Для адміністратора: «дитяча група», «тільки падел»
+  note String?
+
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  bookings Booking[]
+
+  @@index([clubId, isActive])
 }
 
 /// Розклад роботи по днях тижня (0 = неділя ... 6 = субота)
@@ -107,6 +167,14 @@ model Booking {
   customerId String?   @db.Uuid
   customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
 
+  /// Тренер на це заняття. null = грають самі.
+  /// SetNull, а не Cascade: звільнення тренера не має стирати історію броней.
+  trainerId String?  @db.Uuid
+  trainer   Trainer? @relation(fields: [trainerId], references: [id], onDelete: SetNull)
+  /// Скільки з priceTotal — робота тренера. Зафіксовано на момент броні:
+  /// ставка тренера може змінитись, а сплачено було стільки.
+  trainerPrice Int @default(0)
+
   /// Завжди UTC
   startTime DateTime @db.Timestamptz(3)
   endTime   DateTime @db.Timestamptz(3)
@@ -115,8 +183,16 @@ model Booking {
   source    BookingSource @default(WIDGET)
   /// Зафіксована ціна на момент броні, копійки
   priceTotal Int          @default(0)
-  /// Токен для самостійного скасування клієнтом за посиланням
+  /// Токен для самостійного скасування клієнтом за посиланням.
+  /// Ним же віджет питає статус оплати після повернення з платіжки.
   cancelToken String      @unique @default(uuid())
+
+  /// Заповнено тільки для броні, що чекає оплати. Після цього моменту
+  /// фонова задача переведе бронь у EXPIRED і слот звільниться.
+  /// null = звичайна бронь, яка не протухає.
+  expiresAt DateTime? @db.Timestamptz(3)
+
+  payment Payment?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -124,6 +200,45 @@ model Booking {
 
   @@index([clubId, startTime])
   @@index([courtId, startTime])
+  @@index([status, expiresAt])
+  @@index([trainerId, startTime])
+}
+
+/// Платіж за бронь. Один до одного: часткових оплат немає — 100% передоплата.
+model Payment {
+  id        String @id @default(uuid()) @db.Uuid
+  clubId    String @db.Uuid
+  club      Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  bookingId String  @unique @db.Uuid
+  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  /// 'mono' | 'mock'
+  provider String
+  /// invoiceId на боці провайдера
+  providerRef String
+  /// Сторінка оплати, куди відправляємо гравця
+  pageUrl String?
+
+  /// Копійки. Дублюємо суму броні навмисно: ціна корту може змінитись,
+  /// а сплачено було стільки.
+  amount Int
+  /// ISO 4217, 980 = гривня
+  ccy    Int @default(980)
+
+  status PaymentStatus @default(PENDING)
+  /// modifiedDate з вебхука. Провайдер не гарантує порядок доставки,
+  /// тому старіший вебхук не має перетирати новіший стан.
+  providerAt DateTime?
+  paidAt     DateTime?
+  refundedAt DateTime?
+  failReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Захист від повторної обробки того самого інвойса
+  @@unique([provider, providerRef])
+  @@index([clubId, status])
 }
 
 /// Блокування часу: ремонт, турнір, тривога, техперерва

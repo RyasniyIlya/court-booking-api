@@ -5,6 +5,7 @@ import { prisma, isSlotTakenError, notifyClub } from '../lib/db';
 import { buildSlots, isAlignedToGrid, type Interval } from '../lib/slots';
 import { normalizePhone } from '../lib/phone';
 import { findOrCreateCustomer } from '../lib/customers';
+import { providerFor, publicBase } from '../lib/payments';
 
 export const publicRouter = Router();
 
@@ -16,9 +17,16 @@ async function loadClub(slug: string) {
     include: {
       hours: true,
       courts: { where: { isActive: true }, orderBy: { sortOrder: 'asc' } },
+      trainers: { where: { isActive: true }, orderBy: { sortOrder: 'asc' } },
     },
   });
 }
+
+/**
+ * Статуси, що займають час. EXPIRED сюди не входить: неоплачена бронь
+ * звільняє слот — так само, як її не рахує EXCLUDE-констрейнт у базі.
+ */
+const BUSY_STATUSES = ['PENDING', 'CONFIRMED'] as const;
 
 /** GET /api/public/clubs/:slug — дані для віджета */
 publicRouter.get('/clubs/:slug', async (req, res) => {
@@ -31,13 +39,76 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     timezone: club.timezone,
     slotMinutes: club.slotMinutes,
     horizonDays: club.horizonDays,
+    // Шапка віджета. Порожні поля просто не малюються — у клубів без
+    // логотипа чи адреси віджет лишається таким, як був.
+    phone: club.phone,
+    address: club.address,
+    logoUrl: club.logoUrl,
+    // Розклад тижня — щоб віджет показав «Відчинено до 22:00» без окремого
+    // запиту. Хвилини від опівночі за таймзоною клубу, як у базі.
+    hours: [...club.hours]
+      .sort((a, b) => a.weekday - b.weekday)
+      .map((h) => ({
+        weekday: h.weekday,
+        openMinute: h.openMinute,
+        closeMinute: h.closeMinute,
+        isClosed: h.isClosed,
+      })),
     courts: club.courts.map((c) => ({
       id: c.id,
       name: c.name,
       pricePerHour: c.pricePerHour,
       slotMinutes: c.slotMinutes ?? club.slotMinutes,
     })),
+    // Чи є сенс показувати вибір тренера. Сам список тягнемо окремо —
+    // він залежить від обраної години.
+    hasTrainers: club.trainers.length > 0,
   });
+});
+
+/**
+ * GET /api/public/clubs/:slug/trainers?start=&end=
+ *
+ * Тренери, вільні на цей проміжок. Без start/end — просто весь список.
+ *
+ * Розкладу тренерів ми не ведемо: клуб сам знає, хто коли працює.
+ * Тут відсіюються тільки ті, у кого на цю годину вже є заняття, —
+ * щоб гравець не обрав зайнятого.
+ */
+publicRouter.get('/clubs/:slug/trainers', async (req, res) => {
+  const parsed = z.object({
+    start: z.string().datetime({ offset: true }).optional(),
+    end: z.string().datetime({ offset: true }).optional(),
+  }).safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const club = await loadClub(req.params.slug);
+  if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
+
+  const { start, end } = parsed.data;
+  let busy = new Set<string>();
+
+  if (start && end) {
+    const taken = await prisma.booking.findMany({
+      where: {
+        clubId: club.id,
+        trainerId: { not: null },
+        status: { in: [...BUSY_STATUSES] },
+        startTime: { lt: new Date(end) },
+        endTime: { gt: new Date(start) },
+      },
+      select: { trainerId: true },
+    });
+    busy = new Set(taken.map((t) => t.trainerId!));
+  }
+
+  res.json(club.trainers.map((t) => ({
+    id: t.id,
+    name: t.name,
+    pricePerHour: t.pricePerHour,
+    note: t.note,
+    available: !busy.has(t.id),
+  })));
 });
 
 /**
@@ -77,7 +148,7 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
     prisma.booking.findMany({
       where: {
         clubId: club.id,
-        status: { not: 'CANCELLED' },
+        status: { in: [...BUSY_STATUSES] },
         startTime: { lt: to },
         endTime: { gt: from },
       },
@@ -125,7 +196,30 @@ const bookingSchema = z.object({
   customerName: z.string().trim().min(2).max(80),
   customerPhone: z.string().trim().regex(/^\+?[0-9\s()-]{9,20}$/, 'invalid phone'),
   comment: z.string().trim().max(300).optional(),
+  /** Тренер на заняття. null або відсутнє — грають самі. */
+  trainerId: z.string().uuid().nullable().optional(),
+  /** Куди повернути гравця після платіжки. Віджет підставляє свою сторінку. */
+  returnUrl: z.string().url().max(500).optional(),
 });
+
+/**
+ * Адреса повернення з платіжки. Банк відправить гравця туди, куди ми скажемо,
+ * тому чужий домен сюди пускати не можна — це відкритий редірект.
+ * Приймаємо тільки той самий origin, з якого прийшов запит (це сайт клубу,
+ * де стоїть віджет). Без Origin — падаємо на налаштований запасний варіант.
+ */
+function safeReturnUrl(raw: string | undefined, origin: string | undefined): string {
+  const fallback = process.env.PUBLIC_WIDGET_RETURN_URL ?? `${publicBase()}/api/pay/done`;
+  if (!raw) return fallback;
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== 'https:' && u.protocol !== 'http:') return fallback;
+    if (origin && u.origin !== origin) return fallback;
+    return u.toString();
+  } catch {
+    return fallback;
+  }
+}
 
 /** POST /api/public/clubs/:slug/bookings */
 publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
@@ -182,12 +276,48 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
   if (customer?.isBlocked) return res.status(403).json({ error: 'CUSTOMER_BLOCKED' });
 
   const minutes = (end.getTime() - start.getTime()) / 60_000;
-  const priceTotal = Math.round((court.pricePerHour * minutes) / 60);
+  const courtPrice = Math.round((court.pricePerHour * minutes) / 60);
 
+  // Тренер: перевіряємо, що він цього клубу, активний і не зайнятий.
+  // Констрейнта в базі на тренера немає — тому теоретично двоє можуть
+  // проскочити в одну мілісекунду. Живемо з цим свідомо; повний EXCLUDE
+  // по trainerId додається однією міграцією, якщо стане проблемою.
+  let trainer = null;
+  let trainerPrice = 0;
+
+  if (body.trainerId) {
+    trainer = club.trainers.find((t) => t.id === body.trainerId && t.isActive) ?? null;
+    if (!trainer) return res.status(404).json({ error: 'TRAINER_NOT_FOUND' });
+
+    const clash = await prisma.booking.findFirst({
+      where: {
+        trainerId: trainer.id,
+        status: { in: [...BUSY_STATUSES] },
+        startTime: { lt: end },
+        endTime: { gt: start },
+      },
+      select: { id: true },
+    });
+    if (clash) return res.status(409).json({ error: 'TRAINER_BUSY' });
+
+    trainerPrice = Math.round((trainer.pricePerHour * minutes) / 60);
+  }
+
+  const priceTotal = courtPrice + trainerPrice;
+
+  // Передоплата вмикається клубом і працює тільки якщо є за що платити
+  const provider = club.prepayEnabled ? providerFor(club) : null;
+  const needsPay = Boolean(provider) && priceTotal > 0;
+  const expiresAt = needsPay
+    ? new Date(Date.now() + club.payHoldMinutes * 60_000)
+    : null;
+
+  let booking;
   try {
     // Гонку двох одночасних запитів ловить EXCLUDE USING gist у БД,
     // а не перевірка в коді — тому окрема транзакція з SELECT ... не потрібна.
-    const booking = await prisma.booking.create({
+    // PENDING теж рахується зайнятим, тому слот тримається під час оплати.
+    booking = await prisma.booking.create({
       data: {
         clubId: club.id,
         courtId: court.id,
@@ -198,30 +328,111 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
         startTime: start,
         endTime: end,
         priceTotal,
-        status: club.autoConfirm ? 'CONFIRMED' : 'PENDING',
+        trainerId: trainer?.id ?? null,
+        trainerPrice,
+        status: needsPay ? 'PENDING' : (club.autoConfirm ? 'CONFIRMED' : 'PENDING'),
+        expiresAt,
         source: 'WIDGET',
       },
-    });
-
-    void notifyClub(
-      club.telegramChatId,
-      `<b>Нова бронь</b>\n${court.name}\n${local.toFormat('dd.MM HH:mm')}–` +
-      `${DateTime.fromJSDate(end).setZone(club.timezone).toFormat('HH:mm')}\n` +
-      `${body.customerName}, ${body.customerPhone}\n` +
-      `${(priceTotal / 100).toFixed(2)} грн`,
-    );
-
-    res.status(201).json({
-      id: booking.id,
-      status: booking.status,
-      cancelToken: booking.cancelToken,
-      priceTotal,
     });
   } catch (e) {
     if (isSlotTakenError(e)) return res.status(409).json({ error: 'SLOT_TAKEN' });
     console.error('[booking] create failed', e);
-    res.status(500).json({ error: 'INTERNAL' });
+    return res.status(500).json({ error: 'INTERNAL' });
   }
+
+  const when = `${local.toFormat('dd.MM HH:mm')}–` +
+    `${DateTime.fromJSDate(end).setZone(club.timezone).toFormat('HH:mm')}`;
+
+  if (needsPay) {
+    const back = new URL(safeReturnUrl(body.returnUrl, req.headers.origin));
+    back.searchParams.set('cbPay', booking.cancelToken);
+
+    try {
+      const invoice = await provider!.createInvoice({
+        amountKop: priceTotal,
+        reference: booking.id,
+        destination: `${club.name}: ${court.name}, ${when}`,
+        redirectUrl: back.toString(),
+        webHookUrl: `${publicBase()}/api/pay/webhook/${club.id}`,
+        ttlSeconds: club.payHoldMinutes * 60,
+      });
+
+      await prisma.payment.create({
+        data: {
+          clubId: club.id,
+          bookingId: booking.id,
+          provider: provider!.name,
+          providerRef: invoice.providerRef,
+          pageUrl: invoice.pageUrl,
+          amount: priceTotal,
+        },
+      });
+
+      return res.status(201).json({
+        id: booking.id,
+        status: 'PENDING',
+        cancelToken: booking.cancelToken,
+        priceTotal,
+        payUrl: invoice.pageUrl,
+        expiresAt: expiresAt!.toISOString(),
+      });
+    } catch (e) {
+      // Рахунок не виставився — тримати слот немає підстав, віддаємо назад одразу.
+      console.error('[booking] invoice failed', e);
+      await prisma.booking.update({
+        where: { id: booking.id },
+        data: { status: 'EXPIRED', expiresAt: null },
+      }).catch(() => {});
+      return res.status(502).json({ error: 'PAYMENT_UNAVAILABLE' });
+    }
+  }
+
+  // Без передоплати повідомляємо клуб одразу. З передоплатою — після оплати
+  // (див. lib/payments/apply.ts), інакше адміну падатимуть покинуті кошики.
+  void notifyClub(
+    club.telegramChatId,
+    `<b>Нова бронь</b>\n${court.name}\n${when}\n` +
+    (trainer ? `Тренер: ${trainer.name}\n` : '') +
+    `${body.customerName}, ${body.customerPhone}\n` +
+    `${(priceTotal / 100).toFixed(2)} грн`,
+  );
+
+  res.status(201).json({
+    id: booking.id,
+    status: booking.status,
+    cancelToken: booking.cancelToken,
+    priceTotal,
+  });
+});
+
+/**
+ * GET /api/public/bookings/:token/status
+ *
+ * Віджет питає сюди після повернення з платіжки. Повернення гравця на сайт
+ * не гарантоване і не є джерелом правди — правда приходить вебхуком, тому
+ * віджет коротко опитує цей роут, поки статус не стане остаточним.
+ */
+publicRouter.get('/bookings/:token/status', async (req, res) => {
+  const parsed = z.string().uuid().safeParse(req.params.token);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const booking = await prisma.booking.findUnique({
+    where: { cancelToken: parsed.data },
+    include: { court: { select: { name: true } }, payment: { select: { status: true } } },
+  });
+  if (!booking) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  res.json({
+    id: booking.id,
+    status: booking.status,
+    paymentStatus: booking.payment?.status ?? null,
+    courtName: booking.court.name,
+    start: booking.startTime.toISOString(),
+    end: booking.endTime.toISOString(),
+    priceTotal: booking.priceTotal,
+    expiresAt: booking.expiresAt?.toISOString() ?? null,
+  });
 });
 
 /** POST /api/public/bookings/:id/cancel  { token } — скасування клієнтом за посиланням */

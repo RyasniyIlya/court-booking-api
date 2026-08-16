@@ -10,7 +10,9 @@ COPY package*.json ./
 RUN npm ci
 
 COPY prisma ./prisma
-RUN npx prisma generate
+# Локальний бінарник, а не npx: npx тягне Prisma 7, де url у schema.prisma
+# не підтримується, і збірка падає з P1012
+RUN ./node_modules/.bin/prisma generate
 
 COPY tsconfig.json ./
 COPY src ./src
@@ -25,6 +27,8 @@ RUN apt-get update -y && apt-get install -y --no-install-recommends openssl \
   && rm -rf /var/lib/apt/lists/*
 
 COPY package*.json ./
+# prisma лежить у dependencies, а не devDependencies — саме щоб пережити
+# --omit=dev і дати запустити migrate deploy на старті контейнера
 RUN npm ci --omit=dev
 
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
@@ -36,5 +40,6 @@ COPY prisma ./prisma
 USER node
 EXPOSE 3000
 
-# Міграції застосовуються при старті: деплой не потребує ручних команд
-CMD ["sh", "-c", "npx prisma migrate deploy && node dist/index.js"]
+# Міграції застосовуються при старті: деплой не потребує ручних команд.
+# Знову локальний бінарник, не npx.
+CMD ["sh", "-c", "./node_modules/.bin/prisma migrate deploy && node dist/index.js"]

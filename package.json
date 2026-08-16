@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "db:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",
+    "club:new": "tsx scripts/create-club.ts",
     "generate": "prisma generate"
   },
   "keywords": [],
@@ -16,6 +17,7 @@
   "license": "ISC",
   "dependencies": {
     "@prisma/client": "6.16.3",
+    "prisma": "6.16.3",
     "bcryptjs": "^3.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
@@ -30,7 +32,6 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/luxon": "^3.7.4",
     "@types/node": "^26.2.0",
-    "prisma": "6.16.3",
     "tsx": "^4.23.12",
     "typescript": "^7.0.2"
   }

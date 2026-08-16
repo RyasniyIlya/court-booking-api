@@ -1,4 +1,8 @@
 # Render Blueprint. Підключаєш репозиторій — сервіс піднімається сам.
+#
+# План starter, а не free: безкоштовний засинає після 15 хвилин тиші, і перший
+# запит чекає холодний старт. Демо клубу на дзвінку цього не пробачить,
+# а вебхук платіжки може прийти в момент, коли сервіс спить.
 services:
   - type: web
     name: court-booking-api
@@ -6,11 +10,38 @@ services:
     plan: starter
     healthCheckPath: /health
     envVars:
+      # Рядок підключення з дашборда Neon. Вставити вручну.
       - key: DATABASE_URL
-        sync: false        # вставити рядок з Neon вручну в дашборді
+        sync: false
+
       - key: JWT_SECRET
         generateValue: true
+
+      # Ключ шифрування токенів еквайрингу клубів.
+      # УВАГА: якщо колись зміниш його — усі збережені токени стануть
+      # нечитабельними, клубам доведеться ввести їх заново.
+      - key: PAYMENTS_SECRET
+        generateValue: true
+
+      # Публічна адреса цього ж сервісу — для webHookUrl платіжки.
+      # Render підставляє хост без схеми, тому publicBase() сам додає https://
+      - key: PUBLIC_API_URL
+        fromService:
+          type: web
+          name: court-booking-api
+          property: host
+
+      # Звідки пускати кабінет адміністратора (CORS). Кома як роздільник.
+      # Наприклад: https://court-booking.vercel.app
+      - key: ADMIN_ORIGINS
+        sync: false
+
+      # Запасна адреса повернення з платіжки, якщо віджет не передав свою
+      - key: PUBLIC_WIDGET_RETURN_URL
+        sync: false
+
       - key: TELEGRAM_BOT_TOKEN
         sync: false
+
       - key: PORT
         value: 3000

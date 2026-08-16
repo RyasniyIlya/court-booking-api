@@ -5,6 +5,8 @@ import jwt from 'jsonwebtoken';
 import { prisma, isSlotTakenError } from '../lib/db';
 import { normalizePhone, isSearchableTail } from '../lib/phone';
 import { getActivePasses, getActivePass } from '../lib/customers';
+import { KNOWN_PROVIDERS, publicBase } from '../lib/payments';
+import { encryptSecret, paymentsSecretReady } from '../lib/crypto';
 
 export const adminRouter = Router();
 
@@ -62,6 +64,8 @@ adminRouter.get('/bookings', requireAuth, async (req, res) => {
     },
     include: {
       court: { select: { name: true } },
+      trainer: { select: { id: true, name: true, phone: true } },
+      payment: { select: { status: true, paidAt: true, amount: true } },
       customer: { select: { id: true, telegramChatId: true, isBlocked: true, note: true } },
     },
     orderBy: { startTime: 'asc' },
@@ -79,20 +83,225 @@ adminRouter.get('/bookings', requireAuth, async (req, res) => {
   })));
 });
 
-/** PATCH /api/admin/bookings/:id — підтвердити / скасувати */
+/**
+ * PATCH /api/admin/bookings/:id — підтвердити / скасувати / поставити тренера.
+ * Обидва поля необовʼязкові, але хоч одне має бути.
+ */
 adminRouter.patch('/bookings/:id', requireAuth, async (req, res) => {
-  const parsed = z.object({ status: z.enum(['PENDING', 'CONFIRMED', 'CANCELLED']) }).safeParse(req.body);
+  const parsed = z.object({
+    status: z.enum(['PENDING', 'CONFIRMED', 'CANCELLED']).optional(),
+    /// null знімає тренера з броні
+    trainerId: z.string().uuid().nullable().optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  if (parsed.data.status === undefined && parsed.data.trainerId === undefined) {
+    return res.status(400).json({ error: 'NOTHING_TO_UPDATE' });
+  }
+
+  const booking = await prisma.booking.findFirst({
+    where: { id: req.params.id, clubId: req.auth!.clubId },
+  });
+  if (!booking) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const data: Record<string, unknown> = {};
+
+  if (parsed.data.status !== undefined) {
+    data.status = parsed.data.status;
+    data.cancelledAt = parsed.data.status === 'CANCELLED' ? new Date() : null;
+  }
+
+  if (parsed.data.trainerId !== undefined) {
+    if (parsed.data.trainerId === null) {
+      // Знімаємо тренера — і його частку з суми
+      data.trainerId = null;
+      data.trainerPrice = 0;
+      data.priceTotal = booking.priceTotal - booking.trainerPrice;
+    } else {
+      const trainer = await prisma.trainer.findFirst({
+        where: { id: parsed.data.trainerId, clubId: req.auth!.clubId, isActive: true },
+      });
+      if (!trainer) return res.status(404).json({ error: 'TRAINER_NOT_FOUND' });
+
+      // Той самий тренер не може вести дві броні одночасно.
+      // Себе з перевірки виключаємо — інакше бронь конфліктувала б сама з собою.
+      const clash = await prisma.booking.findFirst({
+        where: {
+          id: { not: booking.id },
+          trainerId: trainer.id,
+          status: { in: ['PENDING', 'CONFIRMED'] },
+          startTime: { lt: booking.endTime },
+          endTime: { gt: booking.startTime },
+        },
+        select: { id: true },
+      });
+      if (clash) return res.status(409).json({ error: 'TRAINER_BUSY' });
+
+      const minutes = (booking.endTime.getTime() - booking.startTime.getTime()) / 60_000;
+      const trainerPrice = Math.round((trainer.pricePerHour * minutes) / 60);
+
+      data.trainerId = trainer.id;
+      data.trainerPrice = trainerPrice;
+      // Ціна корту вже зафіксована в броні — міняємо тільки частку тренера
+      data.priceTotal = booking.priceTotal - booking.trainerPrice + trainerPrice;
+    }
+  }
+
+  await prisma.booking.update({ where: { id: booking.id }, data });
+  res.json({ ok: true });
+});
+
+/* ── Тренери ─────────────────────────────────────────────────────────────
+   Розкладу тренерів немає свідомо: клуб сам знає, хто коли працює.
+   Від накладок захищає перевірка при створенні та призначенні броні. */
+
+/** GET /api/admin/trainers — усі, включно з прихованими */
+adminRouter.get('/trainers', requireAuth, async (req, res) => {
+  const trainers = await prisma.trainer.findMany({
+    where: { clubId: req.auth!.clubId },
+    orderBy: [{ isActive: 'desc' }, { sortOrder: 'asc' }, { name: 'asc' }],
+  });
+  res.json(trainers);
+});
+
+const trainerSchema = z.object({
+  name: z.string().trim().min(2).max(80),
+  phone: z.string().trim().max(30).nullable().optional(),
+  /// Копійки за годину
+  pricePerHour: z.number().int().min(0).max(10_000_00).default(0),
+  note: z.string().trim().max(200).nullable().optional(),
+  sortOrder: z.number().int().min(0).max(999).default(0),
+  isActive: z.boolean().default(true),
+});
+
+/** POST /api/admin/trainers */
+adminRouter.post('/trainers', requireAuth, async (req, res) => {
+  const parsed = trainerSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
-  const result = await prisma.booking.updateMany({
+  const trainer = await prisma.trainer.create({
+    data: { ...parsed.data, clubId: req.auth!.clubId },
+  });
+  res.status(201).json(trainer);
+});
+
+/** PATCH /api/admin/trainers/:id */
+adminRouter.patch('/trainers/:id', requireAuth, async (req, res) => {
+  const parsed = trainerSchema.partial().safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const result = await prisma.trainer.updateMany({
     where: { id: req.params.id, clubId: req.auth!.clubId },
-    data: {
-      status: parsed.data.status,
-      cancelledAt: parsed.data.status === 'CANCELLED' ? new Date() : null,
-    },
+    data: parsed.data,
   });
   if (result.count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
   res.json({ ok: true });
+});
+
+/**
+ * DELETE /api/admin/trainers/:id
+ * Якщо на тренері висять броні — не стираємо, а ховаємо: історія і звіти
+ * мають лишитись цілими.
+ */
+adminRouter.delete('/trainers/:id', requireAuth, async (req, res) => {
+  const trainer = await prisma.trainer.findFirst({
+    where: { id: req.params.id, clubId: req.auth!.clubId },
+  });
+  if (!trainer) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const used = await prisma.booking.count({ where: { trainerId: trainer.id } });
+  if (used > 0) {
+    await prisma.trainer.update({ where: { id: trainer.id }, data: { isActive: false } });
+    return res.json({ ok: true, hidden: true, bookings: used });
+  }
+
+  await prisma.trainer.delete({ where: { id: trainer.id } });
+  res.json({ ok: true, hidden: false });
+});
+
+/* ── Корти ──────────────────────────────────────────────────────────────── */
+
+/** GET /api/admin/courts — усі, включно з прихованими */
+adminRouter.get('/courts', requireAuth, async (req, res) => {
+  const courts = await prisma.court.findMany({
+    where: { clubId: req.auth!.clubId },
+    orderBy: [{ isActive: 'desc' }, { sortOrder: 'asc' }, { name: 'asc' }],
+  });
+  res.json(courts);
+});
+
+/** PATCH /api/admin/courts/:id */
+adminRouter.patch('/courts/:id', requireAuth, async (req, res) => {
+  const parsed = z.object({
+    name: z.string().trim().min(1).max(60).optional(),
+    pricePerHour: z.number().int().min(0).max(100_000_00).optional(),
+    slotMinutes: z.number().int().min(15).max(240).nullable().optional(),
+    sortOrder: z.number().int().min(0).max(999).optional(),
+    isActive: z.boolean().optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const result = await prisma.court.updateMany({
+    where: { id: req.params.id, clubId: req.auth!.clubId },
+    data: parsed.data,
+  });
+  if (result.count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
+  res.json({ ok: true });
+});
+
+/**
+ * DELETE /api/admin/courts/:id
+ * Корт з бронями ховаємо, а не стираємо: у Booking стоїть Cascade,
+ * і видалення корту забрало б із собою всю історію броней разом з грошима.
+ */
+adminRouter.delete('/courts/:id', requireAuth, async (req, res) => {
+  const court = await prisma.court.findFirst({
+    where: { id: req.params.id, clubId: req.auth!.clubId },
+  });
+  if (!court) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const used = await prisma.booking.count({ where: { courtId: court.id } });
+  if (used > 0) {
+    await prisma.court.update({ where: { id: court.id }, data: { isActive: false } });
+    return res.json({ ok: true, hidden: true, bookings: used });
+  }
+
+  await prisma.court.delete({ where: { id: court.id } });
+  res.json({ ok: true, hidden: false });
+});
+
+/** GET /api/admin/hours — розклад роботи на тиждень */
+adminRouter.get('/hours', requireAuth, async (req, res) => {
+  const hours = await prisma.clubHours.findMany({
+    where: { clubId: req.auth!.clubId },
+    orderBy: { weekday: 'asc' },
+  });
+  res.json(hours);
+});
+
+/** GET /api/admin/club — налаштування клубу для екрана в кабінеті */
+adminRouter.get('/club', requireAuth, async (req, res) => {
+  const club = await prisma.club.findUnique({ where: { id: req.auth!.clubId } });
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  res.json({
+    name: club.name,
+    slug: club.slug,
+    timezone: club.timezone,
+    phone: club.phone,
+    address: club.address,
+    logoUrl: club.logoUrl,
+    telegramChatId: club.telegramChatId,
+    slotMinutes: club.slotMinutes,
+    leadTimeMinutes: club.leadTimeMinutes,
+    horizonDays: club.horizonDays,
+    autoConfirm: club.autoConfirm,
+    prepayEnabled: club.prepayEnabled,
+    paymentProvider: club.paymentProvider,
+    payHoldMinutes: club.payHoldMinutes,
+    // Токен не віддаємо навіть власнику — тільки факт наявності
+    hasPaymentToken: Boolean(club.paymentTokenEnc),
+    webhookUrl: `${publicBase()}/api/pay/webhook/${club.id}`,
+  });
 });
 
 /** POST /api/admin/blocks — закрити час (ремонт, турнір, тривога) */
@@ -128,6 +337,102 @@ adminRouter.post('/blocks', requireAuth, async (req, res) => {
     if (isSlotTakenError(e)) return res.status(409).json({ error: 'BLOCK_OVERLAP' });
     throw e;
   }
+});
+
+/**
+ * PATCH /api/admin/club — реквізити клубу.
+ * Через CLI заводиться новий клуб, а вже заведеному ці поля треба міняти
+ * без походу в базу: клуб переїхав, змінив телефон, нарешті прислав логотип.
+ */
+adminRouter.patch('/club', requireAuth, async (req, res) => {
+  const parsed = z.object({
+    name: z.string().trim().min(1).max(120).optional(),
+    phone: z.string().trim().max(30).nullable().optional(),
+    address: z.string().trim().max(200).nullable().optional(),
+    // Тільки https: http зламає замок у браузері на сайті клубу,
+    // data: роздує кожну відповідь API.
+    logoUrl: z.string().trim().max(500).regex(/^https:\/\/\S+$/).nullable().optional(),
+    telegramChatId: z.string().trim().max(60).nullable().optional(),
+
+    // Передоплата
+    prepayEnabled: z.boolean().optional(),
+    paymentProvider: z.enum(KNOWN_PROVIDERS).nullable().optional(),
+    payHoldMinutes: z.number().int().min(5).max(60).optional(),
+    /// Токен еквайрингу клубу. Приймаємо, шифруємо, назад ніколи не віддаємо.
+    paymentToken: z.string().trim().min(10).max(400).nullable().optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const { paymentToken, ...rest } = parsed.data;
+
+  const data: Record<string, unknown> = { ...rest };
+  if (paymentToken !== undefined) {
+    if (paymentToken === null) {
+      data.paymentTokenEnc = null;
+    } else {
+      if (!paymentsSecretReady()) {
+        return res.status(503).json({ error: 'PAYMENTS_SECRET_MISSING' });
+      }
+      data.paymentTokenEnc = encryptSecret(paymentToken);
+    }
+  }
+
+  const club = await prisma.club.update({ where: { id: req.auth!.clubId }, data });
+
+  res.json({
+    name: club.name,
+    slug: club.slug,
+    phone: club.phone,
+    address: club.address,
+    logoUrl: club.logoUrl,
+    telegramChatId: club.telegramChatId,
+    prepayEnabled: club.prepayEnabled,
+    paymentProvider: club.paymentProvider,
+    payHoldMinutes: club.payHoldMinutes,
+    // Сам токен не віддаємо навіть власнику клубу — тільки факт наявності
+    hasPaymentToken: Boolean(club.paymentTokenEnc),
+    webhookUrl: `${publicBase()}/api/pay/webhook/${club.id}`,
+  });
+});
+
+/** GET /api/admin/blocks?from=&to= — закриті проміжки за період */
+adminRouter.get('/blocks', requireAuth, async (req, res) => {
+  const parsed = z.object({
+    from: z.string().datetime({ offset: true }),
+    to: z.string().datetime({ offset: true }),
+  }).safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const blocks = await prisma.block.findMany({
+    where: {
+      clubId: req.auth!.clubId,
+      startTime: { lt: new Date(parsed.data.to) },
+      endTime: { gt: new Date(parsed.data.from) },
+    },
+    include: { court: { select: { name: true } } },
+    orderBy: { startTime: 'asc' },
+  });
+
+  res.json(blocks);
+});
+
+/**
+ * DELETE /api/admin/blocks/:id — відкрити час назад.
+ * Турнір перенесли, тривогу відбили, ремонт закінчився раніше — час має
+ * повернутись у сітку без походу в базу.
+ */
+adminRouter.delete('/blocks/:id', requireAuth, async (req, res) => {
+  const parsed = z.string().uuid().safeParse(req.params.id);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  // deleteMany з clubId у where, а не delete по id: інакше, знаючи id,
+  // можна було б зняти блокування чужого клубу.
+  const result = await prisma.block.deleteMany({
+    where: { id: parsed.data, clubId: req.auth!.clubId },
+  });
+  if (result.count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  res.json({ ok: true });
 });
 
 /** POST /api/admin/courts */
