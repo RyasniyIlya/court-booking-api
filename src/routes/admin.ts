@@ -20,6 +20,16 @@ declare global {
 
 const SECRET = process.env.JWT_SECRET ?? 'dev-secret-change-me';
 
+/**
+ * Значення req.params у типах Express 5 — це string | string[]:
+ * один параметр може повторитись у шляху. Нам завжди потрібен рядок.
+ * Без цього tsc падає з TS2322 на кожному where по id з параметра шляху.
+ */
+function param(req: Request, name: string): string {
+  const v = (req.params as Record<string, string | string[] | undefined>)[name];
+  return Array.isArray(v) ? (v[0] ?? '') : (v ?? '');
+}
+
 function requireAuth(req: Request, res: Response, next: NextFunction) {
   const header = req.headers.authorization;
   if (!header?.startsWith('Bearer ')) return res.status(401).json({ error: 'UNAUTHORIZED' });
@@ -99,7 +109,7 @@ adminRouter.patch('/bookings/:id', requireAuth, async (req, res) => {
   }
 
   const booking = await prisma.booking.findFirst({
-    where: { id: req.params.id, clubId: req.auth!.clubId },
+    where: { id: param(req, 'id'), clubId: req.auth!.clubId },
   });
   if (!booking) return res.status(404).json({ error: 'NOT_FOUND' });
 
@@ -190,7 +200,7 @@ adminRouter.patch('/trainers/:id', requireAuth, async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
   const result = await prisma.trainer.updateMany({
-    where: { id: req.params.id, clubId: req.auth!.clubId },
+    where: { id: param(req, 'id'), clubId: req.auth!.clubId },
     data: parsed.data,
   });
   if (result.count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
@@ -204,7 +214,7 @@ adminRouter.patch('/trainers/:id', requireAuth, async (req, res) => {
  */
 adminRouter.delete('/trainers/:id', requireAuth, async (req, res) => {
   const trainer = await prisma.trainer.findFirst({
-    where: { id: req.params.id, clubId: req.auth!.clubId },
+    where: { id: param(req, 'id'), clubId: req.auth!.clubId },
   });
   if (!trainer) return res.status(404).json({ error: 'NOT_FOUND' });
 
@@ -241,7 +251,7 @@ adminRouter.patch('/courts/:id', requireAuth, async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
   const result = await prisma.court.updateMany({
-    where: { id: req.params.id, clubId: req.auth!.clubId },
+    where: { id: param(req, 'id'), clubId: req.auth!.clubId },
     data: parsed.data,
   });
   if (result.count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
@@ -255,7 +265,7 @@ adminRouter.patch('/courts/:id', requireAuth, async (req, res) => {
  */
 adminRouter.delete('/courts/:id', requireAuth, async (req, res) => {
   const court = await prisma.court.findFirst({
-    where: { id: req.params.id, clubId: req.auth!.clubId },
+    where: { id: param(req, 'id'), clubId: req.auth!.clubId },
   });
   if (!court) return res.status(404).json({ error: 'NOT_FOUND' });
 
@@ -422,7 +432,7 @@ adminRouter.get('/blocks', requireAuth, async (req, res) => {
  * повернутись у сітку без походу в базу.
  */
 adminRouter.delete('/blocks/:id', requireAuth, async (req, res) => {
-  const parsed = z.string().uuid().safeParse(req.params.id);
+  const parsed = z.string().uuid().safeParse(param(req, 'id'));
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
   // deleteMany з clubId у where, а не delete по id: інакше, знаючи id,
@@ -516,7 +526,7 @@ adminRouter.post('/customers/:id/passes', requireAuth, async (req, res) => {
   }
 
   const customer = await prisma.customer.findFirst({
-    where: { id: req.params.id, clubId: req.auth!.clubId },
+    where: { id: param(req, 'id'), clubId: req.auth!.clubId },
   });
   if (!customer) return res.status(404).json({ error: 'NOT_FOUND' });
 
@@ -541,7 +551,7 @@ adminRouter.post('/customers/:id/passes', requireAuth, async (req, res) => {
  */
 adminRouter.post('/bookings/:id/use-pass', requireAuth, async (req, res) => {
   const booking = await prisma.booking.findFirst({
-    where: { id: req.params.id, clubId: req.auth!.clubId },
+    where: { id: param(req, 'id'), clubId: req.auth!.clubId },
   });
   if (!booking || !booking.customerId) return res.status(404).json({ error: 'NOT_FOUND' });
 
@@ -569,7 +579,7 @@ adminRouter.post('/bookings/:id/use-pass', requireAuth, async (req, res) => {
 /** DELETE /api/admin/bookings/:id/use-pass — повернути списане заняття */
 adminRouter.delete('/bookings/:id/use-pass', requireAuth, async (req, res) => {
   const usage = await prisma.passUsage.findUnique({
-    where: { bookingId: req.params.id },
+    where: { bookingId: param(req, 'id') },
     include: { pass: true },
   });
   if (!usage || usage.revertedAt || usage.pass.clubId !== req.auth!.clubId) {
