@@ -1,10 +1,12 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
+import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
+import { DateTime } from 'luxon';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { prisma, isSlotTakenError } from '../lib/db';
 import { normalizePhone, isSearchableTail } from '../lib/phone';
-import { getActivePasses, getActivePass } from '../lib/customers';
+import { getActivePasses, getActivePass, findOrCreateCustomer } from '../lib/customers';
 import { KNOWN_PROVIDERS, publicBase } from '../lib/payments';
 import { encryptSecret, paymentsSecretReady } from '../lib/crypto';
 
@@ -93,71 +95,378 @@ adminRouter.get('/bookings', requireAuth, async (req, res) => {
   })));
 });
 
+/** Статуси, що займають час. EXPIRED і CANCELLED час звільняють. */
+const BUSY = ['PENDING', 'CONFIRMED'] as const;
+
+/** Скільки коштує тренер за цей інтервал */
+const trainerCost = (pricePerHour: number, start: Date, end: Date) =>
+  Math.round((pricePerHour * ((end.getTime() - start.getTime()) / 60_000)) / 60);
+
 /**
- * PATCH /api/admin/bookings/:id — підтвердити / скасувати / поставити тренера.
- * Обидва поля необовʼязкові, але хоч одне має бути.
+ * POST /api/admin/bookings — бронь від адміністратора.
+ *
+ * Гравець прийшов без телефону, домовились по дзвінку, записали постійного
+ * клієнта — усе це раніше не мало куди подітись, бо створювати броню вмів
+ * тільки віджет.
+ *
+ * Правила тут свідомо мʼякші, ніж у публічному роуті: адміністратору можна
+ * записати минуле (зафіксувати факт гри), можна не по сітці, можна поверх
+ * закритого часу — він сам його і закривав. Що НЕ можна — накласти дві броні
+ * на один корт: це ловить EXCLUDE-констрейнт у базі, а не перевірка в коді.
+ */
+adminRouter.post('/bookings', requireAuth, async (req, res) => {
+  const parsed = z.object({
+    courtId: z.string().uuid(),
+    start: z.string().datetime({ offset: true }),
+    end: z.string().datetime({ offset: true }),
+    customerName: z.string().trim().min(1).max(80),
+    /// Порожньо — записуємо без картки клієнта. Буває: людина зайшла з вулиці.
+    customerPhone: z.string().trim().max(30).optional(),
+    trainerId: z.string().uuid().nullable().optional(),
+    comment: z.string().trim().max(300).optional(),
+    status: z.enum(['PENDING', 'CONFIRMED']).default('CONFIRMED'),
+    /// Своя ціна — знижки й домовленості бувають. Копійки.
+    priceTotal: z.number().int().min(0).max(1_000_000_00).optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const d = parsed.data;
+  const clubId = req.auth!.clubId;
+  const start = new Date(d.start);
+  const end = new Date(d.end);
+
+  if (end <= start) return res.status(400).json({ error: 'BAD_INTERVAL' });
+  if (end.getTime() - start.getTime() > 12 * 3600_000) {
+    return res.status(400).json({ error: 'TOO_LONG' });
+  }
+
+  const court = await prisma.court.findFirst({ where: { id: d.courtId, clubId } });
+  if (!court) return res.status(404).json({ error: 'COURT_NOT_FOUND' });
+
+  let trainer = null;
+  if (d.trainerId) {
+    trainer = await prisma.trainer.findFirst({
+      where: { id: d.trainerId, clubId, isActive: true },
+    });
+    if (!trainer) return res.status(404).json({ error: 'TRAINER_NOT_FOUND' });
+
+    const clash = await prisma.booking.findFirst({
+      where: {
+        trainerId: trainer.id,
+        status: { in: [...BUSY] },
+        startTime: { lt: end },
+        endTime: { gt: start },
+      },
+      select: { id: true },
+    });
+    if (clash) return res.status(409).json({ error: 'TRAINER_BUSY' });
+  }
+
+  const minutes = (end.getTime() - start.getTime()) / 60_000;
+  const trainerPrice = trainer ? trainerCost(trainer.pricePerHour, start, end) : 0;
+  const courtPrice = Math.round((court.pricePerHour * minutes) / 60);
+  const priceTotal = d.priceTotal ?? courtPrice + trainerPrice;
+
+  // Картка клієнта тільки якщо телефон нормалізувався. Без телефону
+  // ідентифікувати людину все одно нічим — картку не плодимо.
+  const phone = d.customerPhone ? normalizePhone(d.customerPhone) : null;
+  const customer = phone
+    ? await findOrCreateCustomer({ clubId, name: d.customerName, rawPhone: d.customerPhone! })
+    : null;
+
+  try {
+    const booking = await prisma.booking.create({
+      data: {
+        clubId,
+        courtId: court.id,
+        customerName: d.customerName,
+        customerPhone: phone?.e164 ?? '',
+        customerId: customer?.id ?? null,
+        trainerId: trainer?.id ?? null,
+        trainerPrice,
+        comment: d.comment,
+        startTime: start,
+        endTime: end,
+        priceTotal,
+        status: d.status,
+        source: 'ADMIN',
+      },
+      include: { court: { select: { name: true } }, trainer: { select: { id: true, name: true } } },
+    });
+    res.status(201).json(booking);
+  } catch (e) {
+    if (isSlotTakenError(e)) return res.status(409).json({ error: 'SLOT_TAKEN' });
+    console.error('[admin booking] create failed', e);
+    res.status(500).json({ error: 'INTERNAL' });
+  }
+});
+
+/**
+ * PATCH /api/admin/bookings/:id — статус, тренер, перенос.
+ *
+ * Перенос (courtId / start / end) потрібен для перетягування броні в сітці.
+ * Ціна корту при переносі перераховується під новий корт і нову тривалість,
+ * частка тренера — теж. Якщо адміністратор виставляв свою ціну, після
+ * переносу вона зникне: інакше перенос на дорожчий корт залишав би клуб
+ * без грошей, і це помітили б не одразу.
  */
 adminRouter.patch('/bookings/:id', requireAuth, async (req, res) => {
   const parsed = z.object({
     status: z.enum(['PENDING', 'CONFIRMED', 'CANCELLED']).optional(),
     /// null знімає тренера з броні
     trainerId: z.string().uuid().nullable().optional(),
+    /// Замітка до заняття: «принести мʼячі», «оплата готівкою», «спізнюється».
+    /// Порожній рядок стирає замітку.
+    comment: z.string().trim().max(300).nullable().optional(),
+    // Перенос. start і end передаються тільки разом.
+    courtId: z.string().uuid().optional(),
+    start: z.string().datetime({ offset: true }).optional(),
+    end: z.string().datetime({ offset: true }).optional(),
   }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
-  if (parsed.data.status === undefined && parsed.data.trainerId === undefined) {
-    return res.status(400).json({ error: 'NOTHING_TO_UPDATE' });
+
+  const p = parsed.data;
+  const clubId = req.auth!.clubId;
+
+  if (Object.keys(p).length === 0) return res.status(400).json({ error: 'NOTHING_TO_UPDATE' });
+  if ((p.start === undefined) !== (p.end === undefined)) {
+    return res.status(400).json({ error: 'START_AND_END_TOGETHER' });
   }
 
   const booking = await prisma.booking.findFirst({
-    where: { id: param(req, 'id'), clubId: req.auth!.clubId },
+    where: { id: param(req, 'id'), clubId },
   });
   if (!booking) return res.status(404).json({ error: 'NOT_FOUND' });
 
   const data: Record<string, unknown> = {};
 
-  if (parsed.data.status !== undefined) {
-    data.status = parsed.data.status;
-    data.cancelledAt = parsed.data.status === 'CANCELLED' ? new Date() : null;
+  // Куда і коли бронь стане після цього запиту — потрібно для перевірок
+  const start = p.start ? new Date(p.start) : booking.startTime;
+  const end = p.end ? new Date(p.end) : booking.endTime;
+  const moved = Boolean(p.start || p.courtId);
+
+  if (moved) {
+    if (end <= start) return res.status(400).json({ error: 'BAD_INTERVAL' });
+
+    const courtId = p.courtId ?? booking.courtId;
+    const court = await prisma.court.findFirst({ where: { id: courtId, clubId } });
+    if (!court) return res.status(404).json({ error: 'COURT_NOT_FOUND' });
+
+    data.courtId = court.id;
+    data.startTime = start;
+    data.endTime = end;
+
+    const minutes = (end.getTime() - start.getTime()) / 60_000;
+    data.priceTotal = Math.round((court.pricePerHour * minutes) / 60) + booking.trainerPrice;
   }
 
-  if (parsed.data.trainerId !== undefined) {
-    if (parsed.data.trainerId === null) {
+  if (p.status !== undefined) {
+    data.status = p.status;
+    data.cancelledAt = p.status === 'CANCELLED' ? new Date() : null;
+  }
+
+  if (p.comment !== undefined) {
+    data.comment = p.comment === null || p.comment === '' ? null : p.comment;
+  }
+
+  if (p.trainerId !== undefined) {
+    if (p.trainerId === null) {
       // Знімаємо тренера — і його частку з суми
       data.trainerId = null;
       data.trainerPrice = 0;
-      data.priceTotal = booking.priceTotal - booking.trainerPrice;
+      data.priceTotal = (data.priceTotal as number ?? booking.priceTotal) - booking.trainerPrice;
     } else {
       const trainer = await prisma.trainer.findFirst({
-        where: { id: parsed.data.trainerId, clubId: req.auth!.clubId, isActive: true },
+        where: { id: p.trainerId, clubId, isActive: true },
       });
       if (!trainer) return res.status(404).json({ error: 'TRAINER_NOT_FOUND' });
 
-      // Той самий тренер не може вести дві броні одночасно.
-      // Себе з перевірки виключаємо — інакше бронь конфліктувала б сама з собою.
-      const clash = await prisma.booking.findFirst({
-        where: {
-          id: { not: booking.id },
-          trainerId: trainer.id,
-          status: { in: ['PENDING', 'CONFIRMED'] },
-          startTime: { lt: booking.endTime },
-          endTime: { gt: booking.startTime },
-        },
-        select: { id: true },
-      });
-      if (clash) return res.status(409).json({ error: 'TRAINER_BUSY' });
-
-      const minutes = (booking.endTime.getTime() - booking.startTime.getTime()) / 60_000;
-      const trainerPrice = Math.round((trainer.pricePerHour * minutes) / 60);
-
+      const price = trainerCost(trainer.pricePerHour, start, end);
       data.trainerId = trainer.id;
-      data.trainerPrice = trainerPrice;
-      // Ціна корту вже зафіксована в броні — міняємо тільки частку тренера
-      data.priceTotal = booking.priceTotal - booking.trainerPrice + trainerPrice;
+      data.trainerPrice = price;
+      data.priceTotal =
+        (data.priceTotal as number ?? booking.priceTotal) - booking.trainerPrice + price;
     }
   }
 
-  await prisma.booking.update({ where: { id: booking.id }, data });
-  res.json({ ok: true });
+  // Тренер не може вести дві броні одночасно. Перевіряємо і коли міняють
+  // тренера, і коли переносять бронь: у новий час він може бути зайнятий.
+  const finalTrainerId = p.trainerId !== undefined ? p.trainerId : booking.trainerId;
+  if (finalTrainerId && (moved || p.trainerId !== undefined)) {
+    const clash = await prisma.booking.findFirst({
+      where: {
+        id: { not: booking.id },
+        trainerId: finalTrainerId,
+        status: { in: [...BUSY] },
+        startTime: { lt: end },
+        endTime: { gt: start },
+      },
+      select: { id: true },
+    });
+    if (clash) return res.status(409).json({ error: 'TRAINER_BUSY' });
+  }
+
+  try {
+    await prisma.booking.update({ where: { id: booking.id }, data });
+    res.json({ ok: true });
+  } catch (e) {
+    // Перенос на зайнятий час — той самий EXCLUDE-констрейнт
+    if (isSlotTakenError(e)) return res.status(409).json({ error: 'SLOT_TAKEN' });
+    throw e;
+  }
+});
+
+/**
+ * POST /api/admin/bookings/series — повторювані заняття.
+ *
+ * «Щовівторка о 19:00 на вісім тижнів» — типова регулярна тренерська група.
+ * Кожен тиждень створюється окремою бронню з тим самим seriesId: заняття
+ * можна перенести чи скасувати поштучно, не ламаючи решту.
+ *
+ * Зайняті дати не валять весь запит, а просто пропускаються — і повертаються
+ * у відповіді списком. Клуб має побачити «створено 6 з 8, дві дати зайняті»,
+ * а не ловити помилку і гадати, що встигло записатись.
+ */
+adminRouter.post('/bookings/series', requireAuth, async (req, res) => {
+  const parsed = z.object({
+    courtId: z.string().uuid(),
+    start: z.string().datetime({ offset: true }),
+    end: z.string().datetime({ offset: true }),
+    customerName: z.string().trim().min(1).max(80),
+    customerPhone: z.string().trim().max(30).optional(),
+    trainerId: z.string().uuid().nullable().optional(),
+    comment: z.string().trim().max(300).optional(),
+    /// Скільки тижнів поспіль, включно з першим
+    weeks: z.number().int().min(2).max(52),
+    status: z.enum(['PENDING', 'CONFIRMED']).default('CONFIRMED'),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const d = parsed.data;
+  const clubId = req.auth!.clubId;
+  const first = new Date(d.start);
+  const firstEnd = new Date(d.end);
+
+  if (firstEnd <= first) return res.status(400).json({ error: 'BAD_INTERVAL' });
+  if (firstEnd.getTime() - first.getTime() > 12 * 3600_000) {
+    return res.status(400).json({ error: 'TOO_LONG' });
+  }
+
+  const club = await prisma.club.findUnique({
+    where: { id: clubId },
+    select: { timezone: true },
+  });
+  const court = await prisma.court.findFirst({ where: { id: d.courtId, clubId } });
+  if (!court) return res.status(404).json({ error: 'COURT_NOT_FOUND' });
+
+  let trainer = null;
+  if (d.trainerId) {
+    trainer = await prisma.trainer.findFirst({
+      where: { id: d.trainerId, clubId, isActive: true },
+    });
+    if (!trainer) return res.status(404).json({ error: 'TRAINER_NOT_FOUND' });
+  }
+
+  const minutes = (firstEnd.getTime() - first.getTime()) / 60_000;
+  const trainerPrice = trainer ? trainerCost(trainer.pricePerHour, first, firstEnd) : 0;
+  const priceTotal = Math.round((court.pricePerHour * minutes) / 60) + trainerPrice;
+
+  const phone = d.customerPhone ? normalizePhone(d.customerPhone) : null;
+  const customer = phone
+    ? await findOrCreateCustomer({ clubId, name: d.customerName, rawPhone: d.customerPhone! })
+    : null;
+
+  const seriesId = randomUUID();
+  const tz = club?.timezone ?? 'Europe/Kyiv';
+
+  // Через Luxon у таймзоні клубу, а не +7*24 години: інакше після переходу
+  // на зимовий час заняття поїхало б на годину. Гравець приходить о 19:00
+  // за годинником на стіні, і так має лишатись весь сезон.
+  const startLocal = DateTime.fromJSDate(first).setZone(tz);
+  const endLocal = DateTime.fromJSDate(firstEnd).setZone(tz);
+
+  const created: { start: string; id: string }[] = [];
+  const skipped: { start: string; reason: 'SLOT_TAKEN' | 'TRAINER_BUSY' }[] = [];
+
+  for (let i = 0; i < d.weeks; i++) {
+    const s = startLocal.plus({ weeks: i }).toJSDate();
+    const e = endLocal.plus({ weeks: i }).toJSDate();
+
+    if (trainer) {
+      const clash = await prisma.booking.findFirst({
+        where: {
+          trainerId: trainer.id,
+          status: { in: [...BUSY] },
+          startTime: { lt: e },
+          endTime: { gt: s },
+        },
+        select: { id: true },
+      });
+      if (clash) {
+        skipped.push({ start: s.toISOString(), reason: 'TRAINER_BUSY' });
+        continue;
+      }
+    }
+
+    try {
+      const b = await prisma.booking.create({
+        data: {
+          clubId,
+          courtId: court.id,
+          customerName: d.customerName,
+          customerPhone: phone?.e164 ?? '',
+          customerId: customer?.id ?? null,
+          trainerId: trainer?.id ?? null,
+          trainerPrice,
+          comment: d.comment,
+          startTime: s,
+          endTime: e,
+          priceTotal,
+          status: d.status,
+          source: 'ADMIN',
+          seriesId,
+        },
+        select: { id: true },
+      });
+      created.push({ start: s.toISOString(), id: b.id });
+    } catch (err) {
+      if (isSlotTakenError(err)) {
+        skipped.push({ start: s.toISOString(), reason: 'SLOT_TAKEN' });
+        continue;
+      }
+      console.error('[series] create failed', err);
+      return res.status(500).json({ error: 'INTERNAL', created, skipped });
+    }
+  }
+
+  if (created.length === 0) {
+    return res.status(409).json({ error: 'ALL_TAKEN', created, skipped });
+  }
+  res.status(201).json({ seriesId, created, skipped });
+});
+
+/**
+ * POST /api/admin/series/:seriesId/cancel — скасувати серію.
+ *
+ * Тільки майбутні заняття. Минулі лишаємо як є: це історія, і в ній були
+ * гроші. «Скасувати те, що вже відбулось» — не те, чого хоче адміністратор,
+ * навіть якщо натиснув на минуле заняття.
+ */
+adminRouter.post('/series/:seriesId/cancel', requireAuth, async (req, res) => {
+  const parsed = z.string().uuid().safeParse(param(req, 'seriesId'));
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const result = await prisma.booking.updateMany({
+    where: {
+      seriesId: parsed.data,
+      clubId: req.auth!.clubId,
+      status: { in: [...BUSY] },
+      startTime: { gte: new Date() },
+    },
+    data: { status: 'CANCELLED', cancelledAt: new Date() },
+  });
+
+  res.json({ ok: true, cancelled: result.count });
 });
 
 /* ── Тренери ─────────────────────────────────────────────────────────────
