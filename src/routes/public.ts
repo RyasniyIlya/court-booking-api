@@ -6,14 +6,25 @@ import { buildSlots, isAlignedToGrid, type Interval } from '../lib/slots';
 import { normalizePhone } from '../lib/phone';
 import { findOrCreateCustomer } from '../lib/customers';
 import { providerFor, publicBase } from '../lib/payments';
+import { clubBilling } from '../lib/billing';
 
 export const publicRouter = Router();
 
 const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD');
 
+/**
+ * `isActive` тут навмисно НЕ фільтрується.
+ *
+ * Раніше вимкнений клуб просто не знаходився, і віджет на його сайті
+ * показував «Розклад тимчасово недоступний» — тобто помилку. Гравець не
+ * винен, що клуб забув заплатити, і не має бачити зламану сторінку.
+ *
+ * Тепер клуб завжди знаходиться, а стан вирішує clubBilling(): віджет
+ * перетворюється на блок з телефоном, а не на повідомлення про збій.
+ */
 async function loadClub(slug: string) {
   return prisma.club.findFirst({
-    where: { slug, isActive: true },
+    where: { slug },
     include: {
       hours: true,
       courts: { where: { isActive: true }, orderBy: { sortOrder: 'asc' } },
@@ -33,7 +44,27 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
   const club = await loadClub(req.params.slug);
   if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
 
+  const billing = clubBilling(club);
+
+  /* Онлайн-запис вимкнено. Віддаємо рівно те, з чого віджет збере блок
+     з телефоном: назву, контакти, бренд. Ні годин, ні кортів, ні цін —
+     нема сенсу малювати сітку, у яку не можна натиснути.
+     Статус 200, а не 4xx: для гравця це не помилка, а режим роботи. */
+  if (!billing.online) {
+    return res.json({
+      name: club.name,
+      slug: club.slug,
+      timezone: club.timezone,
+      phone: club.phone,
+      address: club.address,
+      logoUrl: club.logoUrl,
+      brandColor: club.brandColor,
+      online: false,
+    });
+  }
+
   res.json({
+    online: true,
     name: club.name,
     slug: club.slug,
     timezone: club.timezone,
@@ -44,6 +75,7 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     phone: club.phone,
     address: club.address,
     logoUrl: club.logoUrl,
+    brandColor: club.brandColor,
     // Розклад тижня — щоб віджет показав «Відчинено до 22:00» без окремого
     // запиту. Хвилини від опівночі за таймзоною клубу, як у базі.
     hours: [...club.hours]
@@ -123,6 +155,13 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
 
   const club = await loadClub(req.params.slug);
   if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
+
+  // Онлайн-запис вимкнено — сітки просто немає. Порожній список кортів, а не
+  // помилка: віджет у цьому стані малює блок з телефоном і сюди не ходить,
+  // але прямий запит теж має отримати щось осмислене.
+  if (!clubBilling(club).online) {
+    return res.json({ closed: true, offline: true, courts: [] });
+  }
 
   const day = DateTime.fromISO(date, { zone: club.timezone });
   if (!day.isValid) return res.status(400).json({ error: 'BAD_DATE' });
@@ -229,6 +268,14 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
 
   const club = await loadClub(req.params.slug);
   if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
+
+  /* Остання лінія. Віджет у стані offline форми не показує, але POST може
+     прилетіти зі старої вкладки, відкритої до вимкнення, — і тоді бронь
+     створилась би в обхід. 403, а не 404: клуб існує, просто зараз не
+     приймає онлайн-записи. */
+  if (!clubBilling(club).online) {
+    return res.status(403).json({ error: 'CLUB_OFFLINE' });
+  }
 
   const court = club.courts.find((c) => c.id === body.courtId);
   if (!court) return res.status(404).json({ error: 'COURT_NOT_FOUND' });

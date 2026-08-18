@@ -9,6 +9,7 @@ import { normalizePhone, isSearchableTail } from '../lib/phone';
 import { getActivePasses, getActivePass, findOrCreateCustomer } from '../lib/customers';
 import { KNOWN_PROVIDERS, publicBase } from '../lib/payments';
 import { encryptSecret, paymentsSecretReady } from '../lib/crypto';
+import { clubBilling, GRACE_DAYS, PERIOD_PRICE } from '../lib/billing';
 
 export const adminRouter = Router();
 
@@ -609,6 +610,7 @@ adminRouter.get('/club', requireAuth, async (req, res) => {
     phone: club.phone,
     address: club.address,
     logoUrl: club.logoUrl,
+    brandColor: club.brandColor,
     telegramChatId: club.telegramChatId,
     slotMinutes: club.slotMinutes,
     leadTimeMinutes: club.leadTimeMinutes,
@@ -672,6 +674,27 @@ adminRouter.patch('/club', requireAuth, async (req, res) => {
     // data: роздує кожну відповідь API.
     logoUrl: z.string().trim().max(500).regex(/^https:\/\/\S+$/).nullable().optional(),
     telegramChatId: z.string().trim().max(60).nullable().optional(),
+    // Колір клубу. Читабельність (контраст з білим >= 4.5:1) підбирає фронт
+    // у safeBrand() і шле вже виправлений hex — тут лишається перевірка форми.
+    brandColor: z.string().trim().regex(/^#[0-9A-Fa-f]{6}$/).nullable().optional(),
+
+    // Робота клубу.
+    //
+    // Ці поля майстер міняє з першого дня, а схема їх мовчки викидала:
+    // z.object() за замовчуванням ВИРІЗАЄ невідомі ключі, а не лається,
+    // тому запит повертав 200, кабінет писав «збережено», і нічого не
+    // змінювалось. Найгірший вид поломки — той, що виглядає як успіх.
+    //
+    // slug свідомо НЕ приймаємо: він стоїть у тегу вбудовування на сайті
+    // клубу, і зміна тихо ламає робочу сторінку.
+    timezone: z.string().trim().max(64).optional(),
+    slotMinutes: z.number().int().min(15).max(180).optional(),
+    leadTimeMinutes: z.number().int().min(0).max(1440).optional(),
+    horizonDays: z.number().int().min(1).max(90).optional(),
+    autoConfirm: z.boolean().optional(),
+    /// Зручний клубу період оплати обслуговування. На доступ не впливає —
+    /// його рахує paidUntil, — але каже нам, як виставляти наступний рахунок.
+    billingPeriod: z.enum(['MONTH', 'QUARTER', 'YEAR']).optional(),
 
     // Передоплата
     prepayEnabled: z.boolean().optional(),
@@ -696,6 +719,27 @@ adminRouter.patch('/club', requireAuth, async (req, res) => {
     }
   }
 
+  /**
+   * Таймзону не можна міняти, коли броні вже є.
+   *
+   * Робочі години лежать у базі хвилинами від опівночі ЗА ТАЙМЗОНОЮ КЛУБУ,
+   * а самі броні — в UTC. Зміна таймзони не пересуває ні те, ні інше: вона
+   * тихо посуває всю сітку відносно вже проданого часу. Заняття о 19:00
+   * лишиться о 19:00 UTC, але в сітці опиниться о 18:00 або о 20:00.
+   *
+   * Перевірка тут, а не в zod, бо вона про стан бази, а не про форму поля.
+   */
+  if (rest.timezone) {
+    const current = await prisma.club.findUnique({
+      where: { id: req.auth!.clubId },
+      select: { timezone: true },
+    });
+    if (current && current.timezone !== rest.timezone) {
+      const bookings = await prisma.booking.count({ where: { clubId: req.auth!.clubId } });
+      if (bookings > 0) return res.status(409).json({ error: 'TIMEZONE_LOCKED' });
+    }
+  }
+
   const club = await prisma.club.update({ where: { id: req.auth!.clubId }, data });
 
   res.json({
@@ -704,6 +748,7 @@ adminRouter.patch('/club', requireAuth, async (req, res) => {
     phone: club.phone,
     address: club.address,
     logoUrl: club.logoUrl,
+    brandColor: club.brandColor,
     telegramChatId: club.telegramChatId,
     prepayEnabled: club.prepayEnabled,
     paymentProvider: club.paymentProvider,
@@ -711,6 +756,53 @@ adminRouter.patch('/club', requireAuth, async (req, res) => {
     // Сам токен не віддаємо навіть власнику клубу — тільки факт наявності
     hasPaymentToken: Boolean(club.paymentTokenEnc),
     webhookUrl: `${publicBase()}/api/pay/webhook/${club.id}`,
+  });
+});
+
+/**
+ * GET /api/admin/billing — стан обслуговування та історія рахунків.
+ *
+ * Клуб має бачити свій строк сам, не питаючи нас. Половина прострочок —
+ * це не «не хочу платити», а «не знав, що вже пора».
+ *
+ * Роут читає, але нічого не змінює: продовження поки проходить поза
+ * системою — переказом, посиланням у Telegram або готівкою, — і `paidUntil`
+ * проставляється руками. Своє автосписання потребувало б еквайрингу, який
+ * ми свідомо не заводимо: гроші гравців ідуть на рахунок клубу, і ставати
+ * посередником у розрахунках заради 500 грн немає сенсу.
+ */
+adminRouter.get('/billing', requireAuth, async (req, res) => {
+  const club = await prisma.club.findUnique({
+    where: { id: req.auth!.clubId },
+    select: { paidUntil: true, billingPeriod: true, isActive: true, createdAt: true },
+  });
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const info = clubBilling(club);
+
+  const invoices = await prisma.clubInvoice.findMany({
+    where: { clubId: req.auth!.clubId },
+    orderBy: { periodTo: 'desc' },
+    take: 24,
+    select: {
+      id: true, periodFrom: true, periodTo: true, amount: true,
+      status: true, method: true, issuedAt: true, paidAt: true,
+    },
+  });
+
+  res.json({
+    state: info.state,
+    online: info.online,
+    paidUntil: info.paidUntil,
+    daysLeft: info.daysLeft,
+    graceLeft: info.graceLeft,
+    graceDays: GRACE_DAYS,
+    period: club.billingPeriod,
+    // Ціни — щоб кабінет не тримав свою копію прайсу й не розходився з нами
+    prices: PERIOD_PRICE,
+    since: club.createdAt,
+    invoices,
+    // billingNote назовні не віддаємо: це наші нотатки про клуб, не його дані
   });
 });
 
