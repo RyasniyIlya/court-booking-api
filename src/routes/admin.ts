@@ -2252,6 +2252,8 @@ adminRouter.get(
         club.autoConfirm,
       prepayEnabled:
         club.prepayEnabled,
+      prepayRequired:
+        club.prepayRequired,
       paymentProvider:
         club.paymentProvider,
       payHoldMinutes:
@@ -2372,6 +2374,10 @@ adminRouter.patch(
           z.boolean()
             .optional(),
 
+        prepayRequired:
+          z.boolean()
+            .optional(),
+
         paymentProvider:
           z.enum(
             KNOWN_PROVIDERS,
@@ -2412,6 +2418,7 @@ adminRouter.patch(
     const paymentFieldsTouched =
       paymentToken !== undefined ||
       rest.prepayEnabled !== undefined ||
+      rest.prepayRequired !== undefined ||
       rest.paymentProvider !== undefined ||
       rest.payHoldMinutes !== undefined;
 
@@ -2512,6 +2519,8 @@ adminRouter.patch(
         club.telegramChatId,
       prepayEnabled:
         club.prepayEnabled,
+      prepayRequired:
+        club.prepayRequired,
       paymentProvider:
         club.paymentProvider,
       payHoldMinutes:

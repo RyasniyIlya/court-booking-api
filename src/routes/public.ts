@@ -95,6 +95,12 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     // Чи є сенс показувати вибір тренера. Сам список тягнемо окремо —
     // він залежить від обраної години.
     hasTrainers: club.trainers.length > 0,
+    // Разом визначають, чи взагалі бачить гравець оплату і чи це вибір,
+    // а чи обов'язок: prepayEnabled=false — оплати немає зовсім;
+    // true+true (типово) — оплата обов'язкова, як і раніше;
+    // true+false — гравець сам обирає «зараз» чи «на місці».
+    prepayEnabled: club.prepayEnabled,
+    prepayRequired: club.prepayRequired,
   });
 });
 
@@ -239,6 +245,12 @@ const bookingSchema = z.object({
   trainerId: z.string().uuid().nullable().optional(),
   /** Куди повернути гравця після платіжки. Віджет підставляє свою сторінку. */
   returnUrl: z.string().url().max(500).optional(),
+  /**
+   * Має сенс тільки коли клуб віддав prepayEnabled && !prepayRequired —
+   * тоді гравець сам обирає. В решті випадків ігнорується: платить,
+   * якщо клуб того вимагає, і не платить, якщо оплати в клубі немає.
+   */
+  payChoice: z.enum(['online', 'onsite']).optional(),
 });
 
 /**
@@ -352,8 +364,16 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
 
   const priceTotal = courtPrice + trainerPrice;
 
-  // Передоплата вмикається клубом і працює тільки якщо є за що платити
-  const provider = club.prepayEnabled ? providerFor(club) : null;
+  // Три стани клуба: оплати немає (prepayEnabled=false), оплата обов'язкова
+  // (prepayRequired=true, типово) — і новий: гравець сам обирає при броні.
+  // У третьому стані вибір обов'язковий — без нього незрозуміло, чи повертати
+  // слот, тому просимо перепитати, а не тихо вгадувати «на місці».
+  if (club.prepayEnabled && !club.prepayRequired && !body.payChoice) {
+    return res.status(400).json({ error: 'PAY_CHOICE_REQUIRED' });
+  }
+
+  const wantsOnlinePay = club.prepayRequired || body.payChoice === 'online';
+  const provider = club.prepayEnabled && wantsOnlinePay ? providerFor(club) : null;
   const needsPay = Boolean(provider) && priceTotal > 0;
   const expiresAt = needsPay
     ? new Date(Date.now() + club.payHoldMinutes * 60_000)
