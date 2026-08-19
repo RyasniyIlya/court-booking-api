@@ -1,12 +1,15 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import rateLimit from 'express-rate-limit';
 import { DateTime } from 'luxon';
 import { prisma, isSlotTakenError, notifyClub } from '../lib/db';
 import { buildSlots, isAlignedToGrid, type Interval } from '../lib/slots';
 import { normalizePhone } from '../lib/phone';
+import bcrypt from 'bcryptjs';
 import { findOrCreateCustomer } from '../lib/customers';
 import { providerFor, publicBase } from '../lib/payments';
 import { clubBilling } from '../lib/billing';
+import { signCustomerToken, verifyCustomerToken, verifyCustomerPin } from '../lib/customerAuth';
 
 export const publicRouter = Router();
 
@@ -251,6 +254,12 @@ const bookingSchema = z.object({
    * якщо клуб того вимагає, і не платить, якщо оплати в клубі немає.
    */
   payChoice: z.enum(['online', 'onsite']).optional(),
+  /**
+   * Необов'язково: гравець заодно заводить собі кабінет — наступного разу
+   * не вводити ім'я й телефон, а увійти по цьому PIN. Без окремого екрана
+   * реєстрації, без SMS — просто галочка "запам'ятати мене" у формі броні.
+   */
+  setPin: z.string().regex(/^\d{4,8}$/).optional(),
 });
 
 /**
@@ -333,6 +342,16 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     rawPhone: body.customerPhone,
   });
   if (customer?.isBlocked) return res.status(403).json({ error: 'CUSTOMER_BLOCKED' });
+
+  let customerToken: string | undefined;
+  if (customer && body.setPin) {
+    const pinHash = await bcrypt.hash(body.setPin, 12);
+    await prisma.customer.update({
+      where: { id: customer.id },
+      data: { pinHash, pinFails: 0, pinLockedUntil: null },
+    });
+    customerToken = signCustomerToken({ customerId: customer.id, clubId: club.id });
+  }
 
   const minutes = (end.getTime() - start.getTime()) / 60_000;
   const courtPrice = Math.round((court.pricePerHour * minutes) / 60);
@@ -443,6 +462,7 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
         priceTotal,
         payUrl: invoice.pageUrl,
         expiresAt: expiresAt!.toISOString(),
+        customerToken,
       });
     } catch (e) {
       // Рахунок не виставився — тримати слот немає підстав, віддаємо назад одразу.
@@ -470,6 +490,7 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     status: booking.status,
     cancelToken: booking.cancelToken,
     priceTotal,
+    customerToken,
   });
 });
 
@@ -521,4 +542,112 @@ publicRouter.post('/bookings/:id/cancel', async (req, res) => {
     data: { status: 'CANCELLED', cancelledAt: new Date() },
   });
   res.json({ ok: true });
+});
+
+/* -------------------------------------------------------------------------- */
+/* КАБІНЕТ ГРАВЦЯ                                                             */
+/* -------------------------------------------------------------------------- */
+
+const customerLoginLimiter = rateLimit({
+  windowMs: 15 * 60_000,
+  limit: 15,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'TOO_MANY_ATTEMPTS' },
+});
+
+/**
+ * POST /api/public/clubs/:slug/customer/login
+ *
+ * Телефон + PIN, заведений раніше через setPin при броні. Немає картки або
+ * немає PIN — PIN_NOT_SET: віджет тоді просто показує звичайну форму.
+ */
+publicRouter.post('/clubs/:slug/customer/login', customerLoginLimiter, async (req, res) => {
+  const parsed = z
+    .object({ phone: z.string().trim(), pin: z.string().regex(/^\d{4,8}$/) })
+    .safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+  const club = await loadClub(slug);
+  if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
+
+  const phone = normalizePhone(parsed.data.phone);
+  if (!phone) return res.status(400).json({ error: 'BAD_PHONE' });
+
+  const customer = await prisma.customer.findUnique({
+    where: { clubId_phone: { clubId: club.id, phone: phone.e164 } },
+  });
+  if (!customer) return res.status(404).json({ error: 'PIN_NOT_SET' });
+
+  const result = await verifyCustomerPin(customer.id, parsed.data.pin);
+  if (!result.ok) {
+    const status = result.reason === 'LOCKED' ? 423 : result.reason === 'NOT_SET' ? 404 : 403;
+    const error =
+      result.reason === 'LOCKED' ? 'PIN_LOCKED'
+        : result.reason === 'NOT_SET' ? 'PIN_NOT_SET'
+          : 'INVALID_PIN';
+    return res.status(status).json({ error });
+  }
+
+  res.json({
+    token: signCustomerToken({ customerId: customer.id, clubId: club.id }),
+    name: customer.name,
+    phone: customer.phone,
+  });
+});
+
+function requireCustomerAuth(req: import('express').Request, res: import('express').Response) {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'UNAUTHORIZED' });
+    return null;
+  }
+  const auth = verifyCustomerToken(header.slice(7));
+  if (!auth) {
+    res.status(401).json({ error: 'UNAUTHORIZED' });
+    return null;
+  }
+  return auth;
+}
+
+/**
+ * GET /api/public/customer/me
+ *
+ * Профіль + майбутні броні гравця в цьому клубі — щоб побачив, що вже
+ * записаний, а не тільки щоб не передруковувати ім'я вкотре.
+ */
+publicRouter.get('/customer/me', async (req, res) => {
+  const auth = requireCustomerAuth(req, res);
+  if (!auth) return;
+
+  const customer = await prisma.customer.findUnique({ where: { id: auth.customerId } });
+  if (!customer || customer.clubId !== auth.clubId) {
+    return res.status(404).json({ error: 'NOT_FOUND' });
+  }
+
+  const upcoming = await prisma.booking.findMany({
+    where: {
+      customerId: customer.id,
+      status: { in: [...BUSY_STATUSES] },
+      startTime: { gte: new Date() },
+    },
+    include: { court: { select: { name: true } } },
+    orderBy: { startTime: 'asc' },
+    take: 20,
+  });
+
+  res.json({
+    name: customer.name,
+    phone: customer.phone,
+    upcoming: upcoming.map((b) => ({
+      id: b.id,
+      courtName: b.court.name,
+      start: b.startTime.toISOString(),
+      end: b.endTime.toISOString(),
+      status: b.status,
+      priceTotal: b.priceTotal,
+      cancelToken: b.cancelToken,
+    })),
+  });
 });

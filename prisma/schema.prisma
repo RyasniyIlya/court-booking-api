@@ -399,6 +399,14 @@ model Customer {
   /// Чорний список: не пускати онлайн-бронювання
   isBlocked Boolean @default(false)
 
+  /// Особистий кабінет гравця: телефон + PIN, той самий патерн, що й PIN
+  /// персоналу в User. Не пароль і не SMS-код — жодного зовнішнього
+  /// провайдера відправки не додаємо. null = кабінет ще не заведено,
+  /// гравець просто вводить ім'я й телефон щоразу, як і раніше.
+  pinHash        String?
+  pinFails       Int       @default(0)
+  pinLockedUntil DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 

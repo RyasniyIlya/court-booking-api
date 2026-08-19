@@ -116,7 +116,7 @@ function signToken(auth: Auth, expiresIn: string) {
   });
 }
 
-function requireAuth(
+export function requireAuth(
   req: Request,
   res: Response,
   next: NextFunction,
@@ -186,7 +186,7 @@ function requireLevel(level: AccessLevel) {
   };
 }
 
-function requireRole(...roles: string[]) {
+export function requireRole(...roles: string[]) {
   return (
     req: Request,
     res: Response,

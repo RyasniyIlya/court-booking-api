@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { publicRouter } from './routes/public';
 import { adminRouter } from './routes/admin';
+import { analyticsRouter } from './routes/analytics';
 import { platformRouter } from './routes/platform';
 import { payRouter } from './routes/pay';
 import { startExpirySweeper } from './lib/expire';
@@ -66,6 +67,7 @@ app.use('/api/platform', cors({
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/public', publicRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/admin/analytics', analyticsRouter);
 app.use('/api/platform', platformRouter);
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
