@@ -4,7 +4,14 @@ generator client {
 
 datasource db {
   provider = "postgresql"
-  url      = env("DATABASE_URL")
+  // Пулене з'єднання (PgBouncer, transaction mode) — для запитів застосунку.
+  url       = env("DATABASE_URL")
+  // Пряме з'єднання в обхід пулера — тільки для migrate/introspect. Advisory
+  // lock, на якому тримається `prisma migrate deploy`, ненадійно живе через
+  // transaction-pooling: сесія може розпастись між стейтментами, і лок або
+  // не береться, або виглядає зайнятим назавжди (P1002). Neon і Prisma обидва
+  // документують саме це як причину — https://pris.ly/d/migrate-advisory-locking
+  directUrl = env("DIRECT_URL")
 }
 
 enum BookingStatus {

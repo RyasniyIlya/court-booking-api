@@ -10,8 +10,15 @@ services:
     plan: starter
     healthCheckPath: /health
     envVars:
-      # Рядок підключення з дашборда Neon. Вставити вручну.
+      # Пулений рядок підключення з дашборда Neon (хост з "-pooler"). Вставити вручну.
       - key: DATABASE_URL
+        sync: false
+
+      # Той самий Neon, але БЕЗ "-pooler" у хості — окреме поле в дашборді
+      # Neon "Connection string" -> "Direct connection". Обов'язково: без
+      # нього `prisma migrate deploy` падає з P1002 (advisory lock не тримається
+      # через PgBouncer transaction-pooling).
+      - key: DIRECT_URL
         sync: false
 
       - key: JWT_SECRET
@@ -41,6 +48,12 @@ services:
         sync: false
 
       - key: TELEGRAM_BOT_TOKEN
+        sync: false
+
+      # Оператор платформи (/platform). Без обох — панель віддає 503.
+      - key: PLATFORM_ADMIN_EMAIL
+        sync: false
+      - key: PLATFORM_ADMIN_PASSWORD_HASH
         sync: false
 
       - key: PORT
