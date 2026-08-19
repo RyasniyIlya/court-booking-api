@@ -9,7 +9,9 @@ import bcrypt from 'bcryptjs';
 import { findOrCreateCustomer } from '../lib/customers';
 import { providerFor, publicBase } from '../lib/payments';
 import { clubBilling } from '../lib/billing';
-import { signCustomerToken, verifyCustomerToken, verifyCustomerPin } from '../lib/customerAuth';
+import {
+  signCustomerToken, verifyCustomerToken, verifyCustomerPin, hashPinLookup, isPinTakenError,
+} from '../lib/customerAuth';
 
 export const publicRouter = Router();
 
@@ -344,13 +346,22 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
   if (customer?.isBlocked) return res.status(403).json({ error: 'CUSTOMER_BLOCKED' });
 
   let customerToken: string | undefined;
+  let pinTaken = false;
   if (customer && body.setPin) {
     const pinHash = await bcrypt.hash(body.setPin, 12);
-    await prisma.customer.update({
-      where: { id: customer.id },
-      data: { pinHash, pinFails: 0, pinLockedUntil: null },
-    });
-    customerToken = signCustomerToken({ customerId: customer.id, clubId: club.id });
+    const pinLookupHash = hashPinLookup(club.id, body.setPin);
+    try {
+      await prisma.customer.update({
+        where: { id: customer.id },
+        data: { pinHash, pinLookupHash, pinFails: 0, pinLockedUntil: null },
+      });
+      customerToken = signCustomerToken({ customerId: customer.id, clubId: club.id });
+    } catch (e) {
+      // Цей PIN уже чийсь у клубі — бронь усе одно має пройти, просто без
+      // кабінету. Гравець спробує інший PIN наступного разу.
+      if (!isPinTakenError(e)) throw e;
+      pinTaken = true;
+    }
   }
 
   const minutes = (end.getTime() - start.getTime()) / 60_000;
@@ -463,6 +474,7 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
         payUrl: invoice.pageUrl,
         expiresAt: expiresAt!.toISOString(),
         customerToken,
+        pinTaken,
       });
     } catch (e) {
       // Рахунок не виставився — тримати слот немає підстав, віддаємо назад одразу.
@@ -491,6 +503,7 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     cancelToken: booking.cancelToken,
     priceTotal,
     customerToken,
+    pinTaken,
   });
 });
 

@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import { createHmac } from 'node:crypto';
 import { prisma } from './db';
 import { JWT_SECRET } from './authSecret';
 
@@ -7,6 +8,24 @@ const MAX_PIN_FAILS = 5;
 const PIN_LOCK_MINUTES = 15;
 
 export type CustomerAuth = { scope: 'customer'; customerId: string; clubId: string };
+
+/**
+ * Швидкий детермінований відбиток PIN для перевірки унікальності в межах
+ * клубу — bcrypt для цього не годиться: у нього свій рандомний salt, тому
+ * два однакові PIN дають різні хеші і порівнювати можна тільки перебором
+ * (bcrypt.compare навмисно повільний, ~100+ мс — для клубу з сотнею
+ * клієнтів це секунди на одну спробу забронювати). HMAC із серверним
+ * секретом детермінований і швидкий, але сам по собі нікого не пускає —
+ * вхід усе одно перевіряється через bcrypt.compare(pin, pinHash).
+ */
+export function hashPinLookup(clubId: string, pin: string): string {
+  return createHmac('sha256', JWT_SECRET).update(`customer-pin:${clubId}:${pin}`).digest('hex');
+}
+
+/** P2002 — порушення @@unique([clubId, pinLookupHash]): цей PIN уже чийсь у клубі. */
+export function isPinTakenError(e: unknown): boolean {
+  return (e as { code?: string })?.code === 'P2002';
+}
 
 /** 30 днів: це "запам'ятати мене" для гравця, не робоча сесія персоналу. */
 export function signCustomerToken(auth: Omit<CustomerAuth, 'scope'>) {

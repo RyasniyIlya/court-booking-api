@@ -7,13 +7,16 @@ import { requireAuth, requireRole } from './admin';
 /**
  * CRM-аналітика для власника клубу. Окремий файл, а не ще один розділ
  * у admin.ts (той і так росте з кожною фічею) — увесь модуль про читання
- * даних, жодного запису, тому й вимоги простіші: requireAuth + роль,
- * без requireLevel — переглянути виручку не небезпечніше, ніж переглянути
- * список броней, який і так відкритий на рівні 1.
+ * даних, жодного запису.
+ *
+ * Тільки OWNER, свідомо без ADMIN: виручка й список найчастіших клієнтів —
+ * це бізнес-дані власника, а не операційна інформація для щоденної роботи
+ * ресепшена. requireLevel тут не потрібен — це той самий "перегляд", що
+ * список броней на рівні 1, просто звужений по ролі, а не по рівню.
  */
 export const analyticsRouter = Router();
 
-analyticsRouter.use(requireAuth, requireRole('OWNER', 'ADMIN'));
+analyticsRouter.use(requireAuth, requireRole('OWNER'));
 
 const periodQuery = z.object({
   period: z.enum(['week', 'month']).default('week'),

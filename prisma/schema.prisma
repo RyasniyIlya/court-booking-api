@@ -406,6 +406,12 @@ model Customer {
   pinHash        String?
   pinFails       Int       @default(0)
   pinLockedUntil DateTime?
+  /// HMAC(PIN) — швидкий детермінований відбиток лише для перевірки
+  /// унікальності PIN у межах клубу. НЕ використовується для входу (для
+  /// цього bcrypt-порівняння з pinHash) — сам по собі він нічого не пускає,
+  /// тільки дозволяє БД миттєво відхилити дубль замість перебору bcrypt
+  /// по всіх клієнтах клубу.
+  pinLookupHash String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -416,6 +422,9 @@ model Customer {
   /// Телефон унікальний у межах клубу, а не глобально:
   /// одна людина може ходити у два клуби — це різні картки.
   @@unique([clubId, phone])
+  /// Один PIN — один клієнт клубу. NULL не бере участі в унікальності
+  /// (у Postgres NULL != NULL), тому клієнтів без кабінету це не чіпає.
+  @@unique([clubId, pinLookupHash])
   @@index([clubId, phoneTail])
 }
 
