@@ -9,6 +9,11 @@ import { paymentsSecretReady } from './lib/crypto';
 
 const app = express();
 
+// За Render/Vercel завжди один хоп реверс-проксі: без цього req.ip показує
+// адресу проксі, а не клієнта, і express-rate-limit або лічить усіх одним
+// IP, або сам відмовляється працювати, помітивши недовірений X-Forwarded-For.
+app.set('trust proxy', 1);
+
 // Платіжка монтується ПЕРШОЮ і читає сире тіло: підпис вебхука рахується
 // від байтів. Якщо тіло пройде через express.json(), підпис не збіжиться.
 app.use('/api/pay', express.raw({ type: '*/*', limit: '100kb' }), payRouter);

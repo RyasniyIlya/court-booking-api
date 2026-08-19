@@ -33,6 +33,9 @@ enum BookingSource {
 enum UserRole {
   OWNER
   ADMIN
+  /// Доступ тільки до власного розкладу (свої заняття як тренера).
+  /// Не бачить клієнтів інших тренерів, білінг і налаштування клубу.
+  TRAINER
 }
 
 /// Спортивний клуб = один тенант SaaS
@@ -109,6 +112,9 @@ model Club {
   payments  Payment[]
   trainers  Trainer[]
   invoices  ClubInvoice[]
+  /// Коли ми підтвердили клуб після реєстрації. null = чекає на дзвінок/оплату.
+  /// Впливає на віддачу даних для публічного віджета.
+  approvedAt DateTime?
 }
 
 /// Період оплати обслуговування. Клуб обирає сам: комусь зручніше щомісяця
@@ -184,6 +190,7 @@ model Trainer {
   updatedAt DateTime @updatedAt
 
   bookings Booking[]
+  staffAccounts User[]
 
   @@index([clubId, isActive])
 }
@@ -347,6 +354,20 @@ model User {
   passwordHash String
   role         UserRole @default(OWNER)
   createdAt    DateTime @default(now())
+  pinModerHash   String?
+
+  /// ПІН режиму власника (рівень 3). bcrypt.
+  pinOwnerHash   String?
+
+  /// Захист від перебору: 4 цифри підбираються за хвилини.
+  pinFails       Int       @default(0)
+  pinLockedUntil DateTime?
+
+  /// Прив'язка акаунта TRAINER до картки тренера — визначає, чиї заняття
+  /// він бачить у /bookings. SetNull, а не Cascade: звільнення тренера
+  /// не має ламати сам акаунт (гасити його — окрема дія).
+  trainerId String?  @db.Uuid
+  trainer   Trainer? @relation(fields: [trainerId], references: [id], onDelete: SetNull)
 }
 
 enum PassType {
