@@ -12,6 +12,8 @@ import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 
+import { JWT_SECRET } from '../lib/authSecret';
+
 import { prisma, isSlotTakenError } from '../lib/db';
 import {
   normalizePhone,
@@ -65,14 +67,7 @@ declare global {
   }
 }
 
-// Дефолт лишається тільки для локальної розробки. У production мовчазний
-// відкат означав би, що будь-хто підписує собі токен рівня 3 значенням
-// із відкритих джерел — тож там падаємо на старті, а не на першому запиті.
-if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
-  throw new Error('JWT_SECRET не задано — в production це обов’язково.');
-}
-
-const SECRET = process.env.JWT_SECRET ?? 'dev-secret-change-me';
+const SECRET = JWT_SECRET;
 
 /**
  * IP-ліміти на вхід/PIN — другий рубіж поверх bcrypt і власного

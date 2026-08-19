@@ -3,6 +3,7 @@ import express from 'express';
 import cors from 'cors';
 import { publicRouter } from './routes/public';
 import { adminRouter } from './routes/admin';
+import { platformRouter } from './routes/platform';
 import { payRouter } from './routes/pay';
 import { startExpirySweeper } from './lib/expire';
 import { paymentsSecretReady } from './lib/crypto';
@@ -49,9 +50,23 @@ app.use('/api/admin', cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
+// Той самий origin-allowlist, що й кабінет клубу — платформна панель живе
+// в тому самому фронтенді, просто за іншим шляхом і іншим входом.
+app.use('/api/platform', cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    if (adminOrigins.includes(origin.replace(/\/+$/, ''))) return cb(null, true);
+    if (process.env.NODE_ENV !== 'production') return cb(null, true);
+    cb(null, false);
+  },
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/public', publicRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/platform', platformRouter);
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error('[unhandled]', err);
