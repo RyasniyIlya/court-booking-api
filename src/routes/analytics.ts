@@ -273,3 +273,109 @@ analyticsRouter.get('/forecast', async (req, res) => {
     series,
   });
 });
+
+/* -------------------------------------------------------------------------- */
+/* ВИТРАТИ І ЧИСТИЙ ПРИБУТОК                                                  */
+/* -------------------------------------------------------------------------- */
+
+const monthQuery = z.object({
+  /** YYYY-MM. За замовчуванням — поточний місяць клуба. */
+  month: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+});
+
+/** 'YYYY-MM' (або порожньо — тоді поточний місяць у таймзоні клуба) -> межі місяця. */
+function monthBounds(monthStr: string | undefined, tz: string) {
+  const anchor = monthStr
+    ? DateTime.fromFormat(monthStr, 'yyyy-MM', { zone: tz })
+    : DateTime.now().setZone(tz);
+  const start = anchor.startOf('month');
+  return {
+    monthKey: start.toFormat('yyyy-MM'),
+    monthDate: start.toJSDate(),
+    start: start.toJSDate(),
+    end: start.endOf('month').toJSDate(),
+  };
+}
+
+/**
+ * GET /api/admin/analytics/expenses?month=YYYY-MM
+ *
+ * Витрати за місяць + виручка того самого місяця + чистий прибуток одним
+ * запитом — власнику потрібне готове число, а не сирі дані для підрахунку.
+ */
+analyticsRouter.get('/expenses', async (req, res) => {
+  const parsed = monthQuery.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const club = await prisma.club.findUnique({
+    where: { id: req.auth!.clubId },
+    select: { timezone: true },
+  });
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const { monthKey, monthDate, start, end } = monthBounds(parsed.data.month, club.timezone);
+
+  const [expenses, stats] = await Promise.all([
+    prisma.clubExpense.findMany({
+      where: { clubId: req.auth!.clubId, month: monthDate },
+      orderBy: { createdAt: 'asc' },
+    }),
+    periodStats(req.auth!.clubId, start, end),
+  ]);
+
+  const totalExpenses = expenses.reduce((s, e) => s + e.amount, 0);
+
+  res.json({
+    month: monthKey,
+    expenses,
+    totalExpenses,
+    revenue: stats.revenue,
+    netProfit: stats.revenue - totalExpenses,
+  });
+});
+
+const addExpenseSchema = z.object({
+  month: z.string().regex(/^\d{4}-\d{2}$/),
+  category: z.enum(['SALARY', 'RENT', 'BANK_FEE', 'UTILITIES', 'OTHER']),
+  label: z.string().trim().min(1).max(120),
+  /** Гривні з поля вводу, як і решта грошових полів у кабінеті — переводимо в копійки тут. */
+  amountGrn: z.number().positive(),
+});
+
+/** POST /api/admin/analytics/expenses — додати рядок витрат за місяць. */
+analyticsRouter.post('/expenses', async (req, res) => {
+  const parsed = addExpenseSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const club = await prisma.club.findUnique({
+    where: { id: req.auth!.clubId },
+    select: { timezone: true },
+  });
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const { monthDate } = monthBounds(parsed.data.month, club.timezone);
+
+  const expense = await prisma.clubExpense.create({
+    data: {
+      clubId: req.auth!.clubId,
+      month: monthDate,
+      category: parsed.data.category,
+      label: parsed.data.label,
+      amount: Math.round(parsed.data.amountGrn * 100),
+    },
+  });
+
+  res.status(201).json(expense);
+});
+
+/** DELETE /api/admin/analytics/expenses/:id */
+analyticsRouter.delete('/expenses/:id', async (req, res) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  const result = await prisma.clubExpense.deleteMany({
+    where: { id, clubId: req.auth!.clubId },
+  });
+
+  if (result.count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
+  res.json({ ok: true });
+});

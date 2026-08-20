@@ -123,9 +123,42 @@ model Club {
   payments  Payment[]
   trainers  Trainer[]
   invoices  ClubInvoice[]
+  expenses  ClubExpense[]
   /// Коли ми підтвердили клуб після реєстрації. null = чекає на дзвінок/оплату.
   /// Впливає на віддачу даних для публічного віджета.
   approvedAt DateTime?
+}
+
+enum ExpenseCategory {
+  SALARY
+  RENT
+  BANK_FEE
+  UTILITIES
+  OTHER
+}
+
+/// Витрати клубу — вводяться власником вручну (зарплати, оренда, комісія
+/// банку тощо), щоб аналітика могла показати не тільки виручку, а й чистий
+/// прибуток. Свідомо без автоматичного розрахунку комісії банку: у нас
+/// немає даних про тарифи еквайрингу кожного провайдера, тож це теж просто
+/// рядок витрат, який власник вводить сам.
+model ClubExpense {
+  id     String @id @default(uuid()) @db.Uuid
+  clubId String @db.Uuid
+  club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+
+  /// Перше число місяця, до якого належить витрата. Час не має значення —
+  /// витрата завжди місячна, а не прив'язана до конкретного дня.
+  month    DateTime @db.Date
+  category ExpenseCategory
+  /// Довільний підпис: "Зарплата адміністратора Марії", "Оренда"
+  label  String
+  /// Копійки
+  amount Int
+
+  createdAt DateTime @default(now())
+
+  @@index([clubId, month])
 }
 
 /// Період оплати обслуговування. Клуб обирає сам: комусь зручніше щомісяця
