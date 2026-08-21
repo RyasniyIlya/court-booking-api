@@ -3409,6 +3409,11 @@ adminRouter.post(
         password: z.string().min(8).max(200),
         role: z.enum(['ADMIN', 'TRAINER']),
         trainerId: z.string().uuid().nullable().optional(),
+        // Без цього новий співробітник заходив на LEVEL 1 і назавжди лишався
+        // там: /elevate вимагає pinModerHash, а поставити його самому можна
+        // тільки з LEVEL 2. Власник задає PIN одразу тут же, як і собі при
+        // реєстрації клубу — той самий патерн, той самий /elevate потім.
+        moderatorPin: z.string().regex(/^\d{4,8}$/).optional(),
       })
       .safeParse(req.body);
 
@@ -3441,6 +3446,10 @@ adminRouter.post(
 
     const passwordHash = await bcrypt.hash(parsed.data.password, 10);
 
+    const pinModerHash = parsed.data.moderatorPin
+      ? await bcrypt.hash(parsed.data.moderatorPin, 12)
+      : null;
+
     const user = await prisma.user.create({
       data: {
         clubId: req.auth!.clubId,
@@ -3448,6 +3457,7 @@ adminRouter.post(
         passwordHash,
         role: parsed.data.role,
         trainerId: parsed.data.trainerId ?? null,
+        pinModerHash,
       },
       select: {
         id: true,

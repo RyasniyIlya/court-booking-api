@@ -8,7 +8,14 @@ export const EXCLUSION_VIOLATION = '23P01';
 export function isSlotTakenError(e: unknown): boolean {
   const code = (e as { code?: string })?.code;
   const meta = (e as { meta?: { code?: string } })?.meta?.code;
-  return code === EXCLUSION_VIOLATION || meta === EXCLUSION_VIOLATION;
+  if (code === EXCLUSION_VIOLATION || meta === EXCLUSION_VIOLATION) return true;
+
+  // EXCLUDE-констрейнт (на відміну від UNIQUE/P2002) Prisma не розпізнає як
+  // PrismaClientKnownRequestError — .code і .meta лишаються undefined. Код
+  // Postgres долітає тільки текстом усередині .message необробленого
+  // PrismaClientUnknownRequestError, тому перевіряємо і цей шлях.
+  const message = (e as { message?: string })?.message ?? '';
+  return message.includes(EXCLUSION_VIOLATION);
 }
 
 /** Сповіщення адміністратору клубу. Помилка Telegram не має ламати бронь. */
