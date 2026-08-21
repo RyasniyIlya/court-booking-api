@@ -396,6 +396,19 @@ adminRouter.post('/register', registerLimiter, async (req, res) => {
           },
         });
 
+        // Дефолтні години — щодня 08:00–22:00. Без цього віджет показував би
+        // "зачинено" всі сім днів, поки власник не дійде до кроку "Години"
+        // в майстрі: свіжозареєстрований клуб має щось живе одразу, а не
+        // порожню сітку в перші хвилини.
+        await tx.clubHours.createMany({
+          data: Array.from({ length: 7 }, (_, weekday) => ({
+            clubId: club.id,
+            weekday,
+            openMinute: 8 * 60,
+            closeMinute: 22 * 60,
+          })),
+        });
+
         const user = await tx.user.create({
           data: {
             email: data.email,
@@ -413,20 +426,26 @@ adminRouter.post('/register', registerLimiter, async (req, res) => {
       },
     );
 
+    // Рівень 2, а не 1: PIN модератора щойно заданий у цьому самому запиті —
+    // перепитувати його одразу ж окремим /elevate було б абсурдним UX
+    // ("ви щойно ввели PIN, а тепер введіть ще раз, щоб зберегти майстер").
+    // 45 хвилин, а не 7 днів токена логіну: та сама тривалість, що й у
+    // звичайного /elevate — рівень 2 залишається коротким вікном, навіть
+    // коли отриманий одразу при реєстрації.
     const token = signToken(
       {
         userId: result.user.id,
         clubId: result.club.id,
         role: result.user.role,
-        level: 1,
+        level: 2,
         trainerId: null,
       },
-      '7d',
+      '45m',
     );
 
     return res.status(201).json({
       token,
-      level: 1,
+      level: 2,
       club: {
         id: result.club.id,
         name: result.club.name,
@@ -2415,12 +2434,29 @@ adminRouter.patch(
       ...rest
     } = parsed.data;
 
+    // Порівнюємо зі СПРАВЖНІМИ значеннями в базі, а не з тим, чи поле
+    // взагалі є в тілі запиту: майстер клубу (ClubSetupWizard) шле club
+    // одним цільним обʼєктом і завжди включає ці поля, навіть коли їх
+    // ніхто не чіпав — інакше рівень 3 вимагався б навіть для зміни
+    // назви клубу через майстер.
+    const current = await prisma.club.findUnique({
+      where: { id: req.auth!.clubId },
+      select: {
+        prepayEnabled: true,
+        prepayRequired: true,
+        paymentProvider: true,
+        payHoldMinutes: true,
+      },
+    });
+
     const paymentFieldsTouched =
+      // Сам токен порівняти нема з чим (у базі він шифрований) — будь-яка
+      // спроба його передати вважається зміною.
       paymentToken !== undefined ||
-      rest.prepayEnabled !== undefined ||
-      rest.prepayRequired !== undefined ||
-      rest.paymentProvider !== undefined ||
-      rest.payHoldMinutes !== undefined;
+      (rest.prepayEnabled !== undefined && rest.prepayEnabled !== current?.prepayEnabled) ||
+      (rest.prepayRequired !== undefined && rest.prepayRequired !== current?.prepayRequired) ||
+      (rest.paymentProvider !== undefined && rest.paymentProvider !== current?.paymentProvider) ||
+      (rest.payHoldMinutes !== undefined && rest.payHoldMinutes !== current?.payHoldMinutes);
 
     // Платіжна інтеграція — гроші клубу йдуть повз нас напряму на його
     // еквайринг, тому переприв'язати токен має право тільки LEVEL 3.
