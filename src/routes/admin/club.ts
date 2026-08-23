@@ -2,9 +2,9 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
-import { KNOWN_PROVIDERS, publicBase } from '../../lib/payments';
+import { KNOWN_PROVIDERS, providerFor, publicBase } from '../../lib/payments';
 import { encryptSecret, paymentsSecretReady } from '../../lib/crypto';
-import { requireAuth, requireLevel } from './shared';
+import { requireAuth, requireStaff, requireLevel } from './shared';
 
 export const clubRouter = Router();
 
@@ -79,6 +79,7 @@ clubRouter.get(
 clubRouter.patch(
   '/club',
   requireAuth,
+  requireStaff,
   requireLevel(2),
   async (req, res) => {
     const parsed = z
@@ -246,6 +247,21 @@ clubRouter.patch(
       });
     }
 
+    // Період оплати нашого обслуговування — рахунок виставляється власнику
+    // клубу, не модератору. Модератор бачить стан підписки (йому треба
+    // знати, коли вимкнеться онлайн-запис), але не переводить клуб з
+    // місячної на річну. Роль, а не рівень: це не робота з секретом, і
+    // ганяти власника за окремим PIN заради перемикача — зайве.
+    if (
+      rest.billingPeriod !== undefined &&
+      req.auth!.role !== 'OWNER'
+    ) {
+      return res.status(403).json({
+        error: 'FORBIDDEN',
+        requiredRole: ['OWNER'],
+      });
+    }
+
     const data: Record<
       string,
       unknown
@@ -346,6 +362,94 @@ clubRouter.patch(
       webhookUrl:
         `${publicBase()}/api/pay/webhook/${club.id}`,
     });
+  },
+);
+
+/* PAYMENT TEST                                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * POST /api/admin/club/payment-test
+ *
+ * Перевірка еквайрингу до першої справжньої броні.
+ *
+ * Навіщо. Токен вводиться руками з кабінету банку, а помиляються в ньому
+ * легко — зайвий пробіл, обрізаний хвіст, узятий не з того мерчанта.
+ * Досі клуб дізнавався про це в найгіршу мить: перший гравець тисне
+ * «Оплатити», бек не може виставити рахунок і віддає 502, слот
+ * звільняється, а на екрані — «Оплата тимчасово недоступна». Тут те саме
+ * робиться завчасно й тихо: виставляємо рахунок на 1 грн і одразу гасимо.
+ *
+ * Рахунок НЕ зберігається в Payment: там `bookingId` обов'язковий, та й
+ * платіж без броні у звітності клубу — сміття. Це разова перевірка того,
+ * що банк узагалі відповідає на цей токен.
+ *
+ * Рівень 3, як і сама прив'язка токена: перевірка ходить у банк від імені
+ * клубу, і давати її тому, кому не можна міняти токен, немає підстав.
+ */
+clubRouter.post(
+  '/club/payment-test',
+  requireAuth,
+  requireStaff,
+  requireLevel(3),
+  async (req, res) => {
+    const club = await prisma.club.findUnique({
+      where: { id: req.auth!.clubId },
+      select: {
+        id: true,
+        name: true,
+        paymentProvider: true,
+        paymentTokenEnc: true,
+      },
+    });
+
+    if (!club) {
+      return res.status(404).json({ error: 'NOT_FOUND' });
+    }
+
+    const provider = providerFor(club);
+
+    if (!provider) {
+      // Причин рівно три, і клубу треба знати яку саме: провайдер не
+      // обраний, токен не введений, або токен не розшифрувався (змінили
+      // PAYMENTS_SECRET). Розрізняє їх providerFor, але назовні різниця
+      // одна: платити зараз неможливо.
+      return res.status(400).json({
+        error: 'PAYMENTS_NOT_CONFIGURED',
+        hasProvider: Boolean(club.paymentProvider),
+        hasToken: Boolean(club.paymentTokenEnc),
+      });
+    }
+
+    try {
+      const invoice = await provider.createInvoice({
+        amountKop: 100,
+        reference: `test-${club.id}`,
+        destination: `${club.name}: перевірка еквайрингу`,
+        redirectUrl: `${publicBase()}/api/pay/done`,
+        webHookUrl: `${publicBase()}/api/pay/webhook/${club.id}`,
+        ttlSeconds: 300,
+      });
+
+      // Гасимо одразу: рахунок нікому не показувався і висіти в кабінеті
+      // банку йому нема чого. Якщо не вийшло — не біда, він протухне сам
+      // за п'ять хвилин, а перевірку ми вже провели.
+      void provider
+        .cancelUnpaid(invoice.providerRef)
+        .catch((e) => console.warn('[pay] test cancel', (e as Error).message));
+
+      return res.json({
+        ok: true,
+        provider: provider.name,
+      });
+    } catch (e) {
+      console.error('[pay] перевірка токена не пройшла', e);
+
+      return res.status(502).json({
+        error: 'PAYMENT_TEST_FAILED',
+        provider: provider.name,
+      });
+    }
   },
 );
 

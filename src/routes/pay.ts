@@ -55,13 +55,80 @@ payRouter.post('/webhook/:clubId', async (req, res) => {
   res.json({ ok: true });
 });
 
+/* ── Куди повертається гравець ───────────────────────────────────────────── */
+
+const esc = (s: string) => s.replace(/[<>&"]/g, (c) =>
+  ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c] as string));
+
+const page = (title: string, body: string) => `<!doctype html>
+<html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${esc(title)}</title>
+<style>
+ body{margin:0;min-height:100vh;display:grid;place-items:center;background:#F4F6F4;padding:20px;
+      font:15px/1.5 ui-sans-serif,system-ui,sans-serif;color:#101418}
+ .c{width:340px;max-width:100%;background:#fff;border:1px solid #E4E7E4;border-radius:16px;padding:24px;text-align:center}
+ h1{margin:0 0 8px;font-size:19px;font-weight:650}
+ p{margin:0;font-size:14px;color:#6E7671}
+ .d{margin:0 0 14px;font-size:13px;color:#6E7671;font-variant-numeric:tabular-nums}
+</style></head><body><div class="c">${body}</div></body></html>`;
+
+/**
+ * GET /api/pay/done — запасна сторінка повернення з платіжки.
+ *
+ * Зазвичай банк повертає гравця на сайт клубу: віджет сам підставляє свою
+ * адресу в `returnUrl`, ловить `?cbPay=` і показує результат у собі
+ * (див. bookingStore.checkReturn). Але `safeReturnUrl` відкидає чужий
+ * origin — це захист від відкритого редіректу, — і тоді падає сюди. Досі
+ * тут не було нічого: гравець, який щойно заплатив, бачив 404 від Express
+ * і не знав, пройшли гроші чи ні.
+ *
+ * Джерело правди — вебхук, а не факт повернення. Тому статус беремо з бази,
+ * а не з параметрів у адресі: підмінити їх у рядку браузера може будь-хто.
+ */
+payRouter.get('/done', async (req, res) => {
+  const token = String(req.query.cbPay ?? '');
+
+  const booking = /^[0-9a-f-]{36}$/i.test(token)
+    ? await prisma.booking.findUnique({
+        where: { cancelToken: token },
+        include: { club: { select: { name: true, phone: true, timezone: true } } },
+      })
+    : null;
+
+  if (!booking) {
+    return res.type('html').send(page(
+      'Готово',
+      '<h1>Готово</h1><p>Цю вкладку можна закрити й повернутись на сайт клубу.</p>',
+    ));
+  }
+
+  const when = booking.startTime.toLocaleString('uk-UA', {
+    timeZone: booking.club.timezone,
+    day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+  });
+  const tel = booking.club.phone
+    ? `<p>Питання — <a href="tel:${esc(booking.club.phone)}">${esc(booking.club.phone)}</a></p>`
+    : '';
+
+  const text =
+    booking.status === 'CONFIRMED'
+      ? '<h1>Оплачено</h1><p>Бронь підтверджена. Чекаємо вас.</p>'
+      : booking.status === 'PENDING'
+        ? '<h1>Оплата обробляється</h1><p>Щойно банк підтвердить платіж, бронь стане підтвердженою. Зазвичай це кілька секунд.</p>'
+        : booking.status === 'EXPIRED'
+          ? '<h1>Оплату не завершено</h1><p>Час повернувся у сітку. Спробуйте забронювати ще раз.</p>'
+          : '<h1>Бронь скасована</h1><p>Якщо гроші списались — вони повернуться на картку.</p>';
+
+  res.type('html').send(page(
+    'Оплата',
+    `${text}<p class="d">${esc(booking.club.name)} · ${esc(when)}</p>${tel}`,
+  ));
+});
+
 /* ── Заглушка для локальної розробки ──────────────────────────────────────
    Дві кнопки замість сторінки банку. Дьоргає той самий вебхук, що й моно,
    тому перевіряється весь ланцюжок, а не лише редірект.
    На проді провайдер mock вимкнено (див. lib/payments/index.ts).       */
-
-const esc = (s: string) => s.replace(/[<>&"]/g, (c) =>
-  ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c] as string));
 
 payRouter.get('/mock/:ref', (req, res) => {
   if (process.env.NODE_ENV === 'production') return res.status(404).end();

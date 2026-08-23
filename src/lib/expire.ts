@@ -31,18 +31,29 @@ export async function sweepExpired(now = new Date()): Promise<number> {
 
   for (const b of stale) {
     try {
-      await prisma.$transaction([
-        prisma.booking.update({
-          where: { id: b.id },
-          data: { status: 'EXPIRED', expiresAt: null },
-        }),
-        ...(b.payment && b.payment.status === 'PENDING'
-          ? [prisma.payment.update({
-              where: { id: b.payment.id },
-              data: { status: 'EXPIRED', failReason: 'HOLD_TIMEOUT' },
-            })]
-          : []),
-      ]);
+      /* updateMany зі статусом у where, а не update по id.
+         Між SELECT вище і UPDATE тут минає час, і саме в цю щілину може
+         прилетіти вебхук «оплачено»: він переводить бронь у CONFIRMED, а
+         ми одразу після нього писали б EXPIRED поверх — гравець заплатив,
+         а слот повернувся у сітку. Умова `status: 'PENDING'` робить запис
+         холостим, якщо оплата встигла раніше: count = 0, і ми просто
+         нічого не чіпаємо. */
+      const { count } = await prisma.booking.updateMany({
+        where: { id: b.id, status: 'PENDING' },
+        data: { status: 'EXPIRED', expiresAt: null },
+      });
+
+      if (count === 0) {
+        console.log(`[expire] ${b.id} встиг оплатитись — не чіпаємо`);
+        continue;
+      }
+
+      if (b.payment && b.payment.status === 'PENDING') {
+        await prisma.payment.updateMany({
+          where: { id: b.payment.id, status: 'PENDING' },
+          data: { status: 'EXPIRED', failReason: 'HOLD_TIMEOUT' },
+        });
+      }
 
       // Погасити рахунок у банку — по можливості. Якщо не вийшло, нічого
       // страшного: слот уже вільний, а рахунок протухне сам.

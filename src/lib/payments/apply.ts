@@ -1,4 +1,4 @@
-import { prisma, notifyClub } from '../db';
+import { prisma, notifyClub, isSlotTakenError } from '../db';
 import type { WebhookEvent } from './types';
 
 /**
@@ -41,6 +41,12 @@ export async function applyPayEvent(provider: string, ev: WebhookEvent): Promise
     return 'applied';
   }
 
+  const b = payment.booking;
+  const fmt = (d: Date) => d.toLocaleString('uk-UA', {
+    timeZone: payment.club.timezone, day: '2-digit', month: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  });
+
   if (ev.status === 'paid') {
     // Недоплату не приймаємо: у нас 100% передоплата, часткових немає.
     if (typeof ev.amountKop === 'number' && ev.amountKop < payment.amount) {
@@ -54,23 +60,62 @@ export async function applyPayEvent(provider: string, ev: WebhookEvent): Promise
       return 'amount-mismatch';
     }
 
-    await prisma.$transaction([
-      prisma.payment.update({
-        where: { id: payment.id },
-        data: { status: 'PAID', paidAt: at, providerAt: at, failReason: null },
-      }),
-      prisma.booking.update({
-        where: { id: payment.bookingId },
-        // expiresAt знімаємо: бронь більше не протухає
-        data: { status: 'CONFIRMED', expiresAt: null },
-      }),
-    ]);
+    try {
+      await prisma.$transaction([
+        prisma.payment.update({
+          where: { id: payment.id },
+          data: { status: 'PAID', paidAt: at, providerAt: at, failReason: null },
+        }),
+        prisma.booking.update({
+          where: { id: payment.bookingId },
+          // expiresAt знімаємо: бронь більше не протухає
+          data: { status: 'CONFIRMED', expiresAt: null },
+        }),
+      ]);
+    } catch (e) {
+      /* Слот уже зайняли, поки гроші йшли.
+       *
+       * Як сюди можна потрапити. Гравець платить на останній хвилині холду,
+       * прибирання (lib/expire.ts) встигає першим і переводить бронь у
+       * EXPIRED — слот повертається у сітку, і його займає хтось інший.
+       * Аж тоді долітає вебхук «оплачено» і намагається повернути нашу
+       * бронь у CONFIRMED. Констрейнт booking_no_overlap цього не дозволяє
+       * (EXPIRED час не займає, CONFIRMED — займає) і кидає 23P01.
+       *
+       * Раніше виняток летів нагору, роут віддавав 500, банк повторював
+       * вебхук — і так по колу. Гроші при цьому списані, броні немає, і
+       * ніхто про це не дізнавався: у логах лежав стек, а клуб бачив
+       * звичайний вільний слот.
+       *
+       * Автоматичного повернення тут свідомо немає: гроші пішли на рахунок
+       * клубу повз нас, і рішення про повернення — його. Наша справа —
+       * зафіксувати оплату (щоб вона не загубилась у звітності) і сказати
+       * про це вголос, поки ще можна передзвонити гравцю. Статус броні
+       * лишається EXPIRED: вигадувати їй місце в сітці, де вже хтось грає,
+       * ми не маємо права.
+       */
+      if (!isSlotTakenError(e)) throw e;
 
-    const b = payment.booking;
-    const fmt = (d: Date) => d.toLocaleString('uk-UA', {
-      timeZone: payment.club.timezone, day: '2-digit', month: '2-digit',
-      hour: '2-digit', minute: '2-digit',
-    });
+      await prisma.payment.update({
+        where: { id: payment.id },
+        data: { status: 'PAID', paidAt: at, providerAt: at, failReason: 'SLOT_LOST' },
+      });
+
+      console.error(`[pay] оплата ${payment.providerRef} прийшла на вже зайнятий слот, бронь ${b.id}`);
+
+      void notifyClub(
+        payment.club.telegramChatId,
+        `<b>⚠️ Оплата без броні</b>\n${fmt(b.startTime)}\n${b.customerName}, ${b.customerPhone}\n` +
+        `${(payment.amount / 100).toFixed(2)} грн\n\n` +
+        'Гравець заплатив, але час устигли зайняти, поки йшли гроші. ' +
+        'Передзвоніть: запропонуйте інший час або поверніть оплату.',
+      );
+
+      // 'applied', а не помилка: подію ми обробили як змогли, і банк
+      // не має ганяти цей вебхук по колу.
+      return 'applied';
+    }
+
     void notifyClub(
       payment.club.telegramChatId,
       `<b>Оплачено</b>\n${fmt(b.startTime)}\n${b.customerName}, ${b.customerPhone}\n` +
