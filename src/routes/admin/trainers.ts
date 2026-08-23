@@ -2,7 +2,8 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
-import { requireAuth, requireLevel, param } from './shared';
+import { requireAuth, requireStaff, requireLevel, param } from './shared';
+import { mountNoteRoutes } from './notes';
 
 export const trainersRouter = Router();
 
@@ -83,6 +84,7 @@ const trainerSchema =
 trainersRouter.post(
   '/trainers',
   requireAuth,
+  requireStaff,
   requireLevel(2),
   async (req, res) => {
     const parsed =
@@ -114,6 +116,7 @@ trainersRouter.post(
 trainersRouter.patch(
   '/trainers/:id',
   requireAuth,
+  requireStaff,
   requireLevel(2),
   async (req, res) => {
     const parsed =
@@ -160,6 +163,7 @@ trainersRouter.patch(
 trainersRouter.delete(
   '/trainers/:id',
   requireAuth,
+  requireStaff,
   requireLevel(2),
   async (req, res) => {
     const trainer =
@@ -220,3 +224,21 @@ trainersRouter.delete(
   },
 );
 
+/* ОСОБОВА СПРАВА (Note, subject = TRAINER)                                   */
+/* -------------------------------------------------------------------------- */
+//
+// Приватний журнал персоналу про тренера — не плутати з Trainer.note (та одна
+// й публічна, летить у віджет). Той самий рушій, що й у courts.ts — див.
+// notes.ts. Пише тільки OWNER/ADMIN, тренер про себе тільки читає.
+
+mountNoteRoutes(trainersRouter, {
+  path: '/trainers/:id/notes',
+  subject: 'TRAINER',
+  findInClub: (clubId, id) =>
+    prisma.trainer.findFirst({
+      where: { id, clubId },
+      select: { id: true },
+    }),
+  scope: (id) => ({ trainerId: id, courtId: null }),
+  selfOnlyId: (req) => req.auth!.trainerId,
+});

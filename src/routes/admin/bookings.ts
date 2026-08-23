@@ -6,7 +6,7 @@ import { DateTime } from 'luxon';
 import { prisma, isSlotTakenError } from '../../lib/db';
 import { normalizePhone } from '../../lib/phone';
 import { getActivePasses, findOrCreateCustomer } from '../../lib/customers';
-import { requireAuth, requireLevel, param } from './shared';
+import { requireAuth, requireStaff, requireLevel, param } from './shared';
 
 export const bookingsRouter = Router();
 
@@ -139,6 +139,7 @@ bookingsRouter.get(
 bookingsRouter.post(
   '/bookings',
   requireAuth,
+  requireStaff,
   requireLevel(2),
   async (req, res) => {
     const parsed = z
@@ -455,6 +456,36 @@ bookingsRouter.patch(
       });
     }
 
+    // Тренер на рівні 2 закриває власне заняття — і тільки його. Список
+    // /bookings йому і так віддається звужений по trainerId, але PATCH
+    // ходить по конкретному id: без цієї перевірки досить було б підглянути
+    // чужий id, щоб скасувати чужу броню.
+    if (req.auth!.role === 'TRAINER') {
+      if (
+        !req.auth!.trainerId ||
+        booking.trainerId !== req.auth!.trainerId
+      ) {
+        return res.status(404).json({
+          error: 'NOT_FOUND',
+        });
+      }
+
+      // Статус і коментар — так. Пересунути заняття на інший корт чи час,
+      // а тим більше переписати його на іншого тренера, — ні: це вже
+      // перекроювання чужої сітки, робота ресепшена.
+      if (
+        p.trainerId !== undefined ||
+        p.courtId !== undefined ||
+        p.start !== undefined ||
+        p.end !== undefined
+      ) {
+        return res.status(403).json({
+          error: 'FORBIDDEN',
+          requiredRole: ['OWNER', 'ADMIN'],
+        });
+      }
+    }
+
     const data: Record<
       string,
       unknown
@@ -647,6 +678,7 @@ bookingsRouter.patch(
 bookingsRouter.post(
   '/bookings/series',
   requireAuth,
+  requireStaff,
   requireLevel(2),
   async (req, res) => {
     const parsed = z
@@ -971,6 +1003,7 @@ bookingsRouter.post(
 bookingsRouter.post(
   '/series/:seriesId/cancel',
   requireAuth,
+  requireStaff,
   requireLevel(2),
   async (req, res) => {
     const parsed =

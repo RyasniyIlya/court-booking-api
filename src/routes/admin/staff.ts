@@ -3,7 +3,7 @@ import { z } from 'zod';
 import bcrypt from 'bcryptjs';
 
 import { prisma } from '../../lib/db';
-import { requireAuth, requireRole, param } from './shared';
+import { requireAuth, requireRole, requireLevel, param } from './shared';
 
 export const staffRouter = Router();
 
@@ -41,8 +41,15 @@ staffRouter.get(
 /**
  * POST /api/admin/staff
  *
- * Заводить акаунт ADMIN або TRAINER у своєму клубі. Тільки OWNER —
- * інакше ADMIN міг би плодити собі рівних.
+ * Заводить акаунт у своєму клубі.
+ *
+ * OWNER — будь-яку роль. ADMIN — тільки TRAINER: модератор веде клуб
+ * майже нарівні з власником, але не роздає доступ такого ж рівня, як
+ * у себе. Інакше "майже нарівні" перестало б мати межу — досить завести
+ * собі другий ADMIN-акаунт, і жодна дія вже не прив'язана до людини.
+ *
+ * LEVEL 2: новий акаунт у кабінеті — дія не менш чутлива, ніж перейменувати
+ * корт, а той давно за PIN-ом.
  *
  * TRAINER без trainerId зайти зможе, але /bookings йому завжди
  * поверне порожній список — прив'язку до картки тренера можна
@@ -51,7 +58,8 @@ staffRouter.get(
 staffRouter.post(
   '/staff',
   requireAuth,
-  requireRole('OWNER'),
+  requireRole('OWNER', 'ADMIN'),
+  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .object({
@@ -70,6 +78,16 @@ staffRouter.post(
     if (!parsed.success) {
       return res.status(400).json({
         error: 'BAD_REQUEST',
+      });
+    }
+
+    if (
+      req.auth!.role !== 'OWNER' &&
+      parsed.data.role !== 'TRAINER'
+    ) {
+      return res.status(403).json({
+        error: 'FORBIDDEN',
+        requiredRole: ['OWNER'],
       });
     }
 
@@ -125,13 +143,16 @@ staffRouter.post(
 /**
  * DELETE /api/admin/staff/:id
  *
- * Тільки OWNER, і не можна видалити самого себе — інакше можна лишити
- * клуб без жодного власника.
+ * OWNER знімає будь-кого, ADMIN — тільки тренерів (симетрично до того,
+ * кого кожен з них може завести). Себе не можна нікому: власник інакше
+ * лишив би клуб без власника, модератор — без доступу до кабінету,
+ * і обидва випадки розгрібаються тільки руками в базі.
  */
 staffRouter.delete(
   '/staff/:id',
   requireAuth,
-  requireRole('OWNER'),
+  requireRole('OWNER', 'ADMIN'),
+  requireLevel(2),
   async (req, res) => {
     const id = param(req, 'id');
 
@@ -141,18 +162,31 @@ staffRouter.delete(
       });
     }
 
-    const result = await prisma.user.deleteMany({
+    const target = await prisma.user.findFirst({
       where: {
         id,
         clubId: req.auth!.clubId,
       },
+      select: { role: true },
     });
 
-    if (result.count === 0) {
+    if (!target) {
       return res.status(404).json({
         error: 'NOT_FOUND',
       });
     }
+
+    if (
+      req.auth!.role !== 'OWNER' &&
+      target.role !== 'TRAINER'
+    ) {
+      return res.status(403).json({
+        error: 'FORBIDDEN',
+        requiredRole: ['OWNER'],
+      });
+    }
+
+    await prisma.user.delete({ where: { id } });
 
     res.json({ ok: true });
   },

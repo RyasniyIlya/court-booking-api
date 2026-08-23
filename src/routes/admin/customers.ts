@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { prisma } from '../../lib/db';
 import { isSearchableTail } from '../../lib/phone';
 import { getActivePass, getActivePasses } from '../../lib/customers';
-import { requireAuth, requireLevel, requireRole, param } from './shared';
+import { requireAuth, requireStaff, requireLevel, requireRole, param } from './shared';
 
 export const customersRouter = Router();
 
@@ -112,6 +112,7 @@ customersRouter.get(
 customersRouter.post(
   '/customers/:id/passes',
   requireAuth,
+  requireStaff,
   requireLevel(2),
   async (req, res) => {
     const parsed = z
@@ -252,6 +253,7 @@ customersRouter.post(
 customersRouter.post(
   '/bookings/:id/use-pass',
   requireAuth,
+  requireStaff,
   requireLevel(2),
   async (req, res) => {
     const booking =
@@ -350,6 +352,7 @@ customersRouter.post(
 customersRouter.delete(
   '/bookings/:id/use-pass',
   requireAuth,
+  requireStaff,
   requireLevel(2),
   async (req, res) => {
     const usage =

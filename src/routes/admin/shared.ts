@@ -217,3 +217,34 @@ export async function verifyStepUpPin(
 
   return { ok: true };
 }
+
+/**
+ * Персонал клубу: OWNER або ADMIN. Тренера відсікає незалежно від рівня.
+ *
+ * Раніше цього не було потрібно: тренер фізично не міг взяти LEVEL 2, і
+ * requireLevel(2) сам по собі означав "не тренер". Тепер тренер має свій
+ * PIN і піднімається до рівня 2 — щоб закрити власне заняття, а не щоб
+ * правити корти, години й чужі броні. Рівень і роль перестали бути
+ * взаємозамінними: рівень каже "щойно підтвердив, що це справді він",
+ * роль — "що йому взагалі можна".
+ */
+export function requireStaff(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  if (!req.auth) {
+    return res.status(401).json({
+      error: 'UNAUTHORIZED',
+    });
+  }
+
+  if (req.auth.role === 'TRAINER') {
+    return res.status(403).json({
+      error: 'FORBIDDEN',
+      requiredRole: ['OWNER', 'ADMIN'],
+    });
+  }
+
+  next();
+}
