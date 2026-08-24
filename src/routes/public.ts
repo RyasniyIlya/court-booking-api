@@ -202,7 +202,19 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
         startTime: { lt: to },
         endTime: { gt: from },
       },
-      select: { courtId: true, startTime: true, endTime: true },
+      select: {
+        id: true,
+        courtId: true,
+        startTime: true,
+        endTime: true,
+        // Групове заняття гравцю не «зайнято», а «є місця» — тому про нього
+        // треба розповісти, а не просто вирізати годину з сітки.
+        capacity: true,
+        title: true,
+        pricePerSeat: true,
+        trainer: { select: { name: true } },
+        seats: { where: { status: 'BOOKED' }, select: { id: true } },
+      },
     }),
     prisma.block.findMany({
       where: { clubId: club.id, startTime: { lt: to }, endTime: { gt: from } },
@@ -218,19 +230,64 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
       ...blocks.filter((b) => b.courtId === null || b.courtId === court.id),
     ];
 
+    const slots = buildSlots({
+      date,
+      timezone: club.timezone,
+      openMinute: hours.openMinute,
+      closeMinute: hours.closeMinute,
+      slotMinutes: court.slotMinutes ?? club.slotMinutes,
+      leadTimeMinutes: club.leadTimeMinutes,
+      busy,
+      now,
+    });
+
+    /* Групові заняття цього корту. Слот, на який лягла група, лишається
+       available: false — записатись у неї це інша дія, ніж забронювати
+       корт, і кнопка в гравця має бути інша. Але тепер із ним їде опис
+       заняття, тож віджет малює «Ранкова йога · 3/8», а не «зайнято».
+
+       `startsHere` — бо заняття може бути довшим за слот (півтори години
+       на годинній сітці). Картку заняття показуємо один раз, на його
+       початку; продовження лишаються звичайним зайнятим часом. */
+    const groups = bookings.filter(
+      (b) => b.courtId === court.id && b.capacity != null,
+    );
+
     return {
       courtId: court.id,
       courtName: court.name,
       pricePerHour: court.pricePerHour,
-      slots: buildSlots({
-        date,
-        timezone: club.timezone,
-        openMinute: hours.openMinute,
-        closeMinute: hours.closeMinute,
-        slotMinutes: court.slotMinutes ?? club.slotMinutes,
-        leadTimeMinutes: club.leadTimeMinutes,
-        busy,
-        now,
+      slots: slots.map((s) => {
+        const sMs = Date.parse(s.start);
+        const eMs = Date.parse(s.end);
+        const g = groups.find(
+          (b) => sMs < b.endTime.getTime() && eMs > b.startTime.getTime(),
+        );
+        if (!g) return s;
+
+        const taken = g.seats.length;
+        return {
+          ...s,
+          group: {
+            bookingId: g.id,
+            title: g.title,
+            capacity: g.capacity,
+            taken,
+            free: Math.max(0, (g.capacity ?? 0) - taken),
+            pricePerSeat: g.pricePerSeat ?? 0,
+            trainerName: g.trainer?.name ?? null,
+            start: g.startTime.toISOString(),
+            end: g.endTime.toISOString(),
+            /* Підписи рахуємо тут, у таймзоні клубу — так само, як у
+               слотів. Інакше гравець із Варшави побачив би на київському
+               занятті час свого телефона й прийшов би на годину раніше. */
+            startLabel: DateTime.fromJSDate(g.startTime)
+              .setZone(club.timezone).toFormat('HH:mm'),
+            endLabel: DateTime.fromJSDate(g.endTime)
+              .setZone(club.timezone).toFormat('HH:mm'),
+            startsHere: g.startTime.getTime() === sMs,
+          },
+        };
       }),
     };
   });
@@ -507,6 +564,144 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
   });
 });
 
+const joinSchema = z.object({
+  customerName: z.string().trim().min(2).max(80),
+  customerPhone: z.string().trim().regex(/^\+?[0-9\s()-]{9,20}$/, 'invalid phone'),
+  comment: z.string().trim().max(300).optional(),
+});
+
+/**
+ * Вихід із транзакції з осмисленим кодом.
+ *
+ * Усередині prisma.$transaction звичайний `return res.status(...)` не
+ * годиться: обробник має відкотити транзакцію, а не тихо її закомітити,
+ * віддавши помилку. Кидаємо — Prisma відкочує, обробник унизу перекладає
+ * назад у HTTP.
+ */
+class HttpError extends Error {
+  constructor(readonly status: number, readonly code: string) {
+    super(code);
+  }
+}
+
+/**
+ * Чи гравець ще може зняти запис сам.
+ *
+ * Одне правило на дві сутності — бронь корту й місце в груповому занятті:
+ * для гравця це та сама дія «я не прийду», і різні строки в них він читав
+ * би як помилку. cutoff = 0 означає «до самого початку».
+ *
+ * Адміністратора це не стосується: клуб домовляється голосом і має могти
+ * зняти запис навіть за хвилину до початку.
+ */
+function canCancelNow(startTime: Date, cutoffMinutes: number): boolean {
+  return Date.now() < startTime.getTime() - cutoffMinutes * 60_000;
+}
+
+/**
+ * POST /api/public/clubs/:slug/bookings/:id/join — записатись у групове заняття.
+ *
+ * ── Чому транзакція з FOR UPDATE ─────────────────────────────────────────
+ *
+ * Це єдине місце в проєкті, де від гонки захищає код, а не констрейнт.
+ * «Дітей не більше за capacity» декларативно в Postgres не виражається:
+ * EXCLUDE працює по перетинах, CHECK не бачить інших рядків. Тому рядок
+ * заняття блокується на час перевірки — двоє, що тиснуть «Записатись» на
+ * останнє місце в одну мілісекунду, стають у чергу, і другий отримає
+ * GROUP_FULL замість дев'ятого місця у восьмимісній групі.
+ *
+ * Оплати тут немає навмисно: у першій версії групові заняття оплачуються
+ * на місці. Оплата за місце вимагає розв'язати Payment.bookingId @unique,
+ * і це окрема робота, а не рядок у цьому обробнику.
+ */
+publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
+  const parsed = joinSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const body = parsed.data;
+
+  const bookingId = z.string().uuid().safeParse(req.params.id);
+  if (!bookingId.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const club = await loadClub(req.params.slug);
+  if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
+  if (!clubBilling(club).online) return res.status(403).json({ error: 'CLUB_OFFLINE' });
+
+  const phone = normalizePhone(body.customerPhone);
+  if (!phone) return res.status(400).json({ error: 'BAD_PHONE' });
+
+  const customer = await findOrCreateCustomer({
+    clubId: club.id,
+    name: body.customerName,
+    rawPhone: body.customerPhone,
+  });
+  if (customer?.isBlocked) return res.status(403).json({ error: 'CUSTOMER_BLOCKED' });
+
+  try {
+    const seat = await prisma.$transaction(async (tx) => {
+      /* Блокуємо саме рядок заняття. Всі, хто записується в ЦЮ групу,
+         стають у чергу тут; записи в інші групи не чекають. */
+      const rows = await tx.$queryRaw<
+        { id: string; clubId: string; capacity: number | null; pricePerSeat: number | null; status: string; startTime: Date }[]
+      >`SELECT "id", "clubId", "capacity", "pricePerSeat", "status"::text, "startTime"
+          FROM "Booking" WHERE "id" = ${bookingId.data}::uuid FOR UPDATE`;
+
+      const b = rows[0];
+      if (!b) throw new HttpError(404, 'NOT_FOUND');
+      if (b.clubId !== club.id) throw new HttpError(404, 'NOT_FOUND');
+      if (b.capacity == null) throw new HttpError(400, 'NOT_A_GROUP');
+      if (!BUSY_STATUSES.includes(b.status as never)) throw new HttpError(409, 'GROUP_CANCELLED');
+
+      if (b.startTime.getTime() < Date.now() + club.leadTimeMinutes * 60_000) {
+        throw new HttpError(400, 'TOO_LATE');
+      }
+
+      const taken = await tx.bookingSeat.count({
+        where: { bookingId: b.id, status: 'BOOKED' },
+      });
+      if (taken >= b.capacity) throw new HttpError(409, 'GROUP_FULL');
+
+      const already = await tx.bookingSeat.findFirst({
+        where: { bookingId: b.id, customerPhone: phone.e164, status: 'BOOKED' },
+        select: { id: true },
+      });
+      if (already) throw new HttpError(409, 'ALREADY_JOINED');
+
+      const price = b.pricePerSeat ?? 0;
+
+      const created = await tx.bookingSeat.create({
+        data: {
+          bookingId: b.id,
+          customerId: customer?.id ?? null,
+          customerName: body.customerName.trim(),
+          customerPhone: phone.e164,
+          comment: body.comment,
+          price,
+          source: 'WIDGET',
+        },
+      });
+
+      /* Виручка заняття росте разом із проданими місцями — так підсумок
+         дня рахується сам, без окремої гілки в аналітиці. */
+      await tx.booking.update({
+        where: { id: b.id },
+        data: { priceTotal: { increment: price } },
+      });
+
+      return created;
+    });
+
+    res.status(201).json({
+      id: seat.id,
+      cancelToken: seat.cancelToken,
+      price: seat.price,
+    });
+  } catch (e) {
+    if (e instanceof HttpError) return res.status(e.status).json({ error: e.code });
+    console.error('[join] failed', e);
+    res.status(500).json({ error: 'INTERNAL' });
+  }
+});
+
 /**
  * GET /api/public/bookings/:token/status
  *
@@ -541,13 +736,18 @@ publicRouter.post('/bookings/:id/cancel', async (req, res) => {
   const parsed = z.object({ token: z.string().uuid() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
-  const booking = await prisma.booking.findUnique({ where: { id: req.params.id } });
+  const booking = await prisma.booking.findUnique({
+    where: { id: req.params.id },
+    include: { club: { select: { cancelCutoffMinutes: true } } },
+  });
   if (!booking || booking.cancelToken !== parsed.data.token) {
     return res.status(404).json({ error: 'NOT_FOUND' });
   }
   if (booking.status === 'CANCELLED') return res.json({ ok: true });
-  if (booking.startTime.getTime() < Date.now()) {
-    return res.status(400).json({ error: 'ALREADY_STARTED' });
+
+  const cutoff = booking.club.cancelCutoffMinutes;
+  if (!canCancelNow(booking.startTime, cutoff)) {
+    return res.status(400).json({ error: cutoff > 0 ? 'CANCEL_CLOSED' : 'ALREADY_STARTED' });
   }
 
   await prisma.booking.update({
@@ -639,20 +839,58 @@ publicRouter.get('/customer/me', async (req, res) => {
     return res.status(404).json({ error: 'NOT_FOUND' });
   }
 
-  const upcoming = await prisma.booking.findMany({
-    where: {
-      customerId: customer.id,
-      status: { in: [...BUSY_STATUSES] },
-      startTime: { gte: new Date() },
-    },
-    include: { court: { select: { name: true } } },
-    orderBy: { startTime: 'asc' },
-    take: 20,
-  });
+  const now = new Date();
+
+  const [upcoming, seats, club] = await Promise.all([
+    prisma.booking.findMany({
+      where: {
+        customerId: customer.id,
+        status: { in: [...BUSY_STATUSES] },
+        startTime: { gte: now },
+      },
+      include: { court: { select: { name: true } } },
+      orderBy: { startTime: 'asc' },
+      take: 20,
+    }),
+    /* Записи в групові заняття шукаються окремо: у контейнера групи
+       customerId порожній (клієнта в неї немає), тому запит вище їх
+       не бачить і бачити не може. */
+    prisma.bookingSeat.findMany({
+      where: {
+        customerId: customer.id,
+        status: 'BOOKED',
+        booking: {
+          status: { in: [...BUSY_STATUSES] },
+          startTime: { gte: now },
+        },
+      },
+      include: {
+        booking: {
+          include: {
+            court: { select: { name: true } },
+            trainer: { select: { name: true } },
+          },
+        },
+      },
+      orderBy: { booking: { startTime: 'asc' } },
+      take: 20,
+    }),
+    prisma.club.findUnique({
+      where: { id: customer.clubId },
+      select: { timezone: true, cancelCutoffMinutes: true },
+    }),
+  ]);
+
+  const tz = club?.timezone ?? 'Europe/Kyiv';
+  const cutoff = club?.cancelCutoffMinutes ?? 0;
+  const label = (d: Date) => DateTime.fromJSDate(d).setZone(tz).toFormat('HH:mm');
 
   res.json({
     name: customer.name,
     phone: customer.phone,
+    /* Правило клубу їде разом зі списком: віджет має пояснити гравцю, чому
+       кнопки більше немає, а не мовчки її прибрати. */
+    cancelCutoffMinutes: cutoff,
     upcoming: upcoming.map((b) => ({
       id: b.id,
       courtName: b.court.name,
@@ -661,6 +899,100 @@ publicRouter.get('/customer/me', async (req, res) => {
       status: b.status,
       priceTotal: b.priceTotal,
       cancelToken: b.cancelToken,
+      canCancel: canCancelNow(b.startTime, cutoff),
+    })),
+    /* Окремим списком, а не впереміш із бронями: скасовується це іншим
+       роутом (звільняється місце, а не корт), і кнопка має бути своя. */
+    groups: seats.map((s) => ({
+      seatId: s.id,
+      cancelToken: s.cancelToken,
+      title: s.booking.title,
+      courtName: s.booking.court.name,
+      trainerName: s.booking.trainer?.name ?? null,
+      start: s.booking.startTime.toISOString(),
+      end: s.booking.endTime.toISOString(),
+      startLabel: label(s.booking.startTime),
+      endLabel: label(s.booking.endTime),
+      price: s.price,
+      canCancel: canCancelNow(s.booking.startTime, cutoff),
     })),
   });
+});
+
+/**
+ * POST /api/public/seats/:id/cancel — гравець звільняє своє місце.
+ *
+ * Дві дороги до однієї дії: за `cancelToken` (він видається одразу після
+ * запису — працює й без кабінету) або з-під токена кабінету. Друга потрібна
+ * саме тоді, коли гравець прийшов через «Мої записи»: токена місця він там
+ * не бачив і бачити не мусить.
+ *
+ * Місце не видаляється, а стає CANCELLED: клуб має бачити, хто передумав.
+ * Частковий унікальний індекс seat_one_per_phone рахує тільки BOOKED, тож
+ * той самий гравець може записатись у це заняття знову.
+ */
+publicRouter.post('/seats/:id/cancel', async (req, res) => {
+  const id = z.string().uuid().safeParse(req.params.id);
+  if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const body = z.object({ token: z.string().uuid().optional() }).safeParse(req.body ?? {});
+  if (!body.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const header = req.headers.authorization;
+  const auth = header?.startsWith('Bearer ')
+    ? verifyCustomerToken(header.slice(7))
+    : null;
+
+  try {
+    await prisma.$transaction(async (tx) => {
+      const seat = await tx.bookingSeat.findUnique({
+        where: { id: id.data },
+        include: {
+          booking: {
+            select: {
+              id: true,
+              startTime: true,
+              clubId: true,
+              club: { select: { cancelCutoffMinutes: true } },
+            },
+          },
+        },
+      });
+      if (!seat) throw new HttpError(404, 'NOT_FOUND');
+
+      /* Чиє це місце. Токен місця або кабінет того самого клієнта — інакше
+         сусід по групі зміг би зняти чужий запис, знаючи лише id. */
+      const byToken = Boolean(body.data.token) && seat.cancelToken === body.data.token;
+      const byCabinet = Boolean(auth)
+        && seat.customerId === auth!.customerId
+        && seat.booking.clubId === auth!.clubId;
+      if (!byToken && !byCabinet) throw new HttpError(404, 'NOT_FOUND');
+
+      // Повторний виклик не має бути помилкою: гравець міг двічі тицьнути
+      if (seat.status === 'CANCELLED') return;
+
+      const cutoff = seat.booking.club.cancelCutoffMinutes;
+      if (!canCancelNow(seat.booking.startTime, cutoff)) {
+        throw new HttpError(400, cutoff > 0 ? 'CANCEL_CLOSED' : 'ALREADY_STARTED');
+      }
+
+      await tx.bookingSeat.update({
+        where: { id: seat.id },
+        data: { status: 'CANCELLED', cancelledAt: new Date() },
+      });
+
+      /* Виручка йде разом із місцем — інакше скасовані записи назавжди
+         лишились би в підсумку дня. */
+      await tx.booking.update({
+        where: { id: seat.booking.id },
+        data: { priceTotal: { decrement: seat.price } },
+      });
+    });
+
+    res.json({ ok: true });
+  } catch (e) {
+    if (e instanceof HttpError) return res.status(e.status).json({ error: e.code });
+    console.error('[seat cancel] failed', e);
+    res.status(500).json({ error: 'INTERNAL' });
+  }
 });

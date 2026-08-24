@@ -43,6 +43,8 @@ clubRouter.get(
         club.slotMinutes,
       leadTimeMinutes:
         club.leadTimeMinutes,
+      cancelCutoffMinutes:
+        club.cancelCutoffMinutes,
       horizonDays:
         club.horizonDays,
       autoConfirm:
@@ -143,6 +145,16 @@ clubRouter.patch(
             .optional(),
 
         leadTimeMinutes:
+          z.number()
+            .int()
+            .min(0)
+            .max(1440)
+            .optional(),
+
+        /* Вікно самостійного скасування. Стеля доби: більше означало б
+           «скасувати не можна взагалі», і чесніше сказати це словами,
+           ніж числом, у яке гравець не вчитається. */
+        cancelCutoffMinutes:
           z.number()
             .int()
             .min(0)
