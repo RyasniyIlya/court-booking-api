@@ -31,6 +31,19 @@ const trainerCost = (
   );
 
 /**
+ * Вихід із транзакції з осмисленим кодом.
+ *
+ * Усередині prisma.$transaction звичайний res.status(...) не годиться:
+ * транзакцію треба відкотити, а не тихо закомітити разом із помилкою.
+ * Кидаємо — Prisma відкочує, обробник перекладає назад у HTTP.
+ */
+class SeatError extends Error {
+  constructor(readonly status: number, readonly code: string) {
+    super(code);
+  }
+}
+
+/**
  * GET /api/admin/bookings
  *
  * LEVEL 1 достаточно для чтения.
@@ -1203,3 +1216,152 @@ bookingsRouter.post(
   },
 );
 
+
+/* -------------------------------------------------------------------------- */
+/* МІСЦЯ В ГРУПОВИХ ЗАНЯТТЯХ                                                  */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * POST /api/admin/bookings/:id/seats — записати людину руками.
+ *
+ * Половина записів у групу приходить телефоном: людина дзвонить на
+ * ресепшен, а не тисне кнопку у віджеті. Без цього роуту адміністратор
+ * бачив би заняття, у яке не може нікого вписати, і вів би паралельний
+ * список у зошиті — а зошит не вміє рахувати вільні місця.
+ *
+ * Телефон тут обовʼязковий, на відміну від звичайної броні. Причина
+ * технічна й чесна: місця розрізняються по (заняття, телефон), і двоє
+ * безіменних із порожнім номером просто не влізли б у той самий індекс.
+ * Причина людська та сама: заняття переносять, і групу треба обдзвонити.
+ */
+bookingsRouter.post(
+  '/bookings/:id/seats',
+  requireAuth,
+  requireStaff,
+  requireLevel(2),
+  async (req, res) => {
+    const id = z.string().uuid().safeParse(req.params.id);
+    if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+    const parsed = z
+      .object({
+        customerName: z.string().trim().min(1).max(80),
+        customerPhone: z.string().trim().min(5).max(30),
+        comment: z.string().trim().max(300).optional(),
+      })
+      .safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+    const d = parsed.data;
+    const clubId = req.auth!.clubId;
+
+    const phone = normalizePhone(d.customerPhone);
+    if (!phone) return res.status(400).json({ error: 'BAD_PHONE' });
+
+    const customer = await findOrCreateCustomer({
+      clubId,
+      name: d.customerName,
+      rawPhone: d.customerPhone,
+    });
+
+    try {
+      const seat = await prisma.$transaction(async (tx) => {
+        /* Той самий FOR UPDATE, що й у публічному записі: ресепшен і
+           гравець можуть тиснути в одну мілісекунду на останнє місце. */
+        const rows = await tx.$queryRaw<
+          { id: string; clubId: string; capacity: number | null; pricePerSeat: number | null }[]
+        >`SELECT "id", "clubId", "capacity", "pricePerSeat"
+            FROM "Booking" WHERE "id" = ${id.data}::uuid FOR UPDATE`;
+
+        const b = rows[0];
+        if (!b || b.clubId !== clubId) throw new SeatError(404, 'NOT_FOUND');
+        if (b.capacity == null) throw new SeatError(400, 'NOT_A_GROUP');
+
+        const taken = await tx.bookingSeat.count({
+          where: { bookingId: b.id, status: 'BOOKED' },
+        });
+        if (taken >= b.capacity) throw new SeatError(409, 'GROUP_FULL');
+
+        const already = await tx.bookingSeat.findFirst({
+          where: { bookingId: b.id, customerPhone: phone.e164, status: 'BOOKED' },
+          select: { id: true },
+        });
+        if (already) throw new SeatError(409, 'ALREADY_JOINED');
+
+        const price = b.pricePerSeat ?? 0;
+
+        const created = await tx.bookingSeat.create({
+          data: {
+            bookingId: b.id,
+            customerId: customer?.id ?? null,
+            customerName: d.customerName,
+            customerPhone: phone.e164,
+            comment: d.comment,
+            price,
+            source: 'ADMIN',
+          },
+        });
+
+        await tx.booking.update({
+          where: { id: b.id },
+          data: { priceTotal: { increment: price } },
+        });
+
+        return created;
+      });
+
+      res.status(201).json(seat);
+    } catch (e) {
+      if (e instanceof SeatError) return res.status(e.status).json({ error: e.code });
+      console.error('[admin seat] create failed', e);
+      res.status(500).json({ error: 'INTERNAL' });
+    }
+  },
+);
+
+/**
+ * POST /api/admin/seats/:id/cancel — прибрати запис.
+ *
+ * Вікном скасування (Club.cancelCutoffMinutes) адміністратор НЕ обмежений:
+ * воно існує, щоб гравець не відписувався від підготовленого заняття за
+ * пʼять хвилин, а клуб домовляється голосом і має право зняти запис
+ * будь-коли — зокрема саме тоді, коли гравець зателефонував і попросив.
+ */
+bookingsRouter.post(
+  '/seats/:id/cancel',
+  requireAuth,
+  requireStaff,
+  requireLevel(2),
+  async (req, res) => {
+    const id = z.string().uuid().safeParse(req.params.id);
+    if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+    try {
+      await prisma.$transaction(async (tx) => {
+        const seat = await tx.bookingSeat.findUnique({
+          where: { id: id.data },
+          include: { booking: { select: { id: true, clubId: true } } },
+        });
+        if (!seat || seat.booking.clubId !== req.auth!.clubId) {
+          throw new SeatError(404, 'NOT_FOUND');
+        }
+        if (seat.status === 'CANCELLED') return;
+
+        await tx.bookingSeat.update({
+          where: { id: seat.id },
+          data: { status: 'CANCELLED', cancelledAt: new Date() },
+        });
+        await tx.booking.update({
+          where: { id: seat.booking.id },
+          data: { priceTotal: { decrement: seat.price } },
+        });
+      });
+
+      res.json({ ok: true });
+    } catch (e) {
+      if (e instanceof SeatError) return res.status(e.status).json({ error: e.code });
+      console.error('[admin seat] cancel failed', e);
+      res.status(500).json({ error: 'INTERNAL' });
+    }
+  },
+);
