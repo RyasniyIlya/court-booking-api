@@ -380,3 +380,184 @@ analyticsRouter.delete('/expenses/:id', async (req, res) => {
   if (result.count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
   res.json({ ok: true });
 });
+
+/* -------------------------------------------------------------------------- */
+/* КАРТОТЕКА КЛІЄНТІВ                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Межі сегментів у днях від останнього відвідування.
+ *
+ * Не налаштування клубу — свідомо. Три сегменти мають означати те саме в
+ * усіх клубах, інакше «згасає» в одному дорівнює «активний» в іншому, і
+ * будь-яка розмова про цифри між нами й клубом розсипається. Якщо колись
+ * попросять — це два поля в Club, але починати з них зарано.
+ */
+const TIER_ACTIVE_DAYS = 30;
+const TIER_FADING_DAYS = 90;
+
+export type CustomerTier = 'ACTIVE' | 'FADING' | 'LOST' | 'NEW';
+
+/**
+ * До якого сегмента належить клієнт.
+ *
+ * NEW окремо від LOST: людина, яка записалась учора і ще жодного разу не
+ * була, і людина, яка зникла пів року тому, — це різні розмови. Перших
+ * зустрічають, других повертають.
+ */
+function tierOf(lastVisit: Date | null, firstSeen: Date, now: Date): CustomerTier {
+  if (!lastVisit) {
+    const daysKnown = (now.getTime() - firstSeen.getTime()) / 86_400_000;
+    return daysKnown <= TIER_ACTIVE_DAYS ? 'NEW' : 'LOST';
+  }
+  const days = (now.getTime() - lastVisit.getTime()) / 86_400_000;
+  if (days <= TIER_ACTIVE_DAYS) return 'ACTIVE';
+  if (days <= TIER_FADING_DAYS) return 'FADING';
+  return 'LOST';
+}
+
+/**
+ * GET /api/admin/analytics/customers
+ *
+ * Картотека: усі клієнти клубу з відвідуваннями, витратами й сегментом.
+ *
+ * ── Чому не /customers/top ───────────────────────────────────────────────
+ *
+ * Той роут відповідає на питання «хто наші найкращі за місяць» і бере
+ * тільки CONFIRMED-броні за період. Тут питання інше — «що взагалі з нашою
+ * базою»: потрібні всі, разом із тими, хто перестав ходити, бо саме вони
+ * цікаві для дзвінка.
+ *
+ * ── Групові заняття рахуються теж ────────────────────────────────────────
+ *
+ * У контейнера групи customerId порожній — люди сидять у BookingSeat. Тому
+ * відвідування збираються з ДВОХ джерел. Без цього клієнт, який ходить
+ * лише на йогу, виглядав би як «жодного разу не був», і клуб дзвонив би
+ * повертати того, хто був учора.
+ */
+analyticsRouter.get('/customers', async (req, res) => {
+  const parsed = z
+    .object({
+      tier: z.enum(['ACTIVE', 'FADING', 'LOST', 'NEW']).optional(),
+      tag: z.string().trim().min(1).max(40).optional(),
+      q: z.string().trim().min(1).max(40).optional(),
+      sort: z.enum(['visits', 'spend', 'recent', 'name']).default('recent'),
+      limit: z.coerce.number().int().min(1).max(500).default(100),
+    })
+    .safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const { tier, tag, q, sort, limit } = parsed.data;
+
+  const clubId = req.auth!.clubId;
+  const now = new Date();
+
+  /* Пошук: по імені завжди, по хвосту телефона — тільки коли в запиті є
+     цифри. Спершу тут при пошуку по літерах у OR підставлялось значення,
+     яке «свідомо не збігається» — і Postgres відхиляв ВЕСЬ запит
+     (22021: нульовий байт не є валідним UTF8), тобто пошук по імені не
+     працював зовсім. Тепер умову просто не додаємо, замість вигадування
+     значення, що не може збігтися. */
+  const digits = q ? q.replace(/[^0-9]/g, '').slice(-7) : '';
+  const search = q
+    ? [
+      { name: { contains: q, mode: 'insensitive' as const } },
+      ...(digits.length >= 3 ? [{ phoneTail: { endsWith: digits } }] : []),
+    ]
+    : null;
+
+  const customers = await prisma.customer.findMany({
+    where: {
+      clubId,
+      ...(tag ? { tags: { has: tag } } : {}),
+      ...(search ? { OR: search } : {}),
+    },
+    select: {
+      id: true, name: true, phone: true, note: true, tags: true,
+      isBlocked: true, createdAt: true, telegramChatId: true,
+    },
+  });
+  if (customers.length === 0) return res.json({ tiers: {}, customers: [] });
+
+  const ids = customers.map((c) => c.id);
+
+  /* Два джерела відвідувань. Скасовані не рахуються в жодному: людина
+     записалась і не прийшла — це не візит, і в статистику лояльності
+     він потрапляти не має. */
+  const [bookings, seats] = await Promise.all([
+    prisma.booking.findMany({
+      where: {
+        clubId,
+        customerId: { in: ids },
+        status: 'CONFIRMED',
+        startTime: { lte: now },
+      },
+      select: { customerId: true, priceTotal: true, startTime: true },
+    }),
+    prisma.bookingSeat.findMany({
+      where: {
+        customerId: { in: ids },
+        status: 'BOOKED',
+        booking: { clubId, status: 'CONFIRMED', startTime: { lte: now } },
+      },
+      select: { customerId: true, price: true, booking: { select: { startTime: true } } },
+    }),
+  ]);
+
+  type Row = { visits: number; spend: number; last: Date | null };
+  const stats = new Map<string, Row>();
+  const bump = (id: string, when: Date, money: number) => {
+    const r = stats.get(id) ?? { visits: 0, spend: 0, last: null };
+    r.visits += 1;
+    r.spend += money;
+    if (!r.last || when > r.last) r.last = when;
+    stats.set(id, r);
+  };
+
+  for (const b of bookings) bump(b.customerId!, b.startTime, b.priceTotal);
+  for (const s of seats) bump(s.customerId!, s.booking.startTime, s.price);
+
+  let rows = customers.map((c) => {
+    const r = stats.get(c.id) ?? { visits: 0, spend: 0, last: null };
+    return {
+      id: c.id,
+      name: c.name,
+      phone: c.phone,
+      note: c.note,
+      tags: c.tags,
+      isBlocked: c.isBlocked,
+      hasCabinet: Boolean(c.telegramChatId),
+      since: c.createdAt.toISOString(),
+      visits: r.visits,
+      spend: r.spend,
+      lastVisit: r.last?.toISOString() ?? null,
+      tier: tierOf(r.last, c.createdAt, now),
+    };
+  });
+
+  /* Підсумок по сегментах рахуємо ДО фільтра: клуб має бачити, скільки
+     всього втрачених, навіть коли дивиться на активних. */
+  const tiers = rows.reduce<Record<string, number>>((acc, r) => {
+    acc[r.tier] = (acc[r.tier] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  if (tier) rows = rows.filter((r) => r.tier === tier);
+
+  rows.sort((a, b) => {
+    if (sort === 'visits') return b.visits - a.visits;
+    if (sort === 'spend') return b.spend - a.spend;
+    if (sort === 'name') return a.name.localeCompare(b.name, 'uk');
+    // recent: хто був найпізніше. Ті, хто не був жодного разу, — у кінці.
+    if (!a.lastVisit && !b.lastVisit) return 0;
+    if (!a.lastVisit) return 1;
+    if (!b.lastVisit) return -1;
+    return b.lastVisit.localeCompare(a.lastVisit);
+  });
+
+  res.json({
+    tiers,
+    total: rows.length,
+    thresholds: { activeDays: TIER_ACTIVE_DAYS, fadingDays: TIER_FADING_DAYS },
+    customers: rows.slice(0, limit),
+  });
+});
