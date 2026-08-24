@@ -329,11 +329,32 @@ model Booking {
   courtId String @db.Uuid
   court   Court  @relation(fields: [courtId], references: [id], onDelete: Cascade)
 
-  /// Копія на момент броні — імʼя в картці клієнта може змінитись пізніше
-  customerName  String
+  /// Копія на момент броні — імʼя в картці клієнта може змінитись пізніше.
+  ///
+  /// Nullable з появою групових занять: у контейнера групи одного клієнта
+  /// немає, там замість імені `title` («Ранкова йога»), а люди лежать у
+  /// BookingSeat. Що саме заповнене — стежить CHECK booking_private_or_group,
+  /// тож «ні імені, ні назви» база просто не прийме.
+  customerName  String?
   /// Нормалізований E.164
-  customerPhone String
+  customerPhone String?
   comment       String?
+
+  // ── Групове заняття ──────────────────────────────────────────────────
+  // Групове — це ОДНА бронь корту, до якої записуються люди. Так корт
+  // лишається зайнятим рівно один раз, і booking_no_overlap (EXCLUDE)
+  // продовжує захищати від подвійного продажу години без жодних винятків.
+  //
+  /// Скільки місць усього. null = звичайна приватна бронь корту.
+  capacity     Int?
+  /// Назва заняття для віджета: «Ранкова йога», «Дитяча група 8–10».
+  /// Заповнена рівно тоді, коли заповнена capacity.
+  title        String?
+  /// Ціна одного місця, копійки. У групи priceTotal — це ціна корту,
+  /// а гравець платить саме стільки.
+  pricePerSeat Int?
+
+  seats BookingSeat[]
 
   /// Картка клієнта. Nullable: історичні броні до впровадження обліку
   customerId String?   @db.Uuid
@@ -384,6 +405,52 @@ model Booking {
   @@index([status, expiresAt])
   @@index([trainerId, startTime])
   @@index([seriesId])
+}
+
+enum SeatStatus {
+  BOOKED
+  CANCELLED
+}
+
+/// Одне місце в груповому занятті — один записаний гравець.
+///
+/// Навмисно не Booking: місце не займає корт (його вже зайняв контейнер
+/// групи) і не має власного інтервалу часу. Якби місця були бронями,
+/// booking_no_overlap відхилив би друге ж місце — а саме він і тримає
+/// головну гарантію схеми.
+///
+/// Скасоване місце лишається рядком, а не видаляється: клуб має бачити,
+/// хто записався й передумав, інакше «нас було восьмеро, чому порожньо»
+/// не буде на що відповісти.
+model BookingSeat {
+  id        String  @id @default(uuid()) @db.Uuid
+  bookingId String  @db.Uuid
+  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+
+  /// Картка клієнта — та сама, що й у звичайній броні. Nullable з тієї ж
+  /// причини: історія важливіша за звʼязок, який може зникнути.
+  customerId String?   @db.Uuid
+  customer   Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  /// Копії на момент запису, як і в Booking
+  customerName  String
+  /// Нормалізований E.164
+  customerPhone String
+  comment       String?
+
+  status SeatStatus    @default(BOOKED)
+  source BookingSource @default(WIDGET)
+  /// Зафіксована ціна місця на момент запису, копійки
+  price  Int           @default(0)
+
+  /// Скасування за посиланням — так само, як у звичайної броні
+  cancelToken String @unique @default(uuid())
+
+  createdAt   DateTime  @default(now())
+  cancelledAt DateTime?
+
+  @@index([bookingId, status])
+  @@index([customerId])
 }
 
 /// Платіж за бронь. Один до одного: часткових оплат немає — 100% передоплата.
@@ -510,6 +577,9 @@ model Customer {
 
   bookings Booking[]
   passes   Pass[]
+  /// Місця в групових заняттях — окремо від bookings: там бронь корту,
+  /// тут запис у чужу бронь.
+  seats    BookingSeat[]
 
   /// Телефон унікальний у межах клубу, а не глобально:
   /// одна людина може ходити у два клуби — це різні картки.

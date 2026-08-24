@@ -101,6 +101,22 @@ bookingsRouter.get(
             note: true,
           },
         },
+        /* Записані в групове заняття. У приватної броні масив завжди
+           порожній — окремої гілки в запиті не потрібно. Беремо повний
+           список, а не лічильник: панель броні все одно показує, ХТО
+           записався, а на день таких записів десятки, не тисячі. */
+        seats: {
+          select: {
+            id: true,
+            customerName: true,
+            customerPhone: true,
+            status: true,
+            price: true,
+          },
+          orderBy: {
+            createdAt: 'asc',
+          },
+        },
       },
       orderBy: {
         startTime: 'asc',
@@ -126,6 +142,11 @@ bookingsRouter.get(
         reminderReachable: Boolean(
           b.customer?.telegramChatId,
         ),
+        /* Скільки місць зайнято зараз. Скасовані не рахуються, але з
+           масиву не зникають — клуб має бачити, хто передумав. */
+        seatsTaken: b.seats.filter(
+          (s) => s.status === 'BOOKED',
+        ).length,
       })),
     );
   },
@@ -151,11 +172,14 @@ bookingsRouter.post(
         end: z.string().datetime({
           offset: true,
         }),
+        /* Необовʼязкове, бо в групового заняття одного клієнта немає.
+           Що саме має бути заповнене — стежить superRefine нижче. */
         customerName: z
           .string()
           .trim()
           .min(1)
-          .max(80),
+          .max(80)
+          .optional(),
 
         customerPhone: z
           .string()
@@ -188,6 +212,50 @@ bookingsRouter.post(
           .min(0)
           .max(100_000_000)
           .optional(),
+
+        /* ── Групове заняття ────────────────────────────────────────────
+           Присутня capacity -> це група, а не приватна бронь. Корт при
+           цьому займається рівно один раз, тому booking_no_overlap
+           продовжує працювати без винятків. */
+        capacity: z
+          .number()
+          .int()
+          .min(2)
+          .max(200)
+          .optional(),
+
+        title: z
+          .string()
+          .trim()
+          .min(2)
+          .max(80)
+          .optional(),
+
+        pricePerSeat: z
+          .number()
+          .int()
+          .min(0)
+          .max(100_000_000)
+          .optional(),
+      })
+      /* Дзеркалить CHECK booking_private_or_group у базі. Тут — щоб
+         віддати зрозумілу помилку замість 500 від констрейнта. */
+      .superRefine((d, ctx) => {
+        if (d.capacity != null) {
+          if (!d.title) {
+            ctx.addIssue({
+              code: 'custom',
+              path: ['title'],
+              message: 'Групове заняття без назви',
+            });
+          }
+        } else if (!d.customerName) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['customerName'],
+            message: 'Бронь без імені',
+          });
+        }
       })
       .safeParse(req.body);
 
@@ -289,12 +357,21 @@ bookingsRouter.post(
       (court.pricePerHour * minutes) / 60,
     );
 
-    const priceTotal =
-      d.priceTotal ??
-      courtPrice +
-        trainerPrice;
+    const isGroup = d.capacity != null;
 
-    const phone = d.customerPhone
+    /* Виручка групи — це сума проданих місць, а не ціна корту: клуб бере
+       гроші з кожного гравця окремо. Тому контейнер створюється з нулем і
+       росте, коли люди записуються. Так підсумок дня рахується сам, без
+       окремої гілки в аналітиці. */
+    const priceTotal = isGroup
+      ? (d.priceTotal ?? 0)
+      : (d.priceTotal ??
+        courtPrice +
+          trainerPrice);
+
+    /* У групи клієнта немає — записані лежать у BookingSeat. Картку
+       заводити нема на кого, телефон теж нічий. */
+    const phone = !isGroup && d.customerPhone
       ? normalizePhone(
           d.customerPhone,
         )
@@ -303,7 +380,7 @@ bookingsRouter.post(
     const customer = phone
       ? await findOrCreateCustomer({
           clubId,
-          name: d.customerName,
+          name: d.customerName!,
           rawPhone: d.customerPhone!,
         })
       : null;
@@ -314,9 +391,22 @@ bookingsRouter.post(
           data: {
             clubId,
             courtId: court.id,
-            customerName: d.customerName,
-            customerPhone:
-              phone?.e164 ?? '',
+            /* Група: ні імені, ні телефону — замість них title. Приватна
+               бронь лишається рівно такою, як була, разом із порожнім
+               рядком замість телефону, якщо його не дали. */
+            customerName: isGroup
+              ? null
+              : d.customerName!,
+            customerPhone: isGroup
+              ? null
+              : (phone?.e164 ?? ''),
+            capacity: d.capacity ?? null,
+            title: isGroup
+              ? d.title!
+              : null,
+            pricePerSeat: isGroup
+              ? (d.pricePerSeat ?? 0)
+              : null,
             customerId:
               customer?.id ?? null,
             trainerId:
@@ -690,11 +780,14 @@ bookingsRouter.post(
         end: z.string().datetime({
           offset: true,
         }),
+        /* Як і в одиночній броні: у групи імені немає, є назва.
+           Перевіряє superRefine нижче. */
         customerName: z
           .string()
           .trim()
           .min(1)
-          .max(80),
+          .max(80)
+          .optional(),
         customerPhone: z
           .string()
           .trim()
@@ -721,6 +814,46 @@ bookingsRouter.post(
             'CONFIRMED',
           ])
           .default('CONFIRMED'),
+
+        /* Регулярна група — «щовівторка йога». Саме заради цього серії
+           й потрібні групам найбільше. */
+        capacity: z
+          .number()
+          .int()
+          .min(2)
+          .max(200)
+          .optional(),
+
+        title: z
+          .string()
+          .trim()
+          .min(2)
+          .max(80)
+          .optional(),
+
+        pricePerSeat: z
+          .number()
+          .int()
+          .min(0)
+          .max(100_000_000)
+          .optional(),
+      })
+      .superRefine((d, ctx) => {
+        if (d.capacity != null) {
+          if (!d.title) {
+            ctx.addIssue({
+              code: 'custom',
+              path: ['title'],
+              message: 'Групове заняття без назви',
+            });
+          }
+        } else if (!d.customerName) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['customerName'],
+            message: 'Бронь без імені',
+          });
+        }
       })
       .safeParse(req.body);
 
@@ -733,6 +866,8 @@ bookingsRouter.post(
     const d = parsed.data;
     const clubId =
       req.auth!.clubId;
+    const isGroup =
+      d.capacity != null;
 
     const first = new Date(
       d.start,
@@ -815,15 +950,18 @@ bookingsRouter.post(
           )
         : 0;
 
-    const priceTotal =
-      Math.round(
-        (court.pricePerHour *
-          minutes) /
-          60,
-      ) +
-      trainerPrice;
+    /* Група: виручка приходить із проданих місць, тому кожне заняття
+       серії стартує з нуля — так само, як одиночне. */
+    const priceTotal = isGroup
+      ? 0
+      : Math.round(
+          (court.pricePerHour *
+            minutes) /
+            60,
+        ) +
+        trainerPrice;
 
-    const phone = d.customerPhone
+    const phone = !isGroup && d.customerPhone
       ? normalizePhone(
           d.customerPhone,
         )
@@ -832,7 +970,7 @@ bookingsRouter.post(
     const customer = phone
       ? await findOrCreateCustomer({
           clubId,
-          name: d.customerName,
+          name: d.customerName!,
           rawPhone:
             d.customerPhone!,
         })
@@ -926,9 +1064,22 @@ bookingsRouter.post(
               courtId:
                 court.id,
               customerName:
-                d.customerName,
+                isGroup
+                  ? null
+                  : d.customerName!,
               customerPhone:
-                phone?.e164 ?? '',
+                isGroup
+                  ? null
+                  : (phone?.e164 ?? ''),
+              capacity:
+                d.capacity ?? null,
+              title: isGroup
+                ? d.title!
+                : null,
+              pricePerSeat:
+                isGroup
+                  ? (d.pricePerSeat ?? 0)
+                  : null,
               customerId:
                 customer?.id ??
                 null,
