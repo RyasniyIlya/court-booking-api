@@ -405,7 +405,7 @@ export type CustomerTier = 'ACTIVE' | 'FADING' | 'LOST' | 'NEW';
  * була, і людина, яка зникла пів року тому, — це різні розмови. Перших
  * зустрічають, других повертають.
  */
-function tierOf(lastVisit: Date | null, firstSeen: Date, now: Date): CustomerTier {
+export function tierOf(lastVisit: Date | null, firstSeen: Date, now: Date): CustomerTier {
   if (!lastVisit) {
     const daysKnown = (now.getTime() - firstSeen.getTime()) / 86_400_000;
     return daysKnown <= TIER_ACTIVE_DAYS ? 'NEW' : 'LOST';

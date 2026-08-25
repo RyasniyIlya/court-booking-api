@@ -594,7 +594,7 @@ class HttpError extends Error {
  * Адміністратора це не стосується: клуб домовляється голосом і має могти
  * зняти запис навіть за хвилину до початку.
  */
-function canCancelNow(startTime: Date, cutoffMinutes: number): boolean {
+export function canCancelNow(startTime: Date, cutoffMinutes: number): boolean {
   return Date.now() < startTime.getTime() - cutoffMinutes * 60_000;
 }
 
