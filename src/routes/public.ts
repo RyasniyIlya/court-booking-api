@@ -9,6 +9,7 @@ import bcrypt from 'bcryptjs';
 import { findOrCreateCustomer } from '../lib/customers';
 import { providerFor, publicBase } from '../lib/payments';
 import { clubBilling } from '../lib/billing';
+import { playerStats } from '../lib/playerStats';
 import {
   signCustomerToken, verifyCustomerToken, verifyCustomerPin, hashPinLookup, isPinTakenError,
 } from '../lib/customerAuth';
@@ -841,7 +842,7 @@ publicRouter.get('/customer/me', async (req, res) => {
 
   const now = new Date();
 
-  const [upcoming, seats, club] = await Promise.all([
+  const [upcoming, seats, club, pastBookings, pastSeats] = await Promise.all([
     prisma.booking.findMany({
       where: {
         customerId: customer.id,
@@ -879,15 +880,69 @@ publicRouter.get('/customer/me', async (req, res) => {
       where: { id: customer.clubId },
       select: { timezone: true, cancelCutoffMinutes: true },
     }),
+    /* Минулі відвідування — тільки для підсумку в картці гравця.
+       Беремо обидва джерела й лише поля, потрібні для статистики:
+       список минулих броней сам по собі гравцю у віджеті не показуємо,
+       щоб не перетворювати картку на бухгалтерію. */
+    prisma.booking.findMany({
+      where: {
+        customerId: customer.id,
+        status: 'CONFIRMED',
+        startTime: { lte: now },
+      },
+      select: {
+        startTime: true,
+        court: { select: { name: true } },
+        trainer: { select: { name: true } },
+      },
+      take: 500,
+    }),
+    prisma.bookingSeat.findMany({
+      where: {
+        customerId: customer.id,
+        status: 'BOOKED',
+        booking: { status: 'CONFIRMED', startTime: { lte: now } },
+      },
+      select: {
+        booking: {
+          select: {
+            startTime: true,
+            court: { select: { name: true } },
+            trainer: { select: { name: true } },
+          },
+        },
+      },
+      take: 500,
+    }),
   ]);
 
   const tz = club?.timezone ?? 'Europe/Kyiv';
   const cutoff = club?.cancelCutoffMinutes ?? 0;
   const label = (d: Date) => DateTime.fromJSDate(d).setZone(tz).toFormat('HH:mm');
 
+  /* Підсумок гравця про себе: скільки разів приходив, де грає найчастіше,
+     з ким тренується і скільки тижнів поспіль не пропускає. */
+  const stats = playerStats(
+    [
+      ...pastBookings.map((b) => ({
+        start: b.startTime,
+        courtName: b.court?.name ?? null,
+        trainerName: b.trainer?.name ?? null,
+      })),
+      ...pastSeats.map((s) => ({
+        start: s.booking.startTime,
+        courtName: s.booking.court?.name ?? null,
+        trainerName: s.booking.trainer?.name ?? null,
+      })),
+    ],
+    tz,
+    now,
+  );
+
   res.json({
     name: customer.name,
     phone: customer.phone,
+    stats,
     /* Правило клубу їде разом зі списком: віджет має пояснити гравцю, чому
        кнопки більше немає, а не мовчки її прибрати. */
     cancelCutoffMinutes: cutoff,
