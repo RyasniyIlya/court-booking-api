@@ -561,3 +561,223 @@ analyticsRouter.get('/customers', async (req, res) => {
     customers: rows.slice(0, limit),
   });
 });
+
+/**
+ * GET /api/admin/analytics/trainers/popular?months=6
+ *
+ * Хто з тренерів популярніший — за КІЛЬКІСТЮ РІЗНИХ ЛЮДЕЙ, а не занять.
+ *
+ * ── Чому не /trainers/load ───────────────────────────────────────────────
+ *
+ * Той рахує навантаження за тиждень або місяць: скільки занять і скільки
+ * з них виручки. Питання «до кого йдуть» інше й на короткому вікні не
+ * відповідається: тренер із пʼятьма постійними по двічі на тиждень дасть
+ * більше занять, ніж той, до кого за півроку сходило сорок різних людей.
+ * Перший завантажений, другий популярний, і плутати їх не варто.
+ *
+ * ── Групові рахуються по людях ───────────────────────────────────────────
+ *
+ * У групового заняття один тренер і багато записаних. Тому йога на вісьмох
+ * — це ОДНЕ заняття і ВІСІМ клієнтів. Рахувати її як одного клієнта
+ * означало б записати тренера групових у невостребуваних.
+ *
+ * Люди без картки (адміністратор завів бронь без телефона) серед різних не
+ * рахуються: їх нема чим відрізнити одне від одного. Самі заняття — так.
+ */
+analyticsRouter.get('/trainers/popular', async (req, res) => {
+  const parsed = z
+    .object({ months: z.coerce.number().int().min(1).max(24).default(6) })
+    .safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const club = await prisma.club.findUnique({
+    where: { id: req.auth!.clubId },
+    select: { timezone: true },
+  });
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const now = DateTime.now().setZone(club.timezone);
+  const from = now.minus({ months: parsed.data.months }).startOf('day').toJSDate();
+  const to = now.toJSDate();
+
+  const clubId = req.auth!.clubId;
+
+  const [bookings, seats] = await Promise.all([
+    prisma.booking.findMany({
+      where: {
+        clubId,
+        status: 'CONFIRMED',
+        trainerId: { not: null },
+        startTime: { gte: from, lte: to },
+      },
+      select: {
+        trainerId: true, customerId: true, trainerPrice: true, capacity: true,
+      },
+    }),
+    prisma.bookingSeat.findMany({
+      where: {
+        status: 'BOOKED',
+        booking: {
+          clubId,
+          status: 'CONFIRMED',
+          trainerId: { not: null },
+          startTime: { gte: from, lte: to },
+        },
+      },
+      select: { customerId: true, booking: { select: { trainerId: true } } },
+    }),
+  ]);
+
+  type Row = { sessions: number; clients: Set<string>; headcount: number; revenue: number };
+  const byTrainer = new Map<string, Row>();
+  const rowFor = (id: string) => {
+    const r = byTrainer.get(id)
+      ?? { sessions: 0, clients: new Set<string>(), headcount: 0, revenue: 0 };
+    byTrainer.set(id, r);
+    return r;
+  };
+
+  for (const b of bookings) {
+    const r = rowFor(b.trainerId!);
+    r.sessions += 1;
+    r.revenue += b.trainerPrice;
+    /* Приватна бронь — одна людина. Людей у групі рахуємо нижче, по
+       місцях: capacity тут лише позначає, що заняття не приватне. */
+    if (b.capacity == null) {
+      r.headcount += 1;
+      if (b.customerId) r.clients.add(b.customerId);
+    }
+  }
+
+  for (const s of seats) {
+    const r = rowFor(s.booking.trainerId!);
+    r.headcount += 1;
+    if (s.customerId) r.clients.add(s.customerId);
+  }
+
+  const trainers = await prisma.trainer.findMany({
+    where: { id: { in: [...byTrainer.keys()] } },
+    select: { id: true, name: true, isActive: true },
+  });
+  const byId = new Map(trainers.map((t) => [t.id, t]));
+
+  res.json({
+    months: parsed.data.months,
+    from: from.toISOString(),
+    trainers: [...byTrainer.entries()]
+      .map(([id, r]) => ({
+        trainerId: id,
+        name: byId.get(id)?.name ?? '—',
+        isActive: byId.get(id)?.isActive ?? false,
+        sessions: r.sessions,
+        /** Різних людей — головне число цього звіту */
+        clients: r.clients.size,
+        /** Скільки разів до нього приходили взагалі, з повторами */
+        headcount: r.headcount,
+        revenue: r.revenue,
+      }))
+      .sort((a, b) => b.clients - a.clients || b.sessions - a.sessions),
+  });
+});
+
+/**
+ * GET /api/admin/analytics/customers/:id/visits
+ *
+ * Історія відвідувань однієї людини — броні корту й групові заняття в
+ * одному списку, бо для клуба це однаково «приходив».
+ *
+ * Майбутні записи теж повертаємо, окремим прапорцем: адміністратор
+ * відкриває картку саме тоді, коли людина на дроті, і питання «а коли я
+ * записаний» звучить не рідше, ніж «скільки я вже ходив».
+ */
+analyticsRouter.get('/customers/:id/visits', async (req, res) => {
+  const id = z.string().uuid().safeParse(req.params.id);
+  if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const parsed = z
+    .object({ limit: z.coerce.number().int().min(1).max(200).default(50) })
+    .safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const clubId = req.auth!.clubId;
+
+  const customer = await prisma.customer.findFirst({
+    where: { id: id.data, clubId },
+    select: { id: true, name: true, phone: true },
+  });
+  if (!customer) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const [bookings, seats] = await Promise.all([
+    prisma.booking.findMany({
+      where: { clubId, customerId: customer.id, status: { in: ['CONFIRMED', 'PENDING'] } },
+      select: {
+        id: true, startTime: true, endTime: true, priceTotal: true, status: true,
+        court: { select: { name: true } },
+        trainer: { select: { name: true } },
+      },
+      orderBy: { startTime: 'desc' },
+      take: parsed.data.limit,
+    }),
+    prisma.bookingSeat.findMany({
+      where: {
+        customerId: customer.id,
+        status: 'BOOKED',
+        booking: { clubId, status: { in: ['CONFIRMED', 'PENDING'] } },
+      },
+      select: {
+        id: true, price: true,
+        booking: {
+          select: {
+            startTime: true, endTime: true, title: true, status: true,
+            court: { select: { name: true } },
+            trainer: { select: { name: true } },
+          },
+        },
+      },
+      orderBy: { booking: { startTime: 'desc' } },
+      take: parsed.data.limit,
+    }),
+  ]);
+
+  const now = Date.now();
+
+  const visits = [
+    ...bookings.map((b) => ({
+      id: b.id,
+      kind: 'COURT' as const,
+      label: b.court.name,
+      start: b.startTime.toISOString(),
+      end: b.endTime.toISOString(),
+      price: b.priceTotal,
+      trainerName: b.trainer?.name ?? null,
+      status: b.status,
+      upcoming: b.startTime.getTime() > now,
+    })),
+    ...seats.map((s) => ({
+      id: s.id,
+      kind: 'GROUP' as const,
+      label: s.booking.title ?? 'Групове заняття',
+      start: s.booking.startTime.toISOString(),
+      end: s.booking.endTime.toISOString(),
+      price: s.price,
+      trainerName: s.booking.trainer?.name ?? null,
+      status: s.booking.status,
+      upcoming: s.booking.startTime.getTime() > now,
+    })),
+  ].sort((a, b) => b.start.localeCompare(a.start));
+
+  const past = visits.filter((v) => !v.upcoming);
+
+  res.json({
+    customer,
+    /* Підсумок рахуємо тільки по тому, що вже відбулось: майбутній запис
+       ще не відвідування, і додавати його до «сходив 12 разів» — брехня. */
+    totals: {
+      visits: past.length,
+      spend: past.reduce((a, v) => a + v.price, 0),
+      firstVisit: past.length ? past[past.length - 1].start : null,
+      lastVisit: past.length ? past[0].start : null,
+    },
+    visits: visits.slice(0, parsed.data.limit),
+  });
+});
