@@ -74,9 +74,71 @@ export async function sweepExpired(now = new Date()): Promise<number> {
   return stale.length;
 }
 
+/**
+ * Те саме прибирання, але для місць у групових заняттях.
+ *
+ * Окрема функція, а не гілка в sweepExpired: місце не звільняє корт (його
+ * тримає сам контейнер заняття) і не має власного інтервалу — звільняється
+ * рівно одиниця місткості. Спільним тут лишається тільки правило: холд, за
+ * який не заплатили, віддається назад.
+ *
+ * Виручку не чіпаємо: PENDING у priceTotal ніколи й не входило (див.
+ * lib/payments/apply.ts) — заняття дорожчає в момент оплати, а не запису.
+ */
+export async function sweepExpiredSeats(now = new Date()): Promise<number> {
+  const stale = await prisma.bookingSeat.findMany({
+    where: { status: 'PENDING', expiresAt: { lt: now } },
+    include: {
+      payment: true,
+      booking: { select: { club: { select: { paymentProvider: true, paymentTokenEnc: true } } } },
+    },
+    take: BATCH,
+  });
+  if (stale.length === 0) return 0;
+
+  for (const s of stale) {
+    try {
+      /* updateMany зі статусом в умові — з тієї ж причини, що й у броней:
+         між SELECT і UPDATE може прилетіти вебхук «оплачено». Умова
+         `status: 'PENDING'` робить запис холостим, якщо оплата встигла. */
+      const { count } = await prisma.bookingSeat.updateMany({
+        where: { id: s.id, status: 'PENDING' },
+        data: { status: 'EXPIRED', expiresAt: null },
+      });
+
+      if (count === 0) {
+        console.log(`[expire] місце ${s.id} встигло оплатитись — не чіпаємо`);
+        continue;
+      }
+
+      if (s.payment?.status === 'PENDING') {
+        await prisma.payment.updateMany({
+          where: { id: s.payment.id, status: 'PENDING' },
+          data: { status: 'EXPIRED', failReason: 'HOLD_TIMEOUT' },
+        });
+
+        const provider = providerFor(s.booking.club);
+        if (provider) {
+          void provider.cancelUnpaid(s.payment.providerRef)
+            .catch((e) => console.warn('[expire] cancelUnpaid', s.payment?.providerRef, e.message));
+        }
+      }
+    } catch (e) {
+      // Одне проблемне місце не має зупиняти прибирання решти
+      console.error('[expire] seat', s.id, e);
+    }
+  }
+
+  console.log(`[expire] звільнено місць у групах: ${stale.length}`);
+  return stale.length;
+}
+
 /** Запускається з index.ts. Хвилини достатньо: холд і так 15 хвилин. */
 export function startExpirySweeper(everyMs = 60_000) {
-  const tick = () => { void sweepExpired().catch((e) => console.error('[expire]', e)); };
+  const tick = () => {
+    void sweepExpired().catch((e) => console.error('[expire]', e));
+    void sweepExpiredSeats().catch((e) => console.error('[expire seats]', e));
+  };
   tick();
   const t = setInterval(tick, everyMs);
   // Не тримати процес живим лише заради таймера

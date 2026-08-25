@@ -2,6 +2,7 @@ import { Router } from 'express';
 
 import { authRouter } from './auth';
 import { bookingsRouter } from './bookings';
+import { refundsRouter } from './refunds';
 import { trainersRouter } from './trainers';
 import { courtsRouter } from './courts';
 import { hoursRouter } from './hours';
@@ -16,12 +17,13 @@ import { staffRouter } from './staff';
  * монолітного admin.ts на 3500+ рядків. Шляхи й поведінка не змінились,
  * тільки розкладка по файлах: auth (register/login/elevate/me/pins),
  * bookings (+ series), trainers, courts, hours, club, billing, blocks,
- * customers (+ passes), staff.
+ * customers (+ passes), staff, refunds.
  */
 export const adminRouter = Router();
 
 adminRouter.use(authRouter);
 adminRouter.use(bookingsRouter);
+adminRouter.use(refundsRouter);
 adminRouter.use(trainersRouter);
 adminRouter.use(courtsRouter);
 adminRouter.use(hoursRouter);

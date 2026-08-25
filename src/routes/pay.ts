@@ -86,11 +86,56 @@ const page = (title: string, body: string) => `<!doctype html>
  * а не з параметрів у адресі: підмінити їх у рядку браузера може будь-хто.
  */
 payRouter.get('/done', async (req, res) => {
-  const token = String(req.query.cbPay ?? '');
+  const bookingToken = String(req.query.cbPay ?? '');
+  const seatToken = String(req.query.cbSeat ?? '');
+  const uuid = (s: string) => /^[0-9a-f-]{36}$/i.test(s);
 
-  const booking = /^[0-9a-f-]{36}$/i.test(token)
+  /* Місце в груповому занятті повертається з ?cbSeat, бронь корту — з
+     ?cbPay. Два параметри, а не один: за токеном не видно, що це, а
+     шукати спершу в одній таблиці, потім в іншій означало б зайвий
+     запит на кожне повернення. */
+  const seat = uuid(seatToken)
+    ? await prisma.bookingSeat.findUnique({
+        where: { cancelToken: seatToken },
+        include: {
+          booking: {
+            select: {
+              title: true, startTime: true,
+              club: { select: { name: true, phone: true, timezone: true } },
+            },
+          },
+        },
+      })
+    : null;
+
+  if (seat) {
+    const club = seat.booking.club;
+    const when = seat.booking.startTime.toLocaleString('uk-UA', {
+      timeZone: club.timezone,
+      day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit',
+    });
+    const tel = club.phone
+      ? `<p>Питання — <a href="tel:${esc(club.phone)}">${esc(club.phone)}</a></p>`
+      : '';
+
+    const text =
+      seat.status === 'BOOKED'
+        ? '<h1>Оплачено</h1><p>Місце на занятті за вами. Чекаємо вас.</p>'
+        : seat.status === 'PENDING'
+          ? '<h1>Оплата обробляється</h1><p>Щойно банк підтвердить платіж, місце стане вашим. Зазвичай це кілька секунд.</p>'
+          : seat.status === 'EXPIRED'
+            ? '<h1>Оплату не завершено</h1><p>Місце повернулось у вільні. Спробуйте записатись ще раз.</p>'
+            : '<h1>Запис скасовано</h1><p>Якщо гроші списались — вони повернуться на картку.</p>';
+
+    return res.type('html').send(page(
+      'Оплата',
+      `${text}<p class="d">${esc(club.name)} · ${esc(seat.booking.title ?? 'заняття')} · ${esc(when)}</p>${tel}`,
+    ));
+  }
+
+  const booking = uuid(bookingToken)
     ? await prisma.booking.findUnique({
-        where: { cancelToken: token },
+        where: { cancelToken: bookingToken },
         include: { club: { select: { name: true, phone: true, timezone: true } } },
       })
     : null;

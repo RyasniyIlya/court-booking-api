@@ -13,6 +13,19 @@ import { PaymentError } from './types';
  * Підпис не перевіряється: у dev його нема кому ставити. Тому провайдер
  * mock свідомо не має бути доступний на проді (див. index.ts).
  */
+/**
+ * Куди стукати вебхуком по кожному рахунку, який ця заглушка виставила.
+ *
+ * Адреса вебхука приходить у createInvoice, а refund() її вже не бачить —
+ * у справжнього банку вона й не потрібна, він пам'ятає мерчанта сам.
+ * Заглушці пам'ятати нема де, тому тримаємо в пам'яті процесу.
+ *
+ * Втрата при перезапуску — свідомо прийнятна: це dev-заглушка, і
+ * найгірше, що станеться, — повернення в локальній базі доведеться
+ * підтвердити руками. У проді mock вимкнено (див. index.ts).
+ */
+const mockHooks = new Map<string, string>();
+
 export class MockProvider implements PayProvider {
   readonly name = 'mock';
 
@@ -25,6 +38,7 @@ export class MockProvider implements PayProvider {
     url.searchParams.set('back', input.redirectUrl);
     url.searchParams.set('hook', input.webHookUrl);
     url.searchParams.set('what', input.destination);
+    mockHooks.set(providerRef, input.webHookUrl);
     return { providerRef, pageUrl: url.toString() };
   }
 
@@ -40,7 +54,8 @@ export class MockProvider implements PayProvider {
     const status = body.status === 'success' ? 'paid'
       : body.status === 'failure' ? 'failed'
         : body.status === 'expired' ? 'expired'
-          : 'pending';
+          : body.status === 'reversed' ? 'refunded'
+            : 'pending';
 
     return {
       providerRef: body.invoiceId,
@@ -50,6 +65,25 @@ export class MockProvider implements PayProvider {
     };
   }
 
-  async refund(): Promise<void> { /* у заглушки повертати нічого */ }
+  /**
+   * Грошей у заглушки немає, але вебхук вона шле справжній — той самий
+   * `reversed`, що й моно. Інакше локально перевірявся б лише HTTP-запит
+   * до банку, а найцікавіше (як подія «повернуто» лягає в базу і знімає
+   * бронь) лишалось би неперевіреним до першого живого клуба.
+   */
+  async refund(providerRef: string, amountKop: number): Promise<void> {
+    const hook = mockHooks.get(providerRef);
+    if (!hook) return;
+
+    /* Не чекаємо на відповідь: справжній банк теж повертає керування
+       одразу, а вебхук долітає окремо. Помилку тільки логуємо — роут
+       повернення про неї нічого зробити не може. */
+    void fetch(hook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ invoiceId: providerRef, status: 'reversed', amount: amountKop }),
+    }).catch((e) => console.error('[pay] mock reverse hook failed', e));
+  }
+
   async cancelUnpaid(): Promise<void> { /* немає що гасити */ }
 }

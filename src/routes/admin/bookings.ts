@@ -104,6 +104,10 @@ bookingsRouter.get(
             status: true,
             paidAt: true,
             amount: true,
+            /* Щоб кабінет міг сказати «повернення в дорозі» замість того,
+               щоб пропонувати натиснути кнопку вдруге. */
+            refundRequestedAt: true,
+            refundedAt: true,
           },
         },
         customer: {
@@ -125,6 +129,17 @@ bookingsRouter.get(
             customerPhone: true,
             status: true,
             price: true,
+            /* У групі платить кожен за себе, тому й повертати доводиться
+               поштучно — панель має показати гроші на рівні місця, а не
+               заняття цілком. */
+            payment: {
+              select: {
+                status: true,
+                amount: true,
+                refundRequestedAt: true,
+                refundedAt: true,
+              },
+            },
           },
           orderBy: {
             createdAt: 'asc',
@@ -155,10 +170,11 @@ bookingsRouter.get(
         reminderReachable: Boolean(
           b.customer?.telegramChatId,
         ),
-        /* Скільки місць зайнято зараз. Скасовані не рахуються, але з
-           масиву не зникають — клуб має бачити, хто передумав. */
+        /* Скільки місць зайнято зараз. Скасовані й протухлі не рахуються,
+           але з масиву не зникають — клуб має бачити, хто передумав.
+           PENDING рахується: місце під оплатою нікому іншому не продати. */
         seatsTaken: b.seats.filter(
-          (s) => s.status === 'BOOKED',
+          (s) => s.status === 'BOOKED' || s.status === 'PENDING',
         ).length,
       })),
     );
@@ -1277,13 +1293,17 @@ bookingsRouter.post(
         if (!b || b.clubId !== clubId) throw new SeatError(404, 'NOT_FOUND');
         if (b.capacity == null) throw new SeatError(400, 'NOT_A_GROUP');
 
+        /* PENDING зайняте нарівні з BOOKED: місце, за яке гравець саме
+           зараз платить у віджеті, ресепшен не має віддати іншому. */
+        const HELD = ['BOOKED', 'PENDING'] as const;
+
         const taken = await tx.bookingSeat.count({
-          where: { bookingId: b.id, status: 'BOOKED' },
+          where: { bookingId: b.id, status: { in: [...HELD] } },
         });
         if (taken >= b.capacity) throw new SeatError(409, 'GROUP_FULL');
 
         const already = await tx.bookingSeat.findFirst({
-          where: { bookingId: b.id, customerPhone: phone.e164, status: 'BOOKED' },
+          where: { bookingId: b.id, customerPhone: phone.e164, status: { in: [...HELD] } },
           select: { id: true },
         });
         if (already) throw new SeatError(409, 'ALREADY_JOINED');
@@ -1345,16 +1365,23 @@ bookingsRouter.post(
         if (!seat || seat.booking.clubId !== req.auth!.clubId) {
           throw new SeatError(404, 'NOT_FOUND');
         }
-        if (seat.status === 'CANCELLED') return;
+        if (seat.status === 'CANCELLED' || seat.status === 'EXPIRED') return;
+
+        /* Місце під оплатою знімається так само (клуб має право), але
+           виручку чіпати нічим: неоплачене місце в priceTotal не входило
+           — його додає вебхук (див. lib/payments/apply.ts). */
+        const wasPaid = seat.status === 'BOOKED';
 
         await tx.bookingSeat.update({
           where: { id: seat.id },
-          data: { status: 'CANCELLED', cancelledAt: new Date() },
+          data: { status: 'CANCELLED', cancelledAt: new Date(), expiresAt: null },
         });
-        await tx.booking.update({
-          where: { id: seat.booking.id },
-          data: { priceTotal: { decrement: seat.price } },
-        });
+        if (wasPaid) {
+          await tx.booking.update({
+            where: { id: seat.booking.id },
+            data: { priceTotal: { decrement: seat.price } },
+          });
+        }
       });
 
       res.json({ ok: true });

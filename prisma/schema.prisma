@@ -419,8 +419,15 @@ model Booking {
 }
 
 enum SeatStatus {
+  /// Місце за гравцем. Рахується і в зайнятих, і у виручці заняття.
   BOOKED
+  /// Місце тримається під оплату (заповнено expiresAt). Місткість займає:
+  /// інакше поки гравець платить, те саме місце продали б удруге.
+  PENDING
   CANCELLED
+  /// Не оплатив за відведений час. Місце повертається у вільні — рівно те
+  /// саме, що EXPIRED у Booking, тільки для місця в групі.
+  EXPIRED
 }
 
 /// Одне місце в груповому занятті — один записаний гравець.
@@ -454,23 +461,51 @@ model BookingSeat {
   /// Зафіксована ціна місця на момент запису, копійки
   price  Int           @default(0)
 
-  /// Скасування за посиланням — так само, як у звичайної броні
+  /// Скасування за посиланням — так само, як у звичайної броні.
+  /// Ним же віджет питає статус оплати після повернення з платіжки.
   cancelToken String @unique @default(uuid())
+
+  /// Заповнено тільки поки місце чекає онлайн-оплати. Після цього моменту
+  /// прибирання (lib/expire.ts) переведе місце в EXPIRED і звільнить його.
+  /// null = місце оплачується на місці й не протухає.
+  expiresAt DateTime? @db.Timestamptz(3)
+
+  /// Оплата саме за це місце. Не плутати з оплатою самого заняття:
+  /// контейнер групи корт нікому не продає, платять учасники поштучно.
+  payment Payment?
 
   createdAt   DateTime  @default(now())
   cancelledAt DateTime?
 
   @@index([bookingId, status])
   @@index([customerId])
+  /// Для прибирання неоплачених місць — той самий патерн, що й у Booking
+  @@index([status, expiresAt])
 }
 
-/// Платіж за бронь. Один до одного: часткових оплат немає — 100% передоплата.
+/// Платіж. Один до одного з тим, за що заплачено: часткових оплат немає —
+/// 100% передоплата.
+///
+/// «Те, за що заплачено» — рівно одне з двох: приватна бронь корту або одне
+/// місце в груповому занятті. Третього не дано, і за цим стежить CHECK
+/// payment_booking_or_seat.
+///
+/// Чому не один bookingId на все. Групове заняття — це ОДНА бронь корту на
+/// вісьмох людей. Якби місце платило через bookingId, унікальність «один
+/// платіж на бронь» довелось би зняти зовсім — і зникла б гарантія, що
+/// приватну бронь не оплатять двома рахунками. Друга nullable-колонка
+/// зберігає обидві: NULL у Postgres не конфліктує з NULL, тому @unique на
+/// кожній працює рівно там, де вона потрібна.
 model Payment {
-  id        String  @id @default(uuid()) @db.Uuid
-  clubId    String  @db.Uuid
-  club      Club    @relation(fields: [clubId], references: [id], onDelete: Cascade)
-  bookingId String  @unique @db.Uuid
-  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  id        String       @id @default(uuid()) @db.Uuid
+  clubId    String       @db.Uuid
+  club      Club         @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  /// Приватна бронь корту. null — платять за місце в групі.
+  bookingId String?      @unique @db.Uuid
+  booking   Booking?     @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  /// Місце в груповому занятті. null — платять за бронь корту.
+  seatId    String?      @unique @db.Uuid
+  seat      BookingSeat? @relation(fields: [seatId], references: [id], onDelete: Cascade)
 
   /// 'mono' | 'mock'
   provider    String
@@ -490,6 +525,14 @@ model Payment {
   /// тому старіший вебхук не має перетирати новіший стан.
   providerAt DateTime?
   paidAt     DateTime?
+  /// Коли клуб натиснув «Повернути гроші» й банк прийняв запит.
+  ///
+  /// Не те саме, що refundedAt: гроші повернулись тоді, коли про це сказав
+  /// вебхук, а не тоді, коли ми попросили. Між цими двома моментами
+  /// проходять секунди у моно й можуть пройти дні у поганий день — і весь
+  /// цей час кабінет має показувати «повернення в дорозі», а не пропонувати
+  /// натиснути кнопку вдруге.
+  refundRequestedAt DateTime?
   refundedAt DateTime?
   failReason String?
 

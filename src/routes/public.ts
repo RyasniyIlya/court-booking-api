@@ -214,7 +214,10 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
         title: true,
         pricePerSeat: true,
         trainer: { select: { name: true } },
-        seats: { where: { status: 'BOOKED' }, select: { id: true } },
+        /* PENDING рахується зайнятим нарівні з BOOKED: місце під оплатою
+           вже не вільне, і показувати його як вільне означало б вести
+           другого гравця в платіжку за тим самим стільцем. */
+        seats: { where: { status: { in: ['BOOKED', 'PENDING'] } }, select: { id: true } },
       },
     }),
     prisma.block.findMany({
@@ -569,6 +572,10 @@ const joinSchema = z.object({
   customerName: z.string().trim().min(2).max(80),
   customerPhone: z.string().trim().regex(/^\+?[0-9\s()-]{9,20}$/, 'invalid phone'),
   comment: z.string().trim().max(300).optional(),
+  /** Куди повернути гравця після платіжки. Віджет підставляє свою сторінку. */
+  returnUrl: z.string().url().max(500).optional(),
+  /** Те саме, що й у броні корту: має сенс лише коли клуб лишив вибір гравцю. */
+  payChoice: z.enum(['online', 'onsite']).optional(),
 });
 
 /**
@@ -611,9 +618,16 @@ export function canCancelNow(startTime: Date, cutoffMinutes: number): boolean {
  * останнє місце в одну мілісекунду, стають у чергу, і другий отримає
  * GROUP_FULL замість дев'ятого місця у восьмимісній групі.
  *
- * Оплати тут немає навмисно: у першій версії групові заняття оплачуються
- * на місці. Оплата за місце вимагає розв'язати Payment.bookingId @unique,
- * і це окрема робота, а не рядок у цьому обробнику.
+ * ── Оплата ───────────────────────────────────────────────────────────────
+ *
+ * Правила ті самі, що й у броні корту: клуб або не бере передоплату, або
+ * вимагає її, або лишає вибір гравцю. Різниця одна — неоплачене місце
+ * тримає не корт, а одиницю місткості, тому воно створюється в статусі
+ * PENDING з `expiresAt`, а не окремим «резервом».
+ *
+ * Виручку заняття неоплачене місце НЕ підіймає: priceTotal росте в момент
+ * оплати (lib/payments/apply.ts). Інакше покинутий кошик на чверть години
+ * додавав би клубу грошей, яких він не бачив.
  */
 publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
   const parsed = joinSchema.safeParse(req.body);
@@ -637,13 +651,25 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
   });
   if (customer?.isBlocked) return res.status(403).json({ error: 'CUSTOMER_BLOCKED' });
 
+  /* Ті самі три стани клуба, що й у броні корту. Вибір обов'язковий, коли
+     клуб його лишив: без нього незрозуміло, чи тримати місце під оплату. */
+  if (club.prepayEnabled && !club.prepayRequired && !body.payChoice) {
+    return res.status(400).json({ error: 'PAY_CHOICE_REQUIRED' });
+  }
+  const wantsOnlinePay = club.prepayRequired || body.payChoice === 'online';
+  const provider = club.prepayEnabled && wantsOnlinePay ? providerFor(club) : null;
+
+  let made;
   try {
-    const seat = await prisma.$transaction(async (tx) => {
+    made = await prisma.$transaction(async (tx) => {
       /* Блокуємо саме рядок заняття. Всі, хто записується в ЦЮ групу,
          стають у чергу тут; записи в інші групи не чекають. */
       const rows = await tx.$queryRaw<
-        { id: string; clubId: string; capacity: number | null; pricePerSeat: number | null; status: string; startTime: Date }[]
-      >`SELECT "id", "clubId", "capacity", "pricePerSeat", "status"::text, "startTime"
+        {
+          id: string; clubId: string; capacity: number | null; pricePerSeat: number | null;
+          status: string; title: string | null; startTime: Date; endTime: Date;
+        }[]
+      >`SELECT "id", "clubId", "capacity", "pricePerSeat", "status"::text, "title", "startTime", "endTime"
           FROM "Booking" WHERE "id" = ${bookingId.data}::uuid FOR UPDATE`;
 
       const b = rows[0];
@@ -656,18 +682,24 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
         throw new HttpError(400, 'TOO_LATE');
       }
 
+      /* PENDING рахується зайнятим нарівні з BOOKED: поки один платить,
+         його місце вже не вільне. Інакше восьмимісна група продала б
+         дев'яте місце за ті самі п'ятнадцять хвилин холду. */
+      const HELD = ['BOOKED', 'PENDING'] as const;
+
       const taken = await tx.bookingSeat.count({
-        where: { bookingId: b.id, status: 'BOOKED' },
+        where: { bookingId: b.id, status: { in: [...HELD] } },
       });
       if (taken >= b.capacity) throw new HttpError(409, 'GROUP_FULL');
 
       const already = await tx.bookingSeat.findFirst({
-        where: { bookingId: b.id, customerPhone: phone.e164, status: 'BOOKED' },
+        where: { bookingId: b.id, customerPhone: phone.e164, status: { in: [...HELD] } },
         select: { id: true },
       });
       if (already) throw new HttpError(409, 'ALREADY_JOINED');
 
       const price = b.pricePerSeat ?? 0;
+      const needsPay = Boolean(provider) && price > 0;
 
       const created = await tx.bookingSeat.create({
         data: {
@@ -678,29 +710,132 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
           comment: body.comment,
           price,
           source: 'WIDGET',
+          status: needsPay ? 'PENDING' : 'BOOKED',
+          expiresAt: needsPay ? new Date(Date.now() + club.payHoldMinutes * 60_000) : null,
         },
       });
 
       /* Виручка заняття росте разом із проданими місцями — так підсумок
-         дня рахується сам, без окремої гілки в аналітиці. */
-      await tx.booking.update({
-        where: { id: b.id },
-        data: { priceTotal: { increment: price } },
-      });
+         дня рахується сам, без окремої гілки в аналітиці. Місце, яке ще
+         не оплачене, продане не є: його додасть вебхук. */
+      if (!needsPay) {
+        await tx.booking.update({
+          where: { id: b.id },
+          data: { priceTotal: { increment: price } },
+        });
+      }
 
-      return created;
-    });
-
-    res.status(201).json({
-      id: seat.id,
-      cancelToken: seat.cancelToken,
-      price: seat.price,
+      return { seat: created, group: b, price, needsPay };
     });
   } catch (e) {
     if (e instanceof HttpError) return res.status(e.status).json({ error: e.code });
     console.error('[join] failed', e);
-    res.status(500).json({ error: 'INTERNAL' });
+    return res.status(500).json({ error: 'INTERNAL' });
   }
+
+  const { seat, group, price, needsPay } = made;
+
+  if (!needsPay) {
+    return res.status(201).json({
+      id: seat.id,
+      cancelToken: seat.cancelToken,
+      price: seat.price,
+      status: seat.status,
+    });
+  }
+
+  /* Рахунок виставляємо ПІСЛЯ транзакції: похід у банк займає сотні
+     мілісекунд, і тримати на ньому рядковий замок заняття означало б
+     ставити в чергу всіх, хто записується в ту саму групу. */
+  const back = new URL(safeReturnUrl(body.returnUrl, req.headers.origin));
+  back.searchParams.set('cbSeat', seat.cancelToken);
+
+  const when = `${DateTime.fromJSDate(group.startTime).setZone(club.timezone).toFormat('dd.MM HH:mm')}–` +
+    `${DateTime.fromJSDate(group.endTime).setZone(club.timezone).toFormat('HH:mm')}`;
+
+  try {
+    const invoice = await provider!.createInvoice({
+      amountKop: price,
+      reference: seat.id,
+      destination: `${club.name}: ${group.title ?? 'заняття'}, ${when}`,
+      redirectUrl: back.toString(),
+      webHookUrl: `${publicBase()}/api/pay/webhook/${club.id}`,
+      ttlSeconds: club.payHoldMinutes * 60,
+    });
+
+    await prisma.payment.create({
+      data: {
+        clubId: club.id,
+        seatId: seat.id,
+        provider: provider!.name,
+        providerRef: invoice.providerRef,
+        pageUrl: invoice.pageUrl,
+        amount: price,
+      },
+    });
+
+    return res.status(201).json({
+      id: seat.id,
+      cancelToken: seat.cancelToken,
+      price,
+      status: 'PENDING',
+      payUrl: invoice.pageUrl,
+      expiresAt: seat.expiresAt!.toISOString(),
+    });
+  } catch (e) {
+    // Рахунок не виставився — тримати місце немає підстав, віддаємо одразу.
+    console.error('[join] invoice failed', e);
+    await prisma.bookingSeat.update({
+      where: { id: seat.id },
+      data: { status: 'EXPIRED', expiresAt: null },
+    }).catch(() => {});
+    return res.status(502).json({ error: 'PAYMENT_UNAVAILABLE' });
+  }
+});
+
+/**
+ * GET /api/public/seats/:token/status — те саме, що й у броні, але для місця.
+ *
+ * Віджет опитує сюди після повернення з платіжки. Джерело правди — вебхук,
+ * а не факт повернення гравця, тому статус читається з бази.
+ */
+publicRouter.get('/seats/:token/status', async (req, res) => {
+  const parsed = z.string().uuid().safeParse(req.params.token);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const seat = await prisma.bookingSeat.findUnique({
+    where: { cancelToken: parsed.data },
+    include: {
+      payment: { select: { status: true } },
+      booking: {
+        select: {
+          title: true, startTime: true, endTime: true,
+          court: { select: { name: true } },
+          trainer: { select: { name: true } },
+          club: { select: { timezone: true } },
+        },
+      },
+    },
+  });
+  if (!seat) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const tz = seat.booking.club.timezone;
+  const label = (d: Date) => DateTime.fromJSDate(d).setZone(tz).toFormat('HH:mm');
+
+  res.json({
+    id: seat.id,
+    status: seat.status,
+    paymentStatus: seat.payment?.status ?? null,
+    title: seat.booking.title,
+    courtName: seat.booking.court.name,
+    trainerName: seat.booking.trainer?.name ?? null,
+    start: seat.booking.startTime.toISOString(),
+    end: seat.booking.endTime.toISOString(),
+    startLabel: label(seat.booking.startTime),
+    endLabel: label(seat.booking.endTime),
+    price: seat.price,
+    expiresAt: seat.expiresAt?.toISOString() ?? null,
+  });
 });
 
 /**
@@ -1023,8 +1158,11 @@ publicRouter.post('/seats/:id/cancel', async (req, res) => {
         && seat.booking.clubId === auth!.clubId;
       if (!byToken && !byCabinet) throw new HttpError(404, 'NOT_FOUND');
 
-      // Повторний виклик не має бути помилкою: гравець міг двічі тицьнути
-      if (seat.status === 'CANCELLED') return;
+      /* Знімати можна тільки те, що справді за гравцем. Повторний виклик
+         не має бути помилкою (гравець міг двічі тицьнути), а місце під
+         оплатою чи вже протухле знімати немає з чого: перше відпустить
+         вебхук або прибирання, друге вже відпущене. */
+      if (seat.status !== 'BOOKED') return;
 
       const cutoff = seat.booking.club.cancelCutoffMinutes;
       if (!canCancelNow(seat.booking.startTime, cutoff)) {
