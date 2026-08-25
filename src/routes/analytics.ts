@@ -396,24 +396,54 @@ analyticsRouter.delete('/expenses/:id', async (req, res) => {
 const TIER_ACTIVE_DAYS = 30;
 const TIER_FADING_DAYS = 90;
 
+/**
+ * Скільки перших відвідувань людина ще вважається новачком.
+ *
+ * Раніше новачком був тільки той, хто записався і НЕ БУВ ЖОДНОГО РАЗУ, —
+ * тобто сегмент зникав рівно тоді, коли з людиною вперше можна поговорити
+ * про клуб. А новачок — це не «нуль візитів», це той, хто ще не вирішив,
+ * лишається він чи ні: його зустрічають, запамʼятовують імʼя, питають, як
+ * пішло. Пʼять занять — це приблизно місяць-півтора занять раз на тиждень,
+ * рівно той строк, за який людина або стає постійною, або зникає.
+ *
+ * Число тут, а не в налаштуваннях клубу, — з тієї ж причини, що й межі в
+ * днях: сегмент має означати те саме всюди.
+ */
+const TIER_NEW_VISITS = 5;
+
 export type CustomerTier = 'ACTIVE' | 'FADING' | 'LOST' | 'NEW';
 
 /**
  * До якого сегмента належить клієнт.
  *
- * NEW окремо від LOST: людина, яка записалась учора і ще жодного разу не
- * була, і людина, яка зникла пів року тому, — це різні розмови. Перших
- * зустрічають, других повертають.
+ * NEW окремо від LOST: людина, яка записалась учора, і людина, яка зникла
+ * пів року тому, — це різні розмови. Перших зустрічають, других повертають.
+ *
+ * ── Чому новачок живе всередині «ходить», а не поруч ─────────────────────
+ *
+ * Спочатку рахуємо, чи людина взагалі ходить, і лише потім — чи вона ще
+ * новачок. Тобто той, у кого три візити, але останній був три місяці тому,
+ * це FADING, а не NEW.
+ *
+ * Інакше сегменти почали б брехати саме там, де вони найпотрібніші:
+ * новачок, який сходив двічі й пропав, — це найважливіший дзвінок у всій
+ * картотеці, а лишившись у «новачках» він виглядав би як людина, яку
+ * просто ще не встигли зустріти.
  */
-export function tierOf(lastVisit: Date | null, firstSeen: Date, now: Date): CustomerTier {
+export function tierOf(
+  lastVisit: Date | null,
+  firstSeen: Date,
+  now: Date,
+  visits = 0,
+): CustomerTier {
   if (!lastVisit) {
     const daysKnown = (now.getTime() - firstSeen.getTime()) / 86_400_000;
     return daysKnown <= TIER_ACTIVE_DAYS ? 'NEW' : 'LOST';
   }
   const days = (now.getTime() - lastVisit.getTime()) / 86_400_000;
-  if (days <= TIER_ACTIVE_DAYS) return 'ACTIVE';
-  if (days <= TIER_FADING_DAYS) return 'FADING';
-  return 'LOST';
+  if (days > TIER_FADING_DAYS) return 'LOST';
+  if (days > TIER_ACTIVE_DAYS) return 'FADING';
+  return visits <= TIER_NEW_VISITS ? 'NEW' : 'ACTIVE';
 }
 
 /**
@@ -530,7 +560,7 @@ analyticsRouter.get('/customers', async (req, res) => {
       visits: r.visits,
       spend: r.spend,
       lastVisit: r.last?.toISOString() ?? null,
-      tier: tierOf(r.last, c.createdAt, now),
+      tier: tierOf(r.last, c.createdAt, now, r.visits),
     };
   });
 
