@@ -5,6 +5,7 @@ import { prisma } from '../../lib/db';
 import { KNOWN_PROVIDERS, providerFor, publicBase } from '../../lib/payments';
 import { encryptSecret, paymentsSecretReady } from '../../lib/crypto';
 import { requireAuth, requireStaff, requireLevel } from './shared';
+import { logoSrcOf } from '../public';
 
 export const clubRouter = Router();
 
@@ -35,6 +36,13 @@ clubRouter.get(
       phone: club.phone,
       address: club.address,
       logoUrl: club.logoUrl,
+      /* Кабінет показує ТОЙ САМИЙ логотип, що й віджет, тому адреса
+         рахується спільною функцією. logoMode іде окремо: перемикач у
+         майстрі має знати справжній стан, а не вгадувати його з того,
+         порожня адреса чи ні. */
+      logoSrc: logoSrcOf(club),
+      logoMode: club.logoMode,
+      hasLogoFile: Boolean(club.logoMime),
       brandColor:
         club.brandColor,
       telegramChatId:
@@ -115,6 +123,16 @@ clubRouter.patch(
             .nullable()
             .optional(),
 
+        /* Що показувати: літери чи картинку. Окремо від самого файлу —
+           клуб може лишити логотип завантаженим і тимчасово повернутись
+           до монограми, не втрачаючи файл. */
+        logoMode:
+          z.enum([
+            'MONOGRAM',
+            'IMAGE',
+          ])
+            .optional(),
+
         telegramChatId:
           z.string()
             .trim()
@@ -172,13 +190,14 @@ clubRouter.patch(
           z.boolean()
             .optional(),
 
-        billingPeriod:
-          z.enum([
-            'MONTH',
-            'QUARTER',
-            'YEAR',
-          ])
-            .optional(),
+        /* billingPeriod звідси прибраний навмисно. Період і план тепер
+           задає оператор платформи (PATCH /api/platform/clubs/:id) після
+           того, як домовився з клубом і отримав гроші. Кабінет їх тільки
+           показує.
+
+           Zod тут working у strip-режимі, тож поле просто відкидається:
+           старий клієнт, який ще шле billingPeriod, отримає 200 і решту
+           збережених полів, а не 400 на весь запит. */
 
         prepayEnabled:
           z.boolean()
@@ -259,20 +278,9 @@ clubRouter.patch(
       });
     }
 
-    // Період оплати нашого обслуговування — рахунок виставляється власнику
-    // клубу, не модератору. Модератор бачить стан підписки (йому треба
-    // знати, коли вимкнеться онлайн-запис), але не переводить клуб з
-    // місячної на річну. Роль, а не рівень: це не робота з секретом, і
-    // ганяти власника за окремим PIN заради перемикача — зайве.
-    if (
-      rest.billingPeriod !== undefined &&
-      req.auth!.role !== 'OWNER'
-    ) {
-      return res.status(403).json({
-        error: 'FORBIDDEN',
-        requiredRole: ['OWNER'],
-      });
-    }
+    /* Перевірки на billingPeriod тут більше немає: поле прибране зі схеми
+       вище, тож дійти сюди воно не може. Період і план клубу задає тільки
+       оператор платформи — і власник, і модератор їх лише бачать. */
 
     const data: Record<
       string,
@@ -355,6 +363,9 @@ clubRouter.patch(
         club.address,
       logoUrl:
         club.logoUrl,
+      logoSrc: logoSrcOf(club),
+      logoMode: club.logoMode,
+      hasLogoFile: Boolean(club.logoMime),
       brandColor:
         club.brandColor,
       telegramChatId:

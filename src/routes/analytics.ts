@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import { DateTime } from 'luxon';
 import { prisma } from '../lib/db';
-import { requireAuth, requireRole } from './admin';
+import { requireAuth, requireRole, requireFeature } from './admin';
 
 /**
  * CRM-аналітика кабінету. Окремий файл, а не ще один розділ
@@ -17,7 +17,18 @@ import { requireAuth, requireRole } from './admin';
  */
 export const analyticsRouter = Router();
 
-analyticsRouter.use(requireAuth, requireRole('OWNER', 'ADMIN'));
+/*
+ * Тут вартовий плану стоїть на ЧИТАННІ, а не на записі — на відміну від
+ * тренерів і групових. Причина в природі можливості: аналітика і є перегляд
+ * цифр, закривати в ній «створення» нема чого. Тренери ж — керування
+ * людьми, там план закриває зміни, а вже заведені картки клуб бачить далі.
+ *
+ * Пошук клієнта за телефоном на ресепшені сюди НЕ входить: він живе в
+ * customersRouter і лишається відкритим на всіх рівнях. Інакше клуб на
+ * першому рівні не зміг би прийняти бронь від постійного гравця — це вже
+ * не «недоплатив за аналітику», а зламаний основний сценарій.
+ */
+analyticsRouter.use(requireAuth, requireRole('OWNER', 'ADMIN'), requireFeature('analytics'));
 
 const periodQuery = z.object({
   period: z.enum(['week', 'month']).default('week'),

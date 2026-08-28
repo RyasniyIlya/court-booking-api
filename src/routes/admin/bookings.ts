@@ -6,7 +6,7 @@ import { DateTime } from 'luxon';
 import { prisma, isSlotTakenError } from '../../lib/db';
 import { normalizePhone } from '../../lib/phone';
 import { getActivePasses, findOrCreateCustomer } from '../../lib/customers';
-import { requireAuth, requireStaff, requireLevel, param } from './shared';
+import { requireAuth, requireStaff, requireLevel, hasFeature, param } from './shared';
 
 export const bookingsRouter = Router();
 
@@ -387,6 +387,17 @@ bookingsRouter.post(
     );
 
     const isGroup = d.capacity != null;
+
+    /* Групове заняття — можливість плану, звичайна бронь — ні. Перевірка
+       саме тут, а не middleware на весь роут: обидва створюються одним
+       POST /bookings і відрізняються лише наявністю capacity, тож вартовий
+       на роуті закрив би клубу першого рівня всі броні разом із групами. */
+    if (isGroup && !(await hasFeature(req.auth!.clubId, 'groups'))) {
+      return res.status(402).json({
+        error: 'PLAN_REQUIRED',
+        feature: 'groups',
+      });
+    }
 
     /* Виручка групи — це сума проданих місць, а не ціна корту: клуб бере
        гроші з кожного гравця окремо. Тому контейнер створюється з нулем і

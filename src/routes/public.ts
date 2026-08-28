@@ -31,12 +31,44 @@ const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM
 async function loadClub(slug: string) {
   return prisma.club.findFirst({
     where: { slug },
+    /* Байти логотипа сюди тягнути не можна: цей запит виконується на КОЖЕН
+       показ віджета, а logoData важить до 512 КБ. Без omit кожен гравець,
+       який відкрив сторінку клуба, качав би логотип із бази — і той навіть
+       не потрапляв би у відповідь, бо нижче віддаються лише обрані поля.
+       Сам логотип іде окремим роутом, який браузер кешує на рік. */
+    omit: { logoData: true },
     include: {
       hours: true,
       courts: { where: { isActive: true }, orderBy: { sortOrder: 'asc' } },
       trainers: { where: { isActive: true }, orderBy: { sortOrder: 'asc' } },
     },
   });
+}
+
+/**
+ * Адреса логотипа для віджета й кабінету.
+ *
+ * Завантажений файл б'є зовнішнє посилання: якщо клуб вивантажив картинку,
+ * він саме її й хоче бачити. Мітка часу в запиті — щоб браузер, який тримає
+ * попередній логотип рік, побачив новий одразу після заміни.
+ *
+ * MONOGRAM повертає null: віджет і кабінет на null малюють дві літери, тож
+ * перемикач режиму не потребує окремої гілки в жодному компоненті.
+ */
+export function logoSrcOf(club: {
+  slug: string;
+  logoMode: 'MONOGRAM' | 'IMAGE';
+  logoUrl: string | null;
+  logoMime: string | null;
+  logoUpdatedAt: Date | null;
+}): string | null {
+  if (club.logoMode !== 'IMAGE') return null;
+
+  if (club.logoMime && club.logoUpdatedAt) {
+    return `/api/public/clubs/${club.slug}/logo?v=${club.logoUpdatedAt.getTime()}`;
+  }
+
+  return club.logoUrl || null;
 }
 
 /**
@@ -63,7 +95,7 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
       timezone: club.timezone,
       phone: club.phone,
       address: club.address,
-      logoUrl: club.logoUrl,
+      logoUrl: logoSrcOf(club),
       brandColor: club.brandColor,
       online: false,
     });
@@ -80,7 +112,7 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     // логотипа чи адреси віджет лишається таким, як був.
     phone: club.phone,
     address: club.address,
-    logoUrl: club.logoUrl,
+    logoUrl: logoSrcOf(club),
     brandColor: club.brandColor,
     // Розклад тижня — щоб віджет показав «Відчинено до 22:00» без окремого
     // запиту. Хвилини від опівночі за таймзоною клубу, як у базі.
@@ -108,6 +140,43 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     prepayEnabled: club.prepayEnabled,
     prepayRequired: club.prepayRequired,
   });
+});
+
+/**
+ * GET /api/public/clubs/:slug/logo — сам файл логотипа.
+ *
+ * Публічний навмисно: віджет стоїть на сайті клуба, і картинка має
+ * вантажитись без токена — так само, як вантажиться логотип із будь-якого
+ * чужого домену.
+ *
+ * Кешується на рік і незмінно (`immutable`), бо адреса містить мітку часу
+ * останньої заміни: новий файл — нова адреса, стара лежить у браузері й
+ * нікому не заважає. Без цього кожен показ віджета качав би сотні кілобайт.
+ *
+ * `nosniff` і фіксований Content-Type зі свого ж переліку: браузер не має
+ * права переінтерпретувати вміст, навіть якщо в базу колись потрапить не те,
+ * що ми думали.
+ */
+publicRouter.get('/clubs/:slug/logo', async (req, res) => {
+  const club = await prisma.club.findFirst({
+    where: { slug: req.params.slug },
+    select: { logoData: true, logoMime: true, logoUpdatedAt: true },
+  });
+
+  if (!club?.logoData || !club.logoMime) {
+    return res.status(404).json({ error: 'NO_LOGO' });
+  }
+
+  res.setHeader('Content-Type', club.logoMime);
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', 'inline');
+
+  if (club.logoUpdatedAt) {
+    res.setHeader('ETag', `"${club.logoUpdatedAt.getTime()}"`);
+  }
+
+  res.send(club.logoData);
 });
 
 /**

@@ -9,6 +9,7 @@ import jwt from 'jsonwebtoken';
 
 import { JWT_SECRET } from '../../lib/authSecret';
 import { prisma } from '../../lib/db';
+import { planFeatures, type PlanFeatures } from '../../lib/plans';
 
 /* -------------------------------------------------------------------------- */
 /* AUTH                                                                       */
@@ -247,4 +248,89 @@ export function requireStaff(
   }
 
   next();
+}
+
+/**
+ * Вартовий плану: чи відкрита клубу ця можливість.
+ *
+ * План читається з бази НА КОЖЕН запит, а не кладеться в токен. Токен живе
+ * до семи днів, і якби права їхали в ньому, підвищення рівня доходило б до
+ * клуба лише після повторного входу — оператор натиснув «Аналітика», клуб
+ * дзвонить і каже, що нічого не змінилось. Один індексований запит по
+ * clubId дешевший за цю розмову.
+ *
+ * Клуб без призначеного плану проходить усі перевірки: planFeatures()
+ * віддає для null повний набір (див. lib/plans.ts). Це навмисно — так
+ * виглядають клуби, заведені до появи планів.
+ *
+ * 402 PAYMENT_REQUIRED, а не 403: 403 означає «тобі не можна за роллю», і
+ * кабінет уже показує на нього «недостатньо прав». Тут інша природа —
+ * можна, але не оплачено, і повідомлення має бути іншим.
+ */
+export function requireFeature(feature: keyof PlanFeatures) {
+  return async (
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ) => {
+    if (!req.auth) {
+      return res.status(401).json({
+        error: 'UNAUTHORIZED',
+      });
+    }
+
+    const club = await prisma.club.findUnique({
+      where: {
+        id: req.auth.clubId,
+      },
+      select: {
+        plan: {
+          select: {
+            featTrainers: true,
+            featGroups: true,
+            featAnalytics: true,
+          },
+        },
+      },
+    });
+
+    if (!planFeatures(club?.plan)[feature]) {
+      return res.status(402).json({
+        error: 'PLAN_REQUIRED',
+        feature,
+      });
+    }
+
+    next();
+  };
+}
+
+/**
+ * Те саме, що requireFeature, але для перевірки ВСЕРЕДИНІ обробника.
+ *
+ * Потрібне там, де можливість визначається не адресою роута, а тілом
+ * запиту: групове заняття створюється тим самим POST /bookings, що й
+ * звичайна бронь, і відрізняється лише наявністю capacity. Повісити
+ * middleware на весь роут означало б закрити всі броні разом із групами.
+ */
+export async function hasFeature(
+  clubId: string,
+  feature: keyof PlanFeatures,
+): Promise<boolean> {
+  const club = await prisma.club.findUnique({
+    where: {
+      id: clubId,
+    },
+    select: {
+      plan: {
+        select: {
+          featTrainers: true,
+          featGroups: true,
+          featAnalytics: true,
+        },
+      },
+    },
+  });
+
+  return planFeatures(club?.plan)[feature];
 }

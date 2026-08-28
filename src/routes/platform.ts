@@ -6,6 +6,7 @@ import rateLimit from 'express-rate-limit';
 
 import { prisma } from '../lib/db';
 import { JWT_SECRET } from '../lib/authSecret';
+import { PLAN_SELECT } from '../lib/plans';
 
 export const platformRouter = Router();
 
@@ -122,6 +123,8 @@ platformRouter.get('/clubs', requirePlatformAuth, async (_req, res) => {
       paidUntil: true,
       billingPeriod: true,
       billingNote: true,
+      planPrice: true,
+      plan: { select: PLAN_SELECT },
       createdAt: true,
       users: {
         where: { role: 'OWNER' },
@@ -163,6 +166,14 @@ const patchSchema = z.object({
 
   billingPeriod: z.enum(['MONTH', 'QUARTER', 'YEAR']).optional(),
   billingNote: z.string().trim().max(500).nullable().optional(),
+
+  /** uuid плану або null — зняти план (клуб лишається без обмежень) */
+  planId: z.string().uuid().nullable().optional(),
+  /**
+   * Індивідуальна ціна, копійки. null — брати ціну з плану.
+   * 0 дозволений: безкоштовне впровадження — реальна домовленість.
+   */
+  planPrice: z.number().int().min(0).max(100_000_00).nullable().optional(),
 });
 
 /**
@@ -200,8 +211,98 @@ platformRouter.patch('/clubs/:id', requirePlatformAuth, async (req, res) => {
     const club = await prisma.club.update({
       where: { id },
       data,
+      include: { plan: { select: PLAN_SELECT } },
     });
     res.json(club);
+  } catch {
+    res.status(404).json({ error: 'NOT_FOUND' });
+  }
+});
+
+/* -------------------------------------------------------------------------- */
+/* PLANS                                                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Каталог планів. Веде оператор — клуб сюди не має доступу взагалі:
+ * у кабінеті він бачить лише той план, який йому призначили.
+ */
+platformRouter.get('/plans', requirePlatformAuth, async (_req, res) => {
+  const plans = await prisma.plan.findMany({
+    orderBy: [{ sortOrder: 'asc' }, { tier: 'asc' }],
+    include: { _count: { select: { clubs: true } } },
+  });
+
+  res.json(
+    plans.map((p) => ({
+      ...p,
+      clubsCount: p._count.clubs,
+      _count: undefined,
+    })),
+  );
+});
+
+const planBody = z.object({
+  /** Ключ для коду. Латиниця, цифри й дефіс — на нього спираються seed і нотатки */
+  code: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{1,31}$/),
+  name: z.string().trim().min(1).max(80),
+  description: z.string().trim().max(300).nullable().optional(),
+  /** Копійки. 0 дозволений — безкоштовний план теж план */
+  price: z.number().int().min(0).max(100_000_00),
+  period: z.enum(['MONTH', 'QUARTER', 'YEAR']).optional(),
+  tier: z.number().int().min(1).max(9).optional(),
+  featTrainers: z.boolean().optional(),
+  featGroups: z.boolean().optional(),
+  featAnalytics: z.boolean().optional(),
+  isActive: z.boolean().optional(),
+  sortOrder: z.number().int().min(0).max(999).optional(),
+});
+
+platformRouter.post('/plans', requirePlatformAuth, async (req, res) => {
+  const parsed = planBody.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'BAD_REQUEST' });
+  }
+
+  try {
+    const plan = await prisma.plan.create({ data: parsed.data });
+    res.status(201).json(plan);
+  } catch {
+    // Єдина реальна причина — зайнятий code (унікальний індекс)
+    res.status(409).json({ error: 'CODE_TAKEN' });
+  }
+});
+
+platformRouter.patch('/plans/:id', requirePlatformAuth, async (req, res) => {
+  // code не міняється після створення: на нього спираються посилання
+  // ззовні, а перейменування ключа мовчки розірвало б їх.
+  const parsed = planBody.partial().omit({ code: true }).safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({ error: 'BAD_REQUEST' });
+  }
+
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  try {
+    const plan = await prisma.plan.update({ where: { id }, data: parsed.data });
+    res.json(plan);
+  } catch {
+    res.status(404).json({ error: 'NOT_FOUND' });
+  }
+});
+
+/**
+ * Видалення плану. Клуби, яким він призначений, НЕ видаляються і не
+ * ламаються — за зовнішнім ключем їм проставляється planId = null, тобто
+ * вони лишаються без обмежень. Але це рішення оператора, а не побічний
+ * ефект, тому попереджаємо кількістю в підтвердженні на клієнті.
+ */
+platformRouter.delete('/plans/:id', requirePlatformAuth, async (req, res) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  try {
+    await prisma.plan.delete({ where: { id } });
+    res.status(204).end();
   } catch {
     res.status(404).json({ error: 'NOT_FOUND' });
   }

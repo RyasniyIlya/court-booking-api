@@ -7,6 +7,8 @@ import { analyticsRouter } from './routes/analytics';
 import { platformRouter } from './routes/platform';
 import { payRouter } from './routes/pay';
 import { startExpirySweeper } from './lib/expire';
+import { startBot } from './lib/botRunner';
+import { handleUpdate } from './lib/botHandlers';
 import { paymentsSecretReady } from './lib/crypto';
 
 const app = express();
@@ -92,4 +94,8 @@ app.listen(port, () => {
   // Звільняє слоти під неоплаченими бронями. Страховка на випадок,
   // коли гравець просто закрив вкладку і банк нічого не надішле.
   startExpirySweeper();
+
+  // Бот сам вирішує, polling чи вебхук — за наявністю TELEGRAM_WEBHOOK_URL.
+  // Без токена мовчки не вмикається: API має піднятись і без Telegram.
+  void startBot();
 });

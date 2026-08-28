@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
-import { requireAuth, requireStaff, requireLevel, param } from './shared';
+import { requireAuth, requireStaff, requireLevel, requireFeature, param } from './shared';
 import { mountNoteRoutes } from './notes';
 
 export const trainersRouter = Router();
@@ -86,6 +86,7 @@ trainersRouter.post(
   requireAuth,
   requireStaff,
   requireLevel(2),
+  requireFeature('trainers'),
   async (req, res) => {
     const parsed =
       trainerSchema.safeParse(
@@ -118,6 +119,7 @@ trainersRouter.patch(
   requireAuth,
   requireStaff,
   requireLevel(2),
+  requireFeature('trainers'),
   async (req, res) => {
     const parsed =
       trainerSchema
@@ -165,6 +167,7 @@ trainersRouter.delete(
   requireAuth,
   requireStaff,
   requireLevel(2),
+  requireFeature('trainers'),
   async (req, res) => {
     const trainer =
       await prisma.trainer.findFirst({

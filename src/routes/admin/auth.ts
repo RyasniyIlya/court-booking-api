@@ -12,6 +12,7 @@ import {
   signToken,
   verifyStepUpPin,
 } from './shared';
+import { planFeatures } from '../../lib/plans';
 
 export const authRouter = Router();
 
@@ -416,6 +417,19 @@ authRouter.get(
         clubId: true,
         trainerId: true,
         pinOwnerHash: true,
+        club: {
+          select: {
+            plan: {
+              select: {
+                name: true,
+                tier: true,
+                featTrainers: true,
+                featGroups: true,
+                featAnalytics: true,
+              },
+            },
+          },
+        },
       },
     });
 
@@ -441,6 +455,15 @@ authRouter.get(
       // пропонував увімкнути передоплату й отримував 403, а кнопка
       // «Режим власника» в шапці нічого не давала, бо PIN ще не існував.
       hasOwnerPin: Boolean(user.pinOwnerHash),
+
+      /* Можливості за планом — тут, поруч із роллю й рівнем, бо це третя
+         вісь тих самих прав, і кабінет має отримувати всі три одним
+         запитом. Через /billing їх не віддати: ту вкладку бачить не кожен,
+         а ховати «Аналітику» треба до того, як хтось у неї зайде.
+         Клуб без плану отримує повний набір — див. lib/plans.ts. */
+      features: planFeatures(user.club?.plan),
+      /* Назва рівня для підказки «доступно на плані ...» */
+      planName: user.club?.plan?.name ?? null,
     });
   },
 );
