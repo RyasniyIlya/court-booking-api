@@ -28,9 +28,23 @@ const STATUS_MAP: Record<string, PayEventStatus> = {
 /**
  * Публічний ключ мерчанта. Змінюється вкрай рідко, а вебхуки приходять
  * пачками — тримаємо в памʼяті на годину, щоб не ходити по мережі на кожен.
+ *
+ * refetchAfter — не раніше якого часу дозволено перечитати ключ достроково
+ * (див. parseWebhook).
  */
-const pubkeyCache = new Map<string, { pem: string; until: number }>();
+const pubkeyCache = new Map<string, { pem: string; until: number; refetchAfter: number }>();
 const PUBKEY_TTL_MS = 60 * 60 * 1000;
+
+/**
+ * Як часто дозволено перечитувати ключ через непідхожий підпис.
+ *
+ * Роут вебхука публічний і нічим не прикритий, крім самого підпису. Якби
+ * кожен невдалий підпис гнав нас у банк, будь-хто зміг би шквалом підробок
+ * влаштувати нам потік запитів до mono з токеном клуба — і токен поїхав би
+ * у рейт-ліміт банку. Хвилина — стеля для підробок і водночас максимальна
+ * затримка відновлення після справжньої ротації ключа.
+ */
+const PUBKEY_REFETCH_COOLDOWN_MS = 60 * 1000;
 
 export class MonoProvider implements PayProvider {
   readonly name = 'mono';
@@ -84,15 +98,21 @@ export class MonoProvider implements PayProvider {
     return { providerRef: res.invoiceId, pageUrl: res.pageUrl };
   }
 
-  private async pubkey(): Promise<string> {
+  /** force — піти в банк навіть за живого кеша (ключ провернувся) */
+  private async pubkey(force = false): Promise<string> {
     const cached = pubkeyCache.get(this.token);
-    if (cached && cached.until > Date.now()) return cached.pem;
+    if (!force && cached && cached.until > Date.now()) return cached.pem;
 
     const res = await this.call<{ key: string }>('/api/merchant/pubkey');
     if (!res.key) throw new PaymentError('mono не віддав публічний ключ');
 
     const pem = Buffer.from(res.key, 'base64').toString('utf8');
-    pubkeyCache.set(this.token, { pem, until: Date.now() + PUBKEY_TTL_MS });
+    const now = Date.now();
+    pubkeyCache.set(this.token, {
+      pem,
+      until: now + PUBKEY_TTL_MS,
+      refetchAfter: now + PUBKEY_REFETCH_COOLDOWN_MS,
+    });
     return pem;
   }
 
@@ -103,9 +123,21 @@ export class MonoProvider implements PayProvider {
 
     // Підпис рахується від СИРИХ байтів тіла. Якщо тіло десь пройшло через
     // JSON.parse -> JSON.stringify, підпис не збіжиться.
-    const ok = createVerify('SHA256')
-      .update(rawBody)
-      .verify(await this.pubkey(), Buffer.from(sigB64, 'base64'));
+    const sig = Buffer.from(sigB64, 'base64');
+    const verify = (pem: string) => createVerify('SHA256').update(rawBody).verify(pem, sig);
+
+    /* Ключ мерчанта може провернутись. Кешований ключ, який не підійшов, —
+       привід перечитати його з банку, а не одразу відбити вебхук: інакше
+       після ротації ми годину відбивали б кожен платіж, гроші списувались
+       би, а броні висіли в PENDING. Дострокове перечитування — не частіше
+       разу на хвилину, див. PUBKEY_REFETCH_COOLDOWN_MS. */
+    const cached = pubkeyCache.get(this.token);
+    const fromCache = Boolean(cached && cached.until > Date.now());
+
+    let ok = verify(await this.pubkey());
+    if (!ok && fromCache && cached!.refetchAfter <= Date.now()) {
+      ok = verify(await this.pubkey(true));
+    }
     if (!ok) throw new PaymentError('Підпис вебхука не збігся');
 
     let body: {
