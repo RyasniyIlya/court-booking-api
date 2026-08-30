@@ -10,6 +10,7 @@ import { findOrCreateCustomer } from '../lib/customers';
 import { providerFor, publicBase } from '../lib/payments';
 import { clubBilling } from '../lib/billing';
 import { playerStats } from '../lib/playerStats';
+import { notifyTrainerBooked } from '../lib/notifyTrainer';
 import {
   signCustomerToken, verifyCustomerToken, verifyCustomerPin, hashPinLookup, isPinTakenError,
 } from '../lib/customerAuth';
@@ -626,6 +627,20 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     `${body.customerName}, ${body.customerPhone}\n` +
     `${(priceTotal / 100).toFixed(2)} грн`,
   );
+
+  /* Тренеру — в особистий чат, і тільки якщо його справді викликали.
+     Окремим повідомленням, а не рядком у клубній групі: там він побачив би
+     чужі броні, а головне — сам би нічого не помітив серед потоку. */
+  if (trainer) {
+    void notifyTrainerBooked({
+      trainerId: trainer.id,
+      startTime: start,
+      endTime: end,
+      courtName: court.name,
+      customerName: body.customerName,
+      customerPhone: body.customerPhone,
+    });
+  }
 
   res.status(201).json({
     id: booking.id,

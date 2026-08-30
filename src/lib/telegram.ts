@@ -13,29 +13,49 @@ export const botToken = () => process.env.TELEGRAM_BOT_TOKEN ?? '';
 /** Чи взагалі налаштований бот. Без токена всі виклики мовчки нічого не роблять. */
 export const botReady = () => Boolean(botToken());
 
+/**
+ * Помилка, після якої повторювати немає сенсу.
+ *
+ * Telegram відповідає 401/404 на невірний токен. Без цієї різниці цикл
+ * опитування крутився б вічно з тим самим «Not Found» кожні пʼять секунд:
+ * лог засмічений, а причина — одруківка в TELEGRAM_BOT_TOKEN — губиться
+ * серед тисячі однакових рядків.
+ */
+export class TelegramFatal extends Error {}
+
 async function call<T>(method: string, body: unknown): Promise<T | null> {
   const token = botToken();
   if (!token) return null;
 
+  let r: Response;
+
   try {
-    const r = await fetch(`${API}/bot${token}/${method}`, {
+    r = await fetch(`${API}/bot${token}/${method}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
     });
-
-    const data = await r.json() as { ok: boolean; result?: T; description?: string };
-
-    if (!data.ok) {
-      console.error(`[telegram] ${method} failed:`, data.description);
-      return null;
-    }
-
-    return data.result ?? null;
   } catch (e) {
+    /* Мережа. Тимчасово — про це варто сказати й спробувати ще. */
     console.error(`[telegram] ${method} threw`, e);
     return null;
   }
+
+  const data = await r.json().catch(() => ({ ok: false, description: 'not json' })) as {
+    ok: boolean; result?: T; description?: string;
+  };
+
+  if (!data.ok) {
+    if (r.status === 401 || r.status === 404) {
+      throw new TelegramFatal(
+        `${method}: ${data.description ?? r.status}. Перевірте TELEGRAM_BOT_TOKEN.`,
+      );
+    }
+    console.error(`[telegram] ${method} failed:`, data.description);
+    return null;
+  }
+
+  return data.result ?? null;
 }
 
 /**

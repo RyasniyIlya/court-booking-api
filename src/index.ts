@@ -72,6 +72,31 @@ app.use('/api/admin', adminRouter);
 app.use('/api/admin/analytics', analyticsRouter);
 app.use('/api/platform', platformRouter);
 
+/**
+ * Вебхук Telegram (прод). Локально бот працює polling-ом і сюди не ходить.
+ *
+ * Секрет перевіряємо заголовком, який Telegram шле сам, — адреса вебхука
+ * рано чи пізно потрапляє в логи проксі, і одного знання URL має бути
+ * замало, щоб слати боту чужі оновлення.
+ *
+ * Відповідаємо 200 ОДРАЗУ, до обробки. Telegram чекає відповідь кілька
+ * секунд і при таймауті шле те саме оновлення знову — а в нас усередині
+ * похід у базу. Повільна відповідь означала б дублі повідомлень клубу.
+ */
+app.post('/api/telegram/webhook', (req, res) => {
+  const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
+
+  if (!secret || req.get('X-Telegram-Bot-Api-Secret-Token') !== secret) {
+    return res.status(401).json({ error: 'UNAUTHORIZED' });
+  }
+
+  res.json({ ok: true });
+
+  void handleUpdate(req.body).catch((e) => {
+    console.error('[bot] webhook update failed', e);
+  });
+});
+
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
   console.error('[unhandled]', err);
   res.status(500).json({ error: 'INTERNAL' });

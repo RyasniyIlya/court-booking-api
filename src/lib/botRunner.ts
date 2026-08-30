@@ -1,4 +1,4 @@
-import { botReady, deleteWebhook, getUpdates, setWebhook } from './telegram';
+import { botReady, deleteWebhook, getUpdates, setWebhook, TelegramFatal } from './telegram';
 import { handleUpdate } from './botHandlers';
 
 /**
@@ -28,7 +28,21 @@ async function pollLoop() {
   let offset = 0;
 
   while (polling) {
-    const updates = await getUpdates(offset);
+    let updates;
+
+    try {
+      updates = await getUpdates(offset);
+    } catch (e) {
+      /* Невірний токен. Повторювати немає сенсу — зупиняємось і кажемо
+         причину ОДИН раз. Без цього цикл писав би те саме «Not Found»
+         кожні пʼять секунд, і справжня причина губилась би в логу. */
+      if (e instanceof TelegramFatal) {
+        polling = false;
+        console.error(`[bot] зупинено: ${e.message}`);
+        return;
+      }
+      throw e;
+    }
 
     if (!updates) {
       /* null — мережа або Telegram віддали помилку. getUpdates уже написав
@@ -65,12 +79,31 @@ export async function startBot() {
       console.error('[bot] TELEGRAM_WEBHOOK_URL заданий без TELEGRAM_WEBHOOK_SECRET — вебхук не ставимо');
       return;
     }
-    const ok = await setWebhook(webhookUrl, secret);
-    console.log(ok ? `[bot] вебхук: ${webhookUrl}` : '[bot] не вдалося поставити вебхук');
+    try {
+      const ok = await setWebhook(webhookUrl, secret);
+      console.log(ok ? `[bot] вебхук: ${webhookUrl}` : '[bot] не вдалося поставити вебхук');
+    } catch (e) {
+      if (e instanceof TelegramFatal) {
+        console.error(`[bot] не запущено: ${e.message}`);
+        return;
+      }
+      throw e;
+    }
     return;
   }
 
-  await deleteWebhook();
+  /* Знімати вебхук теж може впасти на невірному токені — тоді бота просто
+     не вмикаємо, а не валимо разом з ним увесь API. */
+  try {
+    await deleteWebhook();
+  } catch (e) {
+    if (e instanceof TelegramFatal) {
+      console.error(`[bot] не запущено: ${e.message}`);
+      return;
+    }
+    throw e;
+  }
+
   polling = true;
   void pollLoop();
   console.log('[bot] long polling');

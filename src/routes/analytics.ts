@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { DateTime } from 'luxon';
 import { prisma } from '../lib/db';
 import { requireAuth, requireRole, requireFeature } from './admin';
+import { buildLoadProfile } from '../lib/loadProfile';
 
 /**
  * CRM-аналітика кабінету. Окремий файл, а не ще один розділ
@@ -284,6 +285,116 @@ analyticsRouter.get('/forecast', async (req, res) => {
     },
     series,
   });
+});
+
+/* -------------------------------------------------------------------------- */
+/* ЗАВАНТАЖЕННЯ: ДНІ ТИЖНЯ І ГОДИНИ ДОБИ                                      */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Скільки броней має набратись, щоб профіль узагалі показувати.
+ *
+ * Тиждень дає рівно ОДНЕ спостереження на кожен день тижня: одна бронь у
+ * вівторок о 08:00 при двох кортах — це «завантаження 50%», хоча насправді
+ * це один випадковий гравець. Поки броней менше двох десятків, графік
+ * малює не звичку клубу, а шум.
+ */
+const LOAD_MIN_BOOKINGS = 20;
+
+/**
+ * GET /api/admin/analytics/load?weeks=8
+ *
+ * Який день тижня і яка година доби реально заповнені. Відповідь — два зрізи
+ * однієї матриці: byWeekday (7 рядків) і byHour (тільки години, коли клуб
+ * узагалі відчинений).
+ *
+ * ── Чому не period=week|month, як у решти звітів ─────────────────────────
+ *
+ * Ті звіти відповідають на питання «як ідуть справи зараз» і порівнюються з
+ * попереднім періодом. Тут питання про сталу звичку клієнтів, а вона на
+ * одному тижні не видна: у клітинці «вівторок, 08:00» за тиждень рівно
+ * стільки спостережень, скільки в клубі кортів.
+ *
+ * ── Чому вікно закінчується на початку поточного тижня ───────────────────
+ *
+ * Поточний тиждень неповний: у середу в ньому вже є понеділок і вівторок, а
+ * суботи ще немає. Змішавши його з повними, ми систематично занижували б
+ * вихідні. Та сама причина, що й у /forecast.
+ */
+analyticsRouter.get('/load', async (req, res) => {
+  const parsed = z
+    .object({ weeks: z.coerce.number().int().min(4).max(26).default(8) })
+    .safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const clubId = req.auth!.clubId;
+
+  const club = await prisma.club.findUnique({
+    where: { id: clubId },
+    select: {
+      timezone: true,
+      createdAt: true,
+      hours: { select: { weekday: true, openMinute: true, closeMinute: true, isClosed: true } },
+    },
+  });
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const weeks = parsed.data.weeks;
+  const anchor = DateTime.now().setZone(club.timezone).startOf('week');
+  const to = anchor.toJSDate();
+
+  /* Вікно не заходить за появу клубу: до реєстрації корти не могли
+     простоювати, і без цього обрізання клуб першого місяця бачив би
+     завантаження, поділене на неіснуючі тижні.
+
+     Того самого для окремого корту зробити не вийде: Court не зберігає
+     дати створення. Корт, доданий посеред вікна, перші тижні виглядатиме
+     недозавантаженим — це відоме обмеження, а не помилка розрахунку. */
+  const windowStart = anchor.minus({ weeks }).toJSDate();
+  const from = club.createdAt > windowStart ? club.createdAt : windowStart;
+
+  /* Броні й блокування беремо ПЕРЕТИНОМ з вікном, а не за startTime: заняття,
+     що почалось до опівночі понеділка й тягнеться в наш період, зайняло корт
+     так само, як будь-яке інше. */
+  const [courts, blocks, bookings] = await Promise.all([
+    prisma.court.findMany({
+      where: { clubId, isActive: true },
+      select: { id: true },
+    }),
+    prisma.block.findMany({
+      where: { clubId, startTime: { lt: to }, endTime: { gt: from } },
+      select: { courtId: true, startTime: true, endTime: true },
+    }),
+    prisma.booking.findMany({
+      where: {
+        clubId,
+        status: 'CONFIRMED',
+        startTime: { lt: to },
+        endTime: { gt: from },
+      },
+      select: { courtId: true, startTime: true, endTime: true, priceTotal: true },
+    }),
+  ]);
+
+  const profile = buildLoadProfile({
+    from, to, timezone: club.timezone, hours: club.hours, courts, blocks, bookings,
+  });
+
+  const range = { weeks, from: from.toISOString(), to: to.toISOString() };
+
+  /* Чесно кажемо «замало», а не малюємо графік по трьох бронях — той самий
+     принцип, що в /forecast з NOT_ENOUGH_DATA. */
+  if (profile.totals.bookings < LOAD_MIN_BOOKINGS) {
+    return res.json({
+      available: false,
+      reason: 'NOT_ENOUGH_DATA',
+      ...range,
+      bookings: profile.totals.bookings,
+      needBookings: LOAD_MIN_BOOKINGS,
+    });
+  }
+
+  res.json({ available: true, ...range, ...profile });
 });
 
 /* -------------------------------------------------------------------------- */

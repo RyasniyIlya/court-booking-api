@@ -7,6 +7,7 @@ import { prisma, isSlotTakenError } from '../../lib/db';
 import { normalizePhone } from '../../lib/phone';
 import { getActivePasses, findOrCreateCustomer } from '../../lib/customers';
 import { requireAuth, requireStaff, requireLevel, hasFeature, param } from './shared';
+import { notifyTrainerBooked } from '../../lib/notifyTrainer';
 
 export const bookingsRouter = Router();
 
@@ -473,6 +474,22 @@ bookingsRouter.post(
             },
           },
         });
+
+      /* Тренера повідомляємо і тут, а не тільки при бронюванні з віджета:
+         адміністратор ставить заняття на тренера з кабінету так само часто,
+         як гравець сам, — а для тренера це рівно та сама подія «мене
+         викликали». Клуб при цьому нічого не отримує: він сам щойно це
+         й зробив, повідомляти його про власну дію — шум. */
+      if (trainer) {
+        void notifyTrainerBooked({
+          trainerId: trainer.id,
+          startTime: start,
+          endTime: end,
+          courtName: court.name,
+          customerName: booking.customerName,
+          customerPhone: booking.customerPhone,
+        });
+      }
 
       res.status(201).json(
         booking,
