@@ -8,6 +8,7 @@ import { platformRouter } from './routes/platform';
 import { payRouter } from './routes/pay';
 import { startExpirySweeper } from './lib/expire';
 import { startBot } from './lib/botRunner';
+import { startDigestScheduler } from './lib/digestScheduler';
 import { handleUpdate } from './lib/botHandlers';
 import { paymentsSecretReady } from './lib/crypto';
 
@@ -123,4 +124,9 @@ app.listen(port, () => {
   // Бот сам вирішує, polling чи вебхук — за наявністю TELEGRAM_WEBHOOK_URL.
   // Без токена мовчки не вмикається: API має піднятись і без Telegram.
   void startBot();
+
+  // Щоденне зведення власнику о DIGEST_HOUR за часом клубу. Без токена
+  // бота відправка нікуди не піде, але й не завадить — sendMessage без
+  // TELEGRAM_BOT_TOKEN мовчки нічого не робить.
+  startDigestScheduler();
 });

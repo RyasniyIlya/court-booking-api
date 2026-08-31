@@ -50,6 +50,11 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
 
+      # О котрій слати щоденне зведення — за часом клубу. Без цієї змінної
+      # 21:00; тут стоїть явно, щоб її було видно в панелі Render.
+      - key: DIGEST_HOUR
+        value: "21"
+
       # Оператор платформи (/platform). Без обох — панель віддає 503.
       - key: PLATFORM_ADMIN_EMAIL
         sync: false

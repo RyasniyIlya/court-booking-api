@@ -65,26 +65,46 @@ describe('digestText — що бачить власник', () => {
     const t = digestText('Squash Arena', base, 'Europe/Kyiv');
     expect(t).toContain('Squash Arena');
     expect(t).toContain('27.08');
-    expect(t).toContain('Броней: <b>7</b>');
+    expect(t).toContain('7 броней');
     /* Звіряємось із самою hrn(), а не з написаним від руки рядком: uk-UA
        розділяє тисячі НЕРОЗРИВНИМ пробілом, і копія з клавіатури ніколи
        з ним не збіжиться. */
     expect(t).toContain(hrn(315_000));
-    expect(t).toContain('Нових клієнтів: <b>2</b>');
+    expect(t).toContain('2 нові клієнти');
     expect(t).toContain('Корт 1');
+  });
+
+  it('день тижня написаний словом — це шапка картки, а не клітинка таблиці', () => {
+    /* 27.08.2026 — четвер. Якщо WEEKDAY_FULL колись зсунеться на день,
+       падає саме тут. */
+    expect(digestText('Squash Arena', base, 'Europe/Kyiv')).toContain('четвер');
+  });
+
+  it('порівняння з попереднім днем зʼявляється тільки коли є з чим', () => {
+    const withPrev = digestText('Squash Arena', { ...base, prevRevenue: 280_000 }, 'Europe/Kyiv');
+    expect(withPrev).toContain('↑ 13%');
+
+    /* Без учорашнього числа рядка немає взагалі — «↑ 0%» від нуля збрехало б. */
+    expect(digestText('Squash Arena', base, 'Europe/Kyiv')).not.toContain('до попереднього дня');
   });
 
   /* Порожній день — окреме речення, а не чотири нулі. Нулі читаються як
      «щось зламалось», фраза — як відповідь на питання. */
   it('порожній день не показує нулі', () => {
     const t = digestText('Squash Arena', { ...base, bookings: 0, revenue: 0, newCustomers: 0, topCourt: null }, 'Europe/Kyiv');
-    expect(t).toContain('ще немає');
-    expect(t).not.toContain('Виручка');
+    expect(t).toContain('поки немає');
+    expect(t).not.toContain('💰');
   });
 
   it('без кортів рядок про найзавантаженіший просто зникає', () => {
     const t = digestText('Squash Arena', { ...base, topCourt: null }, 'Europe/Kyiv');
-    expect(t).not.toContain('Найзавантаженіший');
-    expect(t).toContain('Броней');
+    expect(t).not.toContain('🏟');
+    expect(t).toContain('7 броней');
+  });
+
+  it('нуль нових клієнтів не займає рядок порожнім числом', () => {
+    const t = digestText('Squash Arena', { ...base, newCustomers: 0 }, 'Europe/Kyiv');
+    expect(t).not.toContain('👤');
+    expect(t).toContain('7 броней');
   });
 });

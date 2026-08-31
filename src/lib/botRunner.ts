@@ -1,5 +1,13 @@
-import { botReady, deleteWebhook, getUpdates, setWebhook, TelegramFatal } from './telegram';
+import {
+  botReady,
+  deleteWebhook,
+  getUpdates,
+  setMyCommands,
+  setWebhook,
+  TelegramFatal,
+} from './telegram';
 import { handleUpdate } from './botHandlers';
+import { COMMANDS_GUEST } from './botKeyboard';
 
 /**
  * Як бот отримує повідомлення.
@@ -70,6 +78,12 @@ export async function startBot() {
     console.log('[bot] TELEGRAM_BOT_TOKEN не заданий — бот вимкнений');
     return;
   }
+
+  /* Меню «/» для чатів, які ще не увійшли. Персональні списки ставляться
+     при вході; цей — те, що бачить незнайомець, і в ньому тільки вхід.
+     Через void: список команд не варте того, щоб через нього не піднявся
+     бот. */
+  void setMyCommands(COMMANDS_GUEST).catch(() => null);
 
   const webhookUrl = process.env.TELEGRAM_WEBHOOK_URL;
 

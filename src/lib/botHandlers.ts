@@ -1,8 +1,28 @@
 import { DateTime } from 'luxon';
 
 import { prisma } from './db';
-import { sendMessage, type TgUpdate } from './telegram';
-import { dayDigest, digestText } from './digest';
+import {
+  answerCallback,
+  deleteMessage,
+  editMessageText,
+  sendMessage,
+  setMyCommands,
+  type TgUpdate,
+} from './telegram';
+import { dayDigest, digestText, WEEKDAY_FULL, weekReport, weekText } from './digest';
+import { count, SESSIONS } from './plural';
+import { loginByPassword, logout, menuFor } from './botAuth';
+import {
+  COMMANDS_GUEST,
+  commandForLabel,
+  commandsFor,
+  dayButtons,
+  parseAction,
+  periodButtons,
+  removeKeyboard,
+  replyKeyboard,
+} from './botKeyboard';
+import { revenueBreakdown, revenueText, staffReport, staffText } from './sections';
 
 /**
  * Що бот відповідає на команди.
@@ -12,27 +32,26 @@ import { dayDigest, digestText } from './digest';
  * заняття. Робити двох ботів означало б два токени, два налаштування у
  * BotFather і клуб, який плутає, кого куди додавати.
  *
- * Чужий чат не отримує нічого, крім пропозиції прив'язатись: доки чат не
- * звʼязаний з акаунтом, бот не знає ні клубу, ні прав, і будь-яка відповідь
- * була б витоком.
+ * Чужий чат не отримує нічого, крім пропозиції увійти: доки чат не
+ * звʼязаний з акаунтом, бот не знає ні клубу, ні прав, і будь-яка
+ * відповідь була б витоком.
+ *
+ * Кнопки живуть у botKeyboard — тут тільки те, що вони роблять.
  */
 
 const HELP = [
-  'Це бот вашого клубу.',
+  '🎾 <b>Бот вашого клубу</b>',
   '',
-  'Щоб підключитись, відкрийте кабінет → Налаштування → Команда,',
-  'натисніть «Підключити Telegram» і надішліть сюди код, який там зʼявиться.',
+  'Показує цифри клубу: виручку за день, за вчора і тиждень із графіком.',
+  '',
+  '<b>Щоб увійти</b>',
+  '<code>/login пошта пароль</code>',
+  '',
+  '<i>Пошта і пароль — ті самі, що й у кабінеті.</i>',
+  '<i>Повідомлення з паролем я видалю одразу після перевірки.</i>',
 ].join('\n');
 
-const OWNER_MENU = [
-  '/today — броні, виручка і нові клієнти за сьогодні',
-  '/help — що я вмію',
-].join('\n');
-
-const TRAINER_MENU = [
-  '/today — ваші заняття на сьогодні',
-  '/help — що я вмію',
-].join('\n');
+type Club = { id: string; name: string; timezone: string };
 
 /** Кого ми знаємо за цим чатом */
 async function userByChat(chatId: string) {
@@ -48,11 +67,68 @@ async function userByChat(chatId: string) {
 }
 
 /**
- * Прив'язка чату до акаунта за одноразовим кодом.
+ * Час оновлення в підвалі повідомлення.
  *
- * Код гаситься одразу після використання, а не лишається «поки не зміниться»:
- * інакше переслане в чаті повідомлення з кодом дало б доступ будь-кому, хто
- * його прочитав.
+ * Не прикраса: Telegram відхиляє editMessageText, якщо текст не змінився
+ * ані на символ. Без відмітки часу кнопка «🔄» на тих самих цифрах
+ * поверталася б помилкою, і в лог сипалось би «message is not modified».
+ */
+const stamp = (timezone: string) =>
+  `\n\n<i>оновлено о ${DateTime.now().setZone(timezone).toFormat('HH:mm:ss')}</i>`;
+
+/** Зведення за день зі зсувом: 0 — сьогодні, 1 — вчора */
+async function dayMessage(club: Club, offset: number, stamped = false) {
+  const anchor = DateTime.now().setZone(club.timezone).minus({ days: offset });
+  const d = await dayDigest(club.id, club.timezone, anchor);
+
+  return {
+    text: digestText(club.name, d, club.timezone) + (stamped ? stamp(club.timezone) : ''),
+    markup: dayButtons(offset),
+  };
+}
+
+/**
+ * Звіт за період: тиждень, персонал або виручка.
+ *
+ * Одна функція на три розділи, бо різниця між ними — тільки джерело
+ * тексту. Кнопки, відмітка оновлення й перемикач періоду в них спільні, і
+ * розводити це по трьох майже однакових функціях означало б правити
+ * кожну з них при кожній зміні розмітки.
+ */
+async function periodMessage(
+  club: Club,
+  section: 'week' | 'staff' | 'money',
+  days: number,
+  stamped = false,
+) {
+  let text: string;
+
+  if (section === 'staff') {
+    text = staffText(club.name, await staffReport(club.id, club.timezone, days), days, club.timezone);
+  } else if (section === 'money') {
+    text = revenueText(
+      club.name,
+      await revenueBreakdown(club.id, club.timezone, days),
+      days,
+      club.timezone,
+    );
+  } else {
+    text = weekText(club.name, await weekReport(club.id, club.timezone, days), days);
+  }
+
+  return {
+    text: text + (stamped ? stamp(club.timezone) : ''),
+    markup: periodButtons(section, days),
+  };
+}
+
+/**
+ * Привʼязка чату одноразовим кодом із кабінету.
+ *
+ * Основний спосіб входу — /login поштою і паролем. Код лишається робочим
+ * заради кнопки «Підключити Telegram», яка вже стоїть у кабінеті: прибрати
+ * його тут означало б, що кнопка мовчки перестає працювати. У довідці бота
+ * він не згадується.
  */
 async function linkByCode(chatId: string, code: string): Promise<string> {
   const user = await prisma.user.findUnique({
@@ -61,32 +137,30 @@ async function linkByCode(chatId: string, code: string): Promise<string> {
   });
 
   if (!user) {
-    return 'Такого коду немає. Візьміть новий у кабінеті: Налаштування → Команда.';
+    return 'Такого коду немає. Увійдіть командою <code>/login пошта пароль</code>.';
   }
 
   if (!user.tgLinkUntil || user.tgLinkUntil < new Date()) {
-    return 'Код протух. Візьміть новий у кабінеті — вони живуть 15 хвилин.';
+    return 'Код протух — вони живуть 15 хвилин. Увійдіть командою <code>/login пошта пароль</code>.';
   }
 
-  /* Чат міг бути прив'язаний до іншої людини цього ж клубу. Відв'язуємо
-     старого власника чату мовчки: unique-індекс на tgChatId інакше просто
-     впаде, і людина побачить незрозумілу помилку замість підключення. */
-  await prisma.user.updateMany({
-    where: { tgChatId: chatId },
-    data: { tgChatId: null },
-  });
-
+  await prisma.user.updateMany({ where: { tgChatId: chatId }, data: { tgChatId: null } });
   await prisma.user.update({
     where: { id: user.id },
     data: { tgChatId: chatId, tgLinkCode: null, tgLinkUntil: null },
   });
 
-  const menu = user.role === 'TRAINER' ? TRAINER_MENU : OWNER_MENU;
-  return `Підключено до клубу <b>${user.club.name}</b>.\n\n${menu}`;
+  return `Підключено до клубу <b>${user.club.name}</b>.\n\n${menuFor(user.role)}`;
 }
 
-/** Заняття тренера на сьогодні */
-async function trainerToday(trainerId: string, timezone: string): Promise<string> {
+/**
+ * Заняття тренера на сьогодні.
+ *
+ * Час — моноширинним: у списку з десяти рядків саме він працює лівою
+ * колонкою, за якою ковзає око. Решта лишається звичайним текстом, бо
+ * імена й назви кортів у <pre> почали б рвати рядок на телефоні.
+ */
+async function trainerToday(trainerId: string, timezone: string, clubName: string): Promise<string> {
   const local = DateTime.now().setZone(timezone);
   const from = local.startOf('day').toUTC().toJSDate();
   const to = local.endOf('day').toUTC().toJSDate();
@@ -107,16 +181,89 @@ async function trainerToday(trainerId: string, timezone: string): Promise<string
     },
   });
 
-  if (rows.length === 0) return 'Сьогодні занять немає.';
+  const head = `🎾 <b>${clubName}</b>\n<i>${WEEKDAY_FULL[local.weekday - 1]}, ${local.toFormat('dd.MM')}</i>`;
+
+  if (rows.length === 0) return `${head}\n\nСьогодні занять немає.`;
 
   const lines = rows.map((b) => {
     const s = DateTime.fromJSDate(b.startTime).setZone(timezone).toFormat('HH:mm');
     const e = DateTime.fromJSDate(b.endTime).setZone(timezone).toFormat('HH:mm');
-    const wait = b.status === 'PENDING' ? ' · чекає підтвердження' : '';
-    return `${s}–${e} · ${b.court?.name ?? 'корт'} · ${b.customerName ?? 'без імені'}${wait}`;
+    /* Очікування підтвердження — окремим значком, а не хвостом тексту:
+       у списку з десяти рядків його треба помітити, не читаючи. */
+    const wait = b.status === 'PENDING' ? ' ⏳' : '';
+    return `<code>${s}–${e}</code>  ${b.court?.name ?? 'корт'} · ${b.customerName ?? 'без імені'}${wait}`;
   });
 
-  return `<b>Сьогодні у вас ${rows.length}</b>\n\n${lines.join('\n')}`;
+  const pending = rows.filter((b) => b.status === 'PENDING').length;
+
+  return [
+    head,
+    '',
+    `📋 ${count(rows.length, SESSIONS)}`,
+    '',
+    lines.join('\n'),
+    /* Формулювання без числівника у ролі підмета: «1 чекає» і «2 чекають»
+       вимагали б ще однієї таблиці форм заради одного рядка. */
+    pending > 0 ? `\n<i>⏳ чекають підтвердження: ${pending}</i>` : '',
+  ].filter(Boolean).join('\n');
+}
+
+/**
+ * Розібрати «/login пошта пароль».
+ *
+ * Пароль може містити пробіли, тому все після пошти склеюємо назад: інакше
+ * людина з нормальним паролем «два слова» отримала б «невірний пароль» без
+ * жодного пояснення.
+ */
+export function parseLogin(args: string[]): { email: string; password: string } | null {
+  if (args.length < 2) return null;
+  const [email, ...rest] = args;
+  const password = rest.join(' ');
+  if (!email.includes('@') || !password) return null;
+  return { email, password };
+}
+
+/**
+ * Натиснута кнопка під повідомленням.
+ *
+ * Цифри переписуються на місці, а не приходять новим повідомленням:
+ * інакше три натискання «14 днів» дали б три однакові звіти поспіль.
+ */
+async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promise<void> {
+  const chatId = String(q.message?.chat.id ?? q.from?.id ?? '');
+  if (!chatId) return;
+
+  const me = await userByChat(chatId);
+
+  if (!me) {
+    await answerCallback(q.id, 'Спершу увійдіть: /login пошта пароль');
+    return;
+  }
+
+  const action = parseAction(q.data);
+  if (!action) {
+    /* Кнопка зі старого повідомлення або чужі дані. Мовчки гасимо
+       годинник: пояснювати тут нічого, а падати тим більше. */
+    await answerCallback(q.id);
+    return;
+  }
+
+  if (me.role === 'TRAINER') {
+    await answerCallback(q.id, 'Ця команда доступна власнику клубу');
+    return;
+  }
+
+  const msg = action.kind === 'day'
+    ? await dayMessage(me.club, action.offset, true)
+    : await periodMessage(me.club, action.kind, action.days, true);
+
+  if (q.message) {
+    await editMessageText(chatId, q.message.message_id, msg.text, msg.markup);
+  } else {
+    await sendMessage(chatId, msg.text, msg.markup);
+  }
+
+  await answerCallback(q.id);
 }
 
 /**
@@ -124,19 +271,60 @@ async function trainerToday(trainerId: string, timezone: string): Promise<string
  * саме тому вона тут, а не всередині транспорту.
  */
 export async function handleUpdate(u: TgUpdate): Promise<void> {
+  if (u.callback_query) {
+    await handleCallback(u.callback_query);
+    return;
+  }
+
   const msg = u.message;
-  const text = msg?.text?.trim();
-  if (!msg || !text) return;
+  const raw = msg?.text?.trim();
+  if (!msg || !raw) return;
 
   const chatId = String(msg.chat.id);
+
+  /* Кнопка постійної клавіатури приходить звичайним текстом — переводимо
+     її в команду до розбору, щоб далі шлях був рівно один. */
+  const text = commandForLabel(raw) ?? raw;
+
   const [cmdRaw, ...args] = text.split(/\s+/);
   /* У групах команди приходять як /today@my_bot — відрізаємо адресата,
      інакше в груповому чаті бот не впізнає жодної своєї ж команди. */
   const cmd = cmdRaw.split('@')[0].toLowerCase();
 
-  /* /start із кодом — єдине, що працює до прив'язки. */
+  /* Вхід. Єдина команда, що працює до привʼязки — і єдина, після якої ми
+     прибираємо повідомлення: пароль не має лишитись в історії чату. */
+  if (cmd === '/login') {
+    await deleteMessage(chatId, msg.message_id);
+
+    const creds = parseLogin(args);
+    if (!creds) {
+      await sendMessage(chatId, 'Формат: <code>/login пошта пароль</code>');
+      return;
+    }
+
+    const reply = await loginByPassword(chatId, creds.email, creds.password);
+    const me = await userByChat(chatId);
+
+    if (me) {
+      await setMyCommands(commandsFor(me.role), chatId);
+      await sendMessage(chatId, reply, replyKeyboard(me.role));
+    } else {
+      await sendMessage(chatId, reply);
+    }
+    return;
+  }
+
+  /* /start із кодом — сумісність із кнопкою кабінету. */
   if (cmd === '/start' && args[0]) {
-    await sendMessage(chatId, await linkByCode(chatId, args[0]));
+    const reply = await linkByCode(chatId, args[0]);
+    const linked = await userByChat(chatId);
+
+    if (linked) {
+      await setMyCommands(commandsFor(linked.role), chatId);
+      await sendMessage(chatId, reply, replyKeyboard(linked.role));
+    } else {
+      await sendMessage(chatId, reply);
+    }
     return;
   }
 
@@ -145,35 +333,77 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
   if (!me) {
     /* Голий код без /start теж приймаємо: людина частіше просто вставляє
        його в чат, ніж пише команду з аргументом. */
-    if (/^[A-Z0-9]{6}$/i.test(text)) {
-      await sendMessage(chatId, await linkByCode(chatId, text.toUpperCase()));
+    if (/^[A-Z0-9]{6}$/i.test(raw)) {
+      await sendMessage(chatId, await linkByCode(chatId, raw.toUpperCase()));
       return;
     }
     await sendMessage(chatId, HELP);
     return;
   }
 
-  const menu = me.role === 'TRAINER' ? TRAINER_MENU : OWNER_MENU;
+  const keyboard = replyKeyboard(me.role);
+  const menu = menuFor(me.role);
 
   if (cmd === '/help' || cmd === '/start') {
-    await sendMessage(chatId, `Клуб <b>${me.club.name}</b>.\n\n${menu}`);
+    await setMyCommands(commandsFor(me.role), chatId);
+    await sendMessage(chatId, `Клуб <b>${me.club.name}</b>.\n\n${menu}`, keyboard);
+    return;
+  }
+
+  if (cmd === '/logout') {
+    await logout(chatId);
+    /* Разом із чатом прибираємо і клавіатуру, і меню команд: лишити
+       кнопки, які більше нічого не роблять, гірше, ніж не мати їх. */
+    await setMyCommands(COMMANDS_GUEST, chatId);
+    await sendMessage(
+      chatId,
+      'Чат відключено. Щоб повернутись — <code>/login пошта пароль</code>.',
+      removeKeyboard,
+    );
     return;
   }
 
   if (cmd === '/today') {
     if (me.role === 'TRAINER') {
       if (!me.trainerId) {
-        await sendMessage(chatId, 'Ваш акаунт ще не прив’язаний до картки тренера — попросіть адміністратора клубу.');
+        await sendMessage(chatId, 'Ваш акаунт ще не привʼязаний до картки тренера — попросіть адміністратора клубу.', keyboard);
         return;
       }
-      await sendMessage(chatId, await trainerToday(me.trainerId, me.club.timezone));
+      await sendMessage(
+        chatId,
+        await trainerToday(me.trainerId, me.club.timezone, me.club.name),
+        keyboard,
+      );
       return;
     }
 
-    const d = await dayDigest(me.club.id, me.club.timezone);
-    await sendMessage(chatId, digestText(me.club.name, d, me.club.timezone));
+    const m = await dayMessage(me.club, 0);
+    await sendMessage(chatId, m.text, m.markup);
     return;
   }
 
-  await sendMessage(chatId, `Не знаю такої команди.\n\n${menu}`);
+  /* Гроші клубу — не тренерська справа. Виручка і тижнева динаміка в
+     кабінеті теж закриті від ролі TRAINER, і бот не має бути обхідним
+     шляхом до того, чого людина не бачить на екрані. */
+  if (cmd === '/yesterday' || cmd === '/week' || cmd === '/staff' || cmd === '/revenue') {
+    if (me.role === 'TRAINER') {
+      await sendMessage(chatId, `Ця команда доступна власнику клубу.\n\n${menu}`, keyboard);
+      return;
+    }
+
+    if (cmd === '/yesterday') {
+      const m = await dayMessage(me.club, 1);
+      await sendMessage(chatId, m.text, m.markup);
+      return;
+    }
+
+    /* Розділи відкриваються тижнем: найкоротший період відповідає на
+       «що зараз», а довші вмикаються кнопкою під самим звітом. */
+    const section = cmd === '/staff' ? 'staff' : cmd === '/revenue' ? 'money' : 'week';
+    const m = await periodMessage(me.club, section, 7);
+    await sendMessage(chatId, m.text, m.markup);
+    return;
+  }
+
+  await sendMessage(chatId, `Не знаю такої команди.\n\n${menu}`, keyboard);
 }

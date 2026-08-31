@@ -65,12 +65,62 @@ async function call<T>(method: string, body: unknown): Promise<T | null> {
  * бронь не має падати через те, що месенджер відповів 502. Виклики
  * навмисно робляться через void — відповідь гравцю не чекає на месенджер.
  */
-export function sendMessage(chatId: string | number, text: string) {
+export function sendMessage(chatId: string | number, text: string, markup?: unknown) {
   return call<{ message_id: number }>('sendMessage', {
     chat_id: chatId,
     text,
     parse_mode: 'HTML',
     disable_web_page_preview: true,
+    reply_markup: markup,
+  });
+}
+
+/**
+ * Переписати вже надіслане повідомлення.
+ *
+ * Потрібне кнопкам під звітом: натиснувши «14 днів», людина має побачити
+ * інші цифри на тому ж місці, а не десяте повідомлення поспіль у стрічці.
+ */
+export function editMessageText(
+  chatId: string | number,
+  messageId: number,
+  text: string,
+  markup?: unknown,
+) {
+  return call<unknown>('editMessageText', {
+    chat_id: chatId,
+    message_id: messageId,
+    text,
+    parse_mode: 'HTML',
+    disable_web_page_preview: true,
+    reply_markup: markup,
+  });
+}
+
+/**
+ * Погасити «годинник» на натиснутій кнопці.
+ *
+ * Telegram крутить його, доки бот не відповів, і без цього виклику кнопка
+ * виглядає завислою навіть тоді, коли все вже спрацювало.
+ */
+export function answerCallback(callbackId: string, text?: string) {
+  return call<boolean>('answerCallbackQuery', { callback_query_id: callbackId, text });
+}
+
+/**
+ * Список команд у синьому меню «/» біля поля вводу.
+ *
+ * Зі scope конкретного чату, а не глобально: тренеру немає чого бачити в
+ * меню /week, якого йому все одно не покажуть. Глобальний список лишається
+ * тим, що бачить незнайомий чат — там тільки вхід.
+ */
+export function setMyCommands(
+  commands: { command: string; description: string }[],
+  chatId?: string | number,
+) {
+  return call<boolean>('setMyCommands', {
+    commands,
+    scope: chatId ? { type: 'chat', chat_id: chatId } : { type: 'default' },
   });
 }
 
@@ -87,13 +137,25 @@ export type TgUpdate = {
     chat: { id: number; type: string };
     from?: { id: number; first_name?: string; username?: string };
   };
+  /** Натиснута кнопка під повідомленням */
+  callback_query?: {
+    id: string;
+    data?: string;
+    message?: { message_id: number; chat: { id: number } };
+    from?: { id: number };
+  };
 };
+
+/* callback_query у списку обовʼязково: без нього Telegram просто не
+   надішле натискання кнопок, і вони мовчатимуть — помилки при цьому
+   ніде не буде, що робить причину неочевидною. */
+const UPDATES = ['message', 'callback_query'];
 
 export function getUpdates(offset: number, timeoutSec = 25) {
   return call<TgUpdate[]>('getUpdates', {
     offset,
     timeout: timeoutSec,
-    allowed_updates: ['message'],
+    allowed_updates: UPDATES,
   });
 }
 
@@ -101,10 +163,27 @@ export function setWebhook(url: string, secret: string) {
   return call<boolean>('setWebhook', {
     url,
     secret_token: secret,
-    allowed_updates: ['message'],
+    allowed_updates: UPDATES,
   });
 }
 
 export function deleteWebhook() {
   return call<boolean>('deleteWebhook', { drop_pending_updates: false });
+}
+
+/**
+ * Прибрати повідомлення з чату.
+ *
+ * Потрібне рівно для одного: пароль, надісланий боту при вході, не має
+ * лежати в історії чату. Telegram дозволяє видаляти чуже повідомлення в
+ * приватному чаті лише 48 годин — нам вистачає з запасом, ми видаляємо
+ * одразу після перевірки.
+ *
+ * Помилку ковтаємо: якщо видалити не вдалось, вхід усе одно відбувся, і
+ * падати через це безглуздо — користувачу ми окремо кажемо стерти
+ * повідомлення руками.
+ */
+export function deleteMessage(chatId: string | number, messageId: number) {
+  return call<boolean>('deleteMessage', { chat_id: chatId, message_id: messageId })
+    .catch(() => null);
 }
