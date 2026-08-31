@@ -176,12 +176,14 @@ const COMMANDS_OWNER = [
   { command: 'revenue', description: 'Звідки беруться гроші' },
   { command: 'staff', description: 'Тренери: заняття і гроші' },
   { command: 'help', description: 'Що я вмію' },
+  { command: 'newpassword', description: 'Змінити пароль кабінету' },
   { command: 'logout', description: 'Відключити цей чат' },
 ];
 
 const COMMANDS_TRAINER = [
   { command: 'today', description: 'Ваші заняття на сьогодні' },
   { command: 'help', description: 'Що я вмію' },
+  { command: 'newpassword', description: 'Змінити пароль кабінету' },
   { command: 'logout', description: 'Відключити цей чат' },
 ];
 

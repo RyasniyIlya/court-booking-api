@@ -47,19 +47,19 @@ enum UserRole {
 
 /// Спортивний клуб = один тенант SaaS
 model Club {
-  id              String  @id @default(uuid()) @db.Uuid
-  name            String
-  slug            String  @unique
+  id       String  @id @default(uuid()) @db.Uuid
+  name     String
+  slug     String  @unique
   /// IANA-таймзона, напр. "Europe/Kyiv". Уся конвертація рахується від неї.
-  timezone        String  @default("Europe/Kyiv")
+  timezone String  @default("Europe/Kyiv")
   /// Телефон адміністратора. Показується у шапці віджета посиланням tel:
-  phone           String?
+  phone    String?
   /// Адреса клубу для шапки віджета: "Київ, вул. Хрещатик, 1"
-  address         String?
+  address  String?
   /// Логотип для шапки віджета. Абсолютний https-URL на чужому хостингу
   /// Зовнішнє посилання на логотип. Лишилось для клубів, у яких файл уже
   /// лежить на власному сайті — вставити адресу швидше, ніж вивантажувати.
-  logoUrl         String?
+  logoUrl  String?
 
   // ── Завантажений логотип ─────────────────────────────────────────────
   // Байти в базі, а не файл на диску: у Render файлова система ефемерна,
@@ -67,27 +67,27 @@ model Club {
   // на 100 КБ — це ще один обліковий запис, ключі й точка відмови; при
   // 300–500 клубах ринку весь обсяг лишається в межах десятків мегабайт.
   // Якщо колись знадобиться CDN, міняється одне місце — роут віддачі.
-  logoData        Bytes?
+  logoData            Bytes?
   /// image/png | image/jpeg | image/webp. SVG свідомо не приймаємо: він
   /// виконує скрипти, а віддається з нашого домену.
-  logoMime        String?
+  logoMime            String?
   /// Для інвалідації кеша: адреса віддачі містить цю мітку, тож новий
   /// логотип видно одразу, а старий лежить у браузері рік.
-  logoUpdatedAt   DateTime?
+  logoUpdatedAt       DateTime?
   /// Що показувати: монограму з назви чи завантажене зображення.
   /// Рішення власника, а не автоматика «є файл — показуй файл»: клуб може
   /// лишити файл на місці й тимчасово повернутись до літер.
-  logoMode        LogoMode @default(MONOGRAM)
+  logoMode            LogoMode  @default(MONOGRAM)
   /// Акцентний колір клубу, #RRGGBB. Ним фарбуються кнопки, вибір у сітці
   /// й фокус — і у віджеті, і в кабінеті. Статусні кольори (підтверджено /
   /// чекає / скасовано) НЕ брендуються навмисно: якби вони бралися звідси,
   /// у клубу з вишневим «Підтверджено» злилося б зі «Скасувати».
   /// null = кортовий зелений за замовчуванням (web/src/lib/brand.js).
-  brandColor      String?
+  brandColor          String?
   /// Крок сітки за замовчуванням, хв
-  slotMinutes     Int     @default(60)
+  slotMinutes         Int       @default(60)
   /// За скільки хвилин до старту ще можна забронювати онлайн
-  leadTimeMinutes Int     @default(60)
+  leadTimeMinutes     Int       @default(60)
   /// За скільки хвилин до старту закривається САМОСТІЙНЕ скасування
   /// гравцем — і броні корту, і місця в груповому занятті.
   ///
@@ -98,13 +98,13 @@ model Club {
   ///
   /// Скасування адміністратором цим не обмежується: клуб домовляється
   /// з гравцем голосом і має могти зняти запис будь-коли.
-  cancelCutoffMinutes Int @default(0)
+  cancelCutoffMinutes Int       @default(0)
   /// На скільки днів уперед відкрита сітка
-  horizonDays     Int     @default(14)
+  horizonDays         Int       @default(14)
   /// Чи бронь одразу CONFIRMED, чи чекає підтвердження адміна
-  autoConfirm     Boolean @default(true)
+  autoConfirm         Boolean   @default(true)
   /// Куди слати сповіщення про нову бронь
-  telegramChatId  String?
+  telegramChatId      String?
 
   // ── Передоплата ──────────────────────────────────────────────────────
   /// Чи взагалі доступна онлайн-оплата в цьому клубі.
@@ -149,31 +149,32 @@ model Club {
   /// призначений план, відсутність плану не обмежує нічого (див.
   /// src/lib/plans.ts). Інакше міграція мовчки вимкнула б половину
   /// кабінету в усіх, хто вже працює.
-  planId        String? @db.Uuid
-  plan          Plan?   @relation(fields: [planId], references: [id], onDelete: SetNull)
+  planId    String? @db.Uuid
+  plan      Plan?   @relation(fields: [planId], references: [id], onDelete: SetNull)
   /// Індивідуальна ціна для цього клубу, копійки. null = ціна з плану.
   /// Потрібна, бо продаємо поштучно: у першого клубу в місті ціна одна,
   /// у мережі з трьох залів — інша, а заводити під кожну домовленість
   /// окремий план у каталозі означає каталог із двадцяти рядків.
-  planPrice     Int?
+  planPrice Int?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  courts     Court[]
-  hours      ClubHours[]
-  bookings   Booking[]
-  blocks     Block[]
-  users      User[]
-  customers  Customer[]
-  passes     Pass[]
-  payments   Payment[]
-  trainers   Trainer[]
-  invoices   ClubInvoice[]
-  expenses   ClubExpense[]
+  courts        Court[]
+  hours         ClubHours[]
+  bookings      Booking[]
+  blocks        Block[]
+  users         User[]
+  customers     Customer[]
+  passes        Pass[]
+  payments      Payment[]
+  trainers      Trainer[]
+  invoices      ClubInvoice[]
+  expenses      ClubExpense[]
+  resetRequests PasswordReset[]
   /// Коли ми підтвердили клуб після реєстрації. null = чекає на дзвінок/оплату.
   /// Впливає на віддачу даних для публічного віджета.
-  approvedAt DateTime?
+  approvedAt    DateTime?
 }
 
 enum ExpenseCategory {
@@ -231,12 +232,12 @@ enum LogoMode {
 /// клубу, якому потрібна аналітика без групових занять, не заводячи
 /// четвертий рівень між другим і третім.
 model Plan {
-  id   String @id @default(uuid()) @db.Uuid
+  id          String  @id @default(uuid()) @db.Uuid
   /// Стабільний ключ для коду й посилань: base | team | pro.
   /// Міняти не можна — на нього спираються seed і платіжні нотатки.
-  code String @unique
+  code        String  @unique
   /// Як показується клубу в кабінеті
-  name String
+  name        String
   /// Один рядок під назвою: за що саме платять
   description String?
 
@@ -616,11 +617,11 @@ model Payment {
   /// ISO 4217, 980 = гривня
   ccy    Int @default(980)
 
-  status     PaymentStatus @default(PENDING)
+  status            PaymentStatus @default(PENDING)
   /// modifiedDate з вебхука. Провайдер не гарантує порядок доставки,
   /// тому старіший вебхук не має перетирати новіший стан.
-  providerAt DateTime?
-  paidAt     DateTime?
+  providerAt        DateTime?
+  paidAt            DateTime?
   /// Коли клуб натиснув «Повернути гроші» й банк прийняв запит.
   ///
   /// Не те саме, що refundedAt: гроші повернулись тоді, коли про це сказав
@@ -629,8 +630,8 @@ model Payment {
   /// цей час кабінет має показувати «повернення в дорозі», а не пропонувати
   /// натиснути кнопку вдруге.
   refundRequestedAt DateTime?
-  refundedAt DateTime?
-  failReason String?
+  refundedAt        DateTime?
+  failReason        String?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -699,7 +700,8 @@ model User {
   /// забутий у листуванні код працював би вічно.
   tgLinkUntil DateTime?
 
-  writtenNotes Note[]
+  writtenNotes  Note[]
+  resetRequests PasswordReset[]
 }
 
 enum PassType {
@@ -736,7 +738,7 @@ model Customer {
   ///
   /// Не плутати з `tier` в аналітиці: той рахується сам із відвідувань і
   /// руками не ставиться. Мітка — те, чого система знати не може.
-  tags           String[] @default([])
+  tags String[] @default([])
 
   /// Особистий кабінет гравця: телефон + PIN, той самий патерн, що й PIN
   /// персоналу в User. Не пароль і не SMS-код — жодного зовнішнього
@@ -814,4 +816,53 @@ model PassUsage {
   revertedAt DateTime?
 
   @@index([passId])
+}
+
+/// Стан заявки на відновлення пароля.
+enum ResetStatus {
+  /// Прийшла з бота, оператор ще не передзвонив.
+  PENDING
+  /// Оператор задав новий пароль.
+  DONE
+  /// Оператор вирішив, що це не власник клубу.
+  REJECTED
+}
+
+/// Заявка «забув пароль», подана з Telegram.
+///
+/// Потрібна саме таблиця, а не разове повідомлення оператору: заявку треба
+/// побачити в панелі, звірити з тим, хто телефонує, і — головне — лишити
+/// слід. Скидання пароля клубу це єдина дія оператора, яка відкриває чужий
+/// кабінет; без запису «хто, коли і за чиєю заявкою» вона не відрізняється
+/// від тихого входу під клієнтом.
+///
+/// Бот НЕ підтверджує, що така пошта існує: заявка створюється лише тоді,
+/// коли акаунт знайшовся, а відповідь у чат однакова в обох випадках.
+/// Інакше бот став би довідником «хто з цією поштою у нас є».
+model PasswordReset {
+  id     String @id @default(uuid()) @db.Uuid
+  clubId String @db.Uuid
+  club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// Пошта, яку ввели в боті. Зберігаємо окремо від user.email: якщо пошту
+  /// акаунта потім змінять, у журналі має лишитись те, що просили.
+  email String
+
+  /// Чат, з якого прийшла заявка, — щоб бот повідомив про результат.
+  tgChatId String?
+  /// Як людина підписана в Telegram: @username або імʼя. Оператору це
+  /// єдиний спосіб звірити заявку з тим, хто дзвонить.
+  tgName   String?
+
+  status     ResetStatus @default(PENDING)
+  createdAt  DateTime    @default(now())
+  resolvedAt DateTime?
+  /// Пошта оператора з платформного токена.
+  resolvedBy String?
+
+  /// Панель відкривається списком нових заявок — індекс саме під нього.
+  @@index([status, createdAt])
+  @@index([clubId])
 }

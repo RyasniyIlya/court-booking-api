@@ -135,7 +135,7 @@ export type TgUpdate = {
     message_id: number;
     text?: string;
     chat: { id: number; type: string };
-    from?: { id: number; first_name?: string; username?: string };
+    from?: { id: number; first_name?: string; last_name?: string; username?: string };
   };
   /** Натиснута кнопка під повідомленням */
   callback_query?: {

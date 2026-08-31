@@ -12,6 +12,7 @@ import {
 import { dayDigest, digestText, WEEKDAY_FULL, weekReport, weekText } from './digest';
 import { count, SESSIONS } from './plural';
 import { loginByPassword, logout, menuFor } from './botAuth';
+import { changePassword, parseNewPassword, requestReset } from './botPassword';
 import {
   COMMANDS_GUEST,
   commandForLabel,
@@ -49,6 +50,11 @@ const HELP = [
   '',
   '<i>Пошта і пароль — ті самі, що й у кабінеті.</i>',
   '<i>Повідомлення з паролем я видалю одразу після перевірки.</i>',
+  '',
+  '<b>Забули пароль?</b>',
+  'Якщо цей чат уже був підключений, задайте новий: <code>/newpassword новий пароль</code>.',
+  'Якщо ні — надішліть заявку: <code>/restore ваша-пошта@приклад.com</code>',
+  'Ми передзвонимо і задамо новий пароль після перевірки.',
 ].join('\n');
 
 type Club = { id: string; name: string; timezone: string };
@@ -311,6 +317,47 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
     } else {
       await sendMessage(chatId, reply);
     }
+    return;
+  }
+
+  /* Новий пароль. Стоїть поруч із /login навмисно: це друга й остання
+     команда, після якої треба прибрати повідомлення, і тримати обидві
+     разом надійніше, ніж згадати про видалення десь нижче по файлу.
+     Привʼязку перевіряє changePassword — саме тому виклик тут іде до
+     userByChat, а не після нього. */
+  if (cmd === '/newpassword') {
+    await deleteMessage(chatId, msg.message_id);
+
+    const password = parseNewPassword(args);
+    if (!password) {
+      await sendMessage(chatId, 'Формат: <code>/newpassword новий пароль</code>');
+      return;
+    }
+
+    const reply = await changePassword(chatId, password);
+    const me = await userByChat(chatId);
+    await sendMessage(chatId, reply, me ? replyKeyboard(me.role) : undefined);
+    return;
+  }
+
+  /* Заявка на відновлення. Працює до привʼязки — це єдиний шлях для тих,
+     кого /newpassword не рятує: пароль забуто, бота не підключено, і
+     довести особу через Telegram неможливо. Пароль тут не приймаємо й не
+     видаємо, тому й видаляти повідомлення нема чого. */
+  if (cmd === '/restore') {
+    if (!args[0]) {
+      await sendMessage(chatId, 'Формат: <code>/restore ваша-пошта@приклад.com</code>');
+      return;
+    }
+
+    /* Підпис у Telegram — єдине, за чим оператор звірить заявку з тим,
+       хто телефонує. @username надійніший, імʼя людина міняє частіше. */
+    const from = msg.from;
+    const tgName = from?.username
+      ? `@${from.username}`
+      : [from?.first_name, from?.last_name].filter(Boolean).join(' ') || null;
+
+    await sendMessage(chatId, await requestReset(chatId, args[0], tgName));
     return;
   }
 

@@ -7,6 +7,7 @@ import rateLimit from 'express-rate-limit';
 import { prisma } from '../lib/db';
 import { JWT_SECRET } from '../lib/authSecret';
 import { PLAN_SELECT } from '../lib/plans';
+import { sendMessage } from '../lib/telegram';
 
 export const platformRouter = Router();
 
@@ -306,4 +307,141 @@ platformRouter.delete('/plans/:id', requirePlatformAuth, async (req, res) => {
   } catch {
     res.status(404).json({ error: 'NOT_FOUND' });
   }
+});
+
+/* -------------------------------------------------------------------------- */
+/* ВІДНОВЛЕННЯ ПАРОЛЯ                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Пароль клубу прочитати не можна — у базі bcrypt-хеш. Тому «відновлення»
+ * тут завжди означає «задати новий», і єдине питання — хто підтвердив, що
+ * на тому кінці справді власник.
+ *
+ * Підтверджує оператор, голосом: заявка з бота дає імʼя в Telegram і клуб,
+ * далі дзвінок. Автоматично не робимо нічого — жодна перевірка, доступна
+ * боту, не відрізняє власника від того, хто знає його пошту.
+ */
+
+/**
+ * GET /api/platform/resets
+ *
+ * Черга заявок. За замовчуванням лише нові: закриті цікавлять як журнал,
+ * а не як робочий список, і мішати їх в одну стрічку означало б ховати
+ * свіжу заявку під торішніми.
+ */
+platformRouter.get('/resets', requirePlatformAuth, async (req, res) => {
+  const all = req.query.all === '1';
+
+  const rows = await prisma.passwordReset.findMany({
+    where: all ? {} : { status: 'PENDING' },
+    orderBy: { createdAt: 'desc' },
+    take: all ? 200 : 100,
+    select: {
+      id: true,
+      email: true,
+      tgName: true,
+      status: true,
+      createdAt: true,
+      resolvedAt: true,
+      resolvedBy: true,
+      club: { select: { id: true, name: true, slug: true, phone: true } },
+      user: { select: { role: true } },
+    },
+  });
+
+  res.json(rows);
+});
+
+/**
+ * POST /api/platform/clubs/:id/owner-password
+ *
+ * Задати новий пароль власникові клубу. Межі 8..128 — ті самі, що й у
+ * формі реєстрації (routes/admin/auth.ts): пароль, з яким потім не
+ * вийде увійти, гірший за відсутність кнопки.
+ *
+ * resetId необовʼязковий: оператор може міняти пароль і без заявки (клуб
+ * подзвонив, а бота не має взагалі). Але якщо заявка є — закриваємо її
+ * тією ж транзакцією, інакше вона висітиме в черзі вже виконаною.
+ */
+platformRouter.post('/clubs/:id/owner-password', requirePlatformAuth, async (req, res) => {
+  const clubId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  const parsed = z
+    .object({
+      password: z.string().min(8).max(128),
+      resetId: z.string().uuid().optional(),
+    })
+    .safeParse(req.body);
+
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  /* Пароль отримує саме власник. Модератора чи тренера, що загубив
+     пароль, заводить наново сам клуб — це його кухня, не наша. */
+  const owner = await prisma.user.findFirst({
+    where: { clubId, role: 'OWNER' },
+    select: { id: true, email: true, tgChatId: true },
+  });
+
+  if (!owner) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const passwordHash = await bcrypt.hash(parsed.data.password, 12);
+
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({ where: { id: owner.id }, data: { passwordHash } });
+
+    if (parsed.data.resetId) {
+      /* updateMany, а не update: заявку могли закрити секунду тому з
+         іншої вкладки, і падати через це нема сенсу — пароль уже новий. */
+      await tx.passwordReset.updateMany({
+        where: { id: parsed.data.resetId, status: 'PENDING' },
+        data: {
+          status: 'DONE',
+          resolvedAt: new Date(),
+          resolvedBy: req.platformAuth?.email ?? null,
+        },
+      });
+    }
+  });
+
+  /* Повідомити власника, що пароль змінили. Не заради зручності: якщо
+     заявку подав не він, це єдиний сигнал, що доступ до кабінету щойно
+     перевидали. Сам пароль у чат не йде — його диктує оператор. */
+  if (owner.tgChatId) {
+    await sendMessage(
+      owner.tgChatId,
+      [
+        '🔑 Пароль вашого кабінету змінено оператором.',
+        '',
+        '<i>Якщо ви цього не просили — негайно звʼяжіться з нами.</i>',
+      ].join('\n'),
+    ).catch(() => {
+      /* Бот міг бути вимкнений або чат заблокований. Пароль уже змінено,
+         і валити відповідь оператору через це не можна. */
+    });
+  }
+
+  res.json({ ok: true, email: owner.email });
+});
+
+/**
+ * POST /api/platform/resets/:id/reject
+ *
+ * Заявка не підтвердилась дзвінком. Прибираємо з черги, але лишаємо в
+ * журналі: кілька відхилених заявок на один клуб — це вже сигнал.
+ */
+platformRouter.post('/resets/:id/reject', requirePlatformAuth, async (req, res) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  const r = await prisma.passwordReset.updateMany({
+    where: { id, status: 'PENDING' },
+    data: {
+      status: 'REJECTED',
+      resolvedAt: new Date(),
+      resolvedBy: req.platformAuth?.email ?? null,
+    },
+  });
+
+  if (r.count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
+  res.status(204).end();
 });
