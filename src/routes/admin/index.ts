@@ -12,6 +12,7 @@ import { telegramRouter } from './telegram';
 import { billingRouter } from './billing';
 import { blocksRouter } from './blocks';
 import { customersRouter } from './customers';
+import { passesRouter } from './passes';
 import { staffRouter } from './staff';
 
 /**
@@ -19,7 +20,8 @@ import { staffRouter } from './staff';
  * монолітного admin.ts на 3500+ рядків. Шляхи й поведінка не змінились,
  * тільки розкладка по файлах: auth (register/login/elevate/me/pins),
  * bookings (+ series), trainers, courts, hours, club, billing, blocks,
- * customers (+ passes), staff, refunds.
+ * customers (+ видача абонементів), passes (тарифи, історія, зняття),
+ * staff, refunds.
  */
 export const adminRouter = Router();
 
@@ -38,6 +40,7 @@ adminRouter.use(telegramRouter);
 adminRouter.use(billingRouter);
 adminRouter.use(blocksRouter);
 adminRouter.use(customersRouter);
+adminRouter.use(passesRouter);
 adminRouter.use(staffRouter);
 
 // analytics.ts монтується окремо в index.ts (src/index.ts), але захищає

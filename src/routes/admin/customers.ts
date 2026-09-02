@@ -109,6 +109,19 @@ customersRouter.get(
 /* PASSES                                                                     */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Видати абонемент клієнту.
+ *
+ * Дві дороги в один бік. Звичайна — `planId`: модератор обирає тариф,
+ * який власник виставив у налаштуваннях, і всі умови (скільки занять,
+ * на скільки днів, почому) приїжджають звідти. Друга — умови руками:
+ * вона була тут до появи тарифів і лишається для домовленостей, під які
+ * заводити тариф безглуздо.
+ *
+ * `price` можна передати й разом із тарифом — це та сама домовлена ціна:
+ * постійному клієнту зробили знижку, а окремий тариф «8 занять дешевше»
+ * ніхто заводити не буде. Записується саме сплачене, а не прейскурант.
+ */
 customersRouter.post(
   '/customers/:id/passes',
   requireAuth,
@@ -117,10 +130,17 @@ customersRouter.post(
   async (req, res) => {
     const parsed = z
       .object({
+        /* Тариф із налаштувань. Є він — решта умов необовʼязкова. */
+        planId:
+          z.string()
+            .uuid()
+            .optional(),
+
         type: z.enum([
           'PACKAGE',
           'UNLIMITED',
-        ]),
+        ])
+          .optional(),
 
         totalSessions:
           z.number()
@@ -134,19 +154,21 @@ customersRouter.post(
           z.string()
             .datetime({
               offset: true,
-            }),
+            })
+            .optional(),
 
         validUntil:
           z.string()
             .datetime({
               offset: true,
-            }),
+            })
+            .optional(),
 
         price:
           z.number()
             .int()
             .min(0)
-            .default(0),
+            .optional(),
       })
       .safeParse(
         req.body,
@@ -161,31 +183,6 @@ customersRouter.post(
 
     const d =
       parsed.data;
-
-    if (
-      d.type ===
-        'PACKAGE' &&
-      !d.totalSessions
-    ) {
-      return res.status(400).json({
-        error:
-          'SESSIONS_REQUIRED',
-      });
-    }
-
-    if (
-      new Date(
-        d.validUntil,
-      ) <=
-      new Date(
-        d.validFrom,
-      )
-    ) {
-      return res.status(400).json({
-        error:
-          'BAD_PERIOD',
-      });
-    }
 
     const customer =
       await prisma.customer.findFirst({
@@ -207,6 +204,110 @@ customersRouter.post(
       });
     }
 
+    /* Умови абонемента: з тарифу або з тіла запиту.
+       Строк від тарифу рахується від ДНЯ ВИДАЧІ, а не від початку доби
+       клубу: людина заплатила зараз і має ходити рівно стільки днів,
+       скільки написано на тарифі. */
+    let terms: {
+      type: 'PACKAGE' | 'UNLIMITED';
+      totalSessions: number | null;
+      validFrom: Date;
+      validUntil: Date;
+      price: number;
+    };
+
+    if (d.planId) {
+      const plan =
+        await prisma.passPlan.findFirst({
+          where: {
+            id: d.planId,
+            clubId:
+              req.auth!.clubId,
+          },
+        });
+
+      if (!plan) {
+        return res.status(404).json({
+          error:
+            'PLAN_NOT_FOUND',
+        });
+      }
+
+      /* Прибраний зі списку тариф видати не можна. Інакше стара вкладка,
+         відкрита з учора, продавала б те, чого клуб більше не продає. */
+      if (!plan.isActive) {
+        return res.status(409).json({
+          error:
+            'PLAN_INACTIVE',
+        });
+      }
+
+      const from = d.validFrom
+        ? new Date(d.validFrom)
+        : new Date();
+
+      terms = {
+        type: plan.type,
+        totalSessions:
+          plan.totalSessions,
+        validFrom: from,
+        validUntil:
+          new Date(
+            from.getTime() +
+            plan.days * 86_400_000,
+          ),
+        // Домовлена ціна важливіша за прейскурант — але тільки якщо її
+        // справді передали. Нуль — це теж рішення («подарували»).
+        price:
+          d.price ?? plan.price,
+      };
+    } else {
+      if (
+        !d.type ||
+        !d.validFrom ||
+        !d.validUntil
+      ) {
+        return res.status(400).json({
+          error:
+            'TERMS_REQUIRED',
+        });
+      }
+
+      if (
+        d.type ===
+          'PACKAGE' &&
+        !d.totalSessions
+      ) {
+        return res.status(400).json({
+          error:
+            'SESSIONS_REQUIRED',
+        });
+      }
+
+      terms = {
+        type: d.type,
+        totalSessions:
+          d.type === 'PACKAGE'
+            ? d.totalSessions!
+            : null,
+        validFrom:
+          new Date(d.validFrom),
+        validUntil:
+          new Date(d.validUntil),
+        price: d.price ?? 0,
+      };
+    }
+
+    if (
+      terms.validUntil <=
+      terms.validFrom
+    ) {
+      return res.status(400).json({
+        error:
+          'BAD_PERIOD',
+      });
+    }
+
     const pass =
       await prisma.pass.create({
         data: {
@@ -217,26 +318,19 @@ customersRouter.post(
             customer.id,
 
           type:
-            d.type,
+            terms.type,
 
           totalSessions:
-            d.type ===
-            'PACKAGE'
-              ? d.totalSessions!
-              : null,
+            terms.totalSessions,
 
           validFrom:
-            new Date(
-              d.validFrom,
-            ),
+            terms.validFrom,
 
           validUntil:
-            new Date(
-              d.validUntil,
-            ),
+            terms.validUntil,
 
           price:
-            d.price,
+            terms.price,
         },
       });
 

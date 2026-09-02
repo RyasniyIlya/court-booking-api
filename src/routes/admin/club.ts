@@ -61,6 +61,12 @@ clubRouter.get(
         club.prepayEnabled,
       prepayRequired:
         club.prepayRequired,
+
+      /* Абонементи. Вимикач, а не наявність тарифів: клуб може завести
+         тарифи заздалегідь і ввімкнути продаж із понеділка. */
+      passesEnabled:
+        club.passesEnabled,
+
       paymentProvider:
         club.paymentProvider,
       payHoldMinutes:
@@ -204,6 +210,13 @@ clubRouter.patch(
             .optional(),
 
         prepayRequired:
+          z.boolean()
+            .optional(),
+
+        /* Не в переліку платіжних полів нижче навмисно: абонемент — це
+           готівка на ресепшені, наш еквайринг у ньому не бере участі,
+           тож і третій рівень доступу для галочки ні до чого. */
+        passesEnabled:
           z.boolean()
             .optional(),
 
@@ -374,6 +387,12 @@ clubRouter.patch(
         club.prepayEnabled,
       prepayRequired:
         club.prepayRequired,
+
+      /* Абонементи. Вимикач, а не наявність тарифів: клуб може завести
+         тарифи заздалегідь і ввімкнути продаж із понеділка. */
+      passesEnabled:
+        club.passesEnabled,
+
       paymentProvider:
         club.paymentProvider,
       payHoldMinutes:

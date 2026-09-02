@@ -35,6 +35,8 @@ export type PassBalance = {
   type: 'PACKAGE' | 'UNLIMITED';
   /** Скільки лишилось. Для безліміту — null */
   left: number | null;
+  /** Скільки було куплено. Для безліміту — null */
+  total: number | null;
   validUntil: Date;
   /** Днів до кінця дії; відʼємне — прострочений */
   daysLeft: number;
@@ -74,6 +76,7 @@ export async function getActivePass(
       passId: p.id,
       type: p.type,
       left,
+      total: p.totalSessions ?? null,
       validUntil: p.validUntil,
       daysLeft,
       label: left === null
@@ -112,6 +115,7 @@ export async function getActivePasses(
       passId: p.id,
       type: p.type,
       left,
+      total: p.totalSessions ?? null,
       validUntil: p.validUntil,
       daysLeft: Math.ceil((p.validUntil.getTime() - on.getTime()) / 86_400_000),
       label: left === null

@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { playerStats, streakWeeks, type PlayerVisit } from './playerStats';
+import { playerStats, streakWeeks, bestStreakWeeks, type PlayerVisit } from './playerStats';
 
 /**
  * Підсумок гравця. Найтонше тут — серія тижнів: її легко порахувати так,
@@ -73,8 +73,18 @@ describe('playerStats', () => {
       favouriteCourt: null,
       favouriteTrainer: null,
       streakWeeks: 0,
+      bestStreakWeeks: 0,
       firstVisit: null,
       lastVisit: null,
+      hours: 0,
+      withTrainer: 0,
+      groupVisits: 0,
+      courts: 0,
+      trainers: 0,
+      earlyVisits: 0,
+      lateVisits: 0,
+      weekendVisits: 0,
+      spent: 0,
     });
   });
 
@@ -121,5 +131,90 @@ describe('playerStats', () => {
     ], TZ, NOW);
     expect(s.firstVisit).toBe(weeksAgo(4));
     expect(s.lastVisit).toBe(weeksAgo(1));
+  });
+});
+
+/**
+ * Лічильники для досягнень. Головне тут — «ранок» і «вихідний» рахуються
+ * в таймзоні клубу: заняття о 8:30 за Києвом в UTC ще пʼята ранку, і в
+ * чужій зоні воно легко переїжджає в сусідню добу.
+ */
+describe('playerStats — лічильники досягнень', () => {
+  const at = (iso: string, over: Partial<PlayerVisit> = {}): PlayerVisit => ({
+    start: new Date(iso),
+    end: new Date(new Date(iso).getTime() + 3_600_000),
+    courtName: 'Корт 1',
+    trainerName: null,
+    kind: 'court',
+    price: 30000,
+    ...over,
+  });
+
+  it('години рахуються з тривалості, а не з кількості занять', () => {
+    const s = playerStats([
+      at('2026-08-10T09:00:00.000Z'),
+      at('2026-08-11T09:00:00.000Z', { end: new Date('2026-08-11T10:30:00.000Z') }),
+    ], TZ, NOW);
+    expect(s.hours).toBe(2.5);
+  });
+
+  it('без endTime заняття рахується за годину, а не ламає підсумок', () => {
+    const s = playerStats([at('2026-08-10T09:00:00.000Z', { end: null })], TZ, NOW);
+    expect(s.hours).toBe(1);
+  });
+
+  it('заняття з тренером і в групі рахуються окремо', () => {
+    const s = playerStats([
+      at('2026-08-10T09:00:00.000Z', { trainerName: 'Марія' }),
+      at('2026-08-11T09:00:00.000Z', { trainerName: 'Марія', kind: 'group' }),
+      at('2026-08-12T09:00:00.000Z'),
+    ], TZ, NOW);
+    expect(s.withTrainer).toBe(2);
+    expect(s.groupVisits).toBe(1);
+    expect(s.trainers).toBe(1);
+  });
+
+  it('ранок, вечір і вихідні — за годинником клубу', () => {
+    const s = playerStats([
+      // 08:30 за Києвом — ранок, хоч в UTC ще 05:30
+      at('2026-08-10T05:30:00.000Z'),
+      // 22:00 за Києвом — вечір
+      at('2026-08-11T19:00:00.000Z'),
+      // субота, 12:00 за Києвом
+      at('2026-08-15T09:00:00.000Z'),
+    ], TZ, NOW);
+    expect(s.earlyVisits).toBe(1);
+    expect(s.lateVisits).toBe(1);
+    expect(s.weekendVisits).toBe(1);
+  });
+
+  it('витрати підсумовуються з обох джерел', () => {
+    const s = playerStats([
+      at('2026-08-10T09:00:00.000Z', { price: 30000 }),
+      at('2026-08-11T09:00:00.000Z', { kind: 'group', price: 15000 }),
+    ], TZ, NOW);
+    expect(s.spent).toBe(45000);
+  });
+});
+
+/* Рекорд серії не можна втратити: досягнення «місяць поспіль», одного разу
+   зароблене, забирати назад через відпустку — це покарання за відпустку. */
+describe('bestStreakWeeks', () => {
+  it('без візитів — нуль', () => {
+    expect(bestStreakWeeks([], TZ)).toBe(0);
+  });
+
+  it('памʼятає найдовшу серію, навіть коли поточна обірвана', () => {
+    const v = [
+      visit(weeksAgo(10)), visit(weeksAgo(9)), visit(weeksAgo(8)), visit(weeksAgo(7)),
+      visit(weeksAgo(1)),
+    ];
+    expect(bestStreakWeeks(v, TZ)).toBe(4);
+    expect(streakWeeks(v, TZ, NOW)).toBe(1);
+  });
+
+  it('рекорд не менший за поточну серію', () => {
+    const v = [visit(weeksAgo(0)), visit(weeksAgo(1)), visit(weeksAgo(2))];
+    expect(bestStreakWeeks(v, TZ)).toBe(streakWeeks(v, TZ, NOW));
   });
 });

@@ -6,10 +6,12 @@ import { prisma, isSlotTakenError, notifyClub } from '../lib/db';
 import { buildSlots, isAlignedToGrid, type Interval } from '../lib/slots';
 import { normalizePhone } from '../lib/phone';
 import bcrypt from 'bcryptjs';
-import { findOrCreateCustomer } from '../lib/customers';
+import { findOrCreateCustomer, getActivePass } from '../lib/customers';
 import { providerFor, publicBase } from '../lib/payments';
 import { clubBilling } from '../lib/billing';
 import { playerStats } from '../lib/playerStats';
+import { playerLevel } from '../lib/playerLevel';
+import { clubLadder, ladderWithMe } from '../lib/clubLadder';
 import { notifyTrainerBooked } from '../lib/notifyTrainer';
 import {
   signCustomerToken, verifyCustomerToken, verifyCustomerPin, hashPinLookup, isPinTakenError,
@@ -1061,7 +1063,7 @@ publicRouter.get('/customer/me', async (req, res) => {
 
   const now = new Date();
 
-  const [upcoming, seats, club, pastBookings, pastSeats] = await Promise.all([
+  const [upcoming, seats, club, pastBookings, pastSeats, pass] = await Promise.all([
     prisma.booking.findMany({
       where: {
         customerId: customer.id,
@@ -1097,7 +1099,7 @@ publicRouter.get('/customer/me', async (req, res) => {
     }),
     prisma.club.findUnique({
       where: { id: customer.clubId },
-      select: { timezone: true, cancelCutoffMinutes: true },
+      select: { timezone: true, cancelCutoffMinutes: true, passesEnabled: true },
     }),
     /* Минулі відвідування — тільки для підсумку в картці гравця.
        Беремо обидва джерела й лише поля, потрібні для статистики:
@@ -1111,6 +1113,8 @@ publicRouter.get('/customer/me', async (req, res) => {
       },
       select: {
         startTime: true,
+        endTime: true,
+        priceTotal: true,
         court: { select: { name: true } },
         trainer: { select: { name: true } },
       },
@@ -1123,9 +1127,11 @@ publicRouter.get('/customer/me', async (req, res) => {
         booking: { status: 'CONFIRMED', startTime: { lte: now } },
       },
       select: {
+        price: true,
         booking: {
           select: {
             startTime: true,
+            endTime: true,
             court: { select: { name: true } },
             trainer: { select: { name: true } },
           },
@@ -1133,6 +1139,9 @@ publicRouter.get('/customer/me', async (req, res) => {
       },
       take: 500,
     }),
+    /* Абонемент. Той самий getActivePass, що бачить ресепшен, — щоб
+       гравець і адміністратор не сперечались про залишок біля стійки. */
+    getActivePass(customer.id, now),
   ]);
 
   const tz = club?.timezone ?? 'Europe/Kyiv';
@@ -1145,23 +1154,66 @@ publicRouter.get('/customer/me', async (req, res) => {
     [
       ...pastBookings.map((b) => ({
         start: b.startTime,
+        end: b.endTime,
         courtName: b.court?.name ?? null,
         trainerName: b.trainer?.name ?? null,
+        kind: 'court' as const,
+        price: b.priceTotal,
       })),
       ...pastSeats.map((s) => ({
         start: s.booking.startTime,
+        end: s.booking.endTime,
         courtName: s.booking.court?.name ?? null,
         trainerName: s.booking.trainer?.name ?? null,
+        kind: 'group' as const,
+        price: s.price,
       })),
     ],
     tz,
     now,
   );
 
+  /* Внутрішній рівень клубу. Він міряється місцем серед своїх, тому потрібен
+     підсумок по всіх гравцях — він кешується на п'ять хвилин (clubLadder).
+
+     Рівень рахуємо тільки тим, хто вже приходив: «Новачок, 0 із 84» для
+     людини з першою бронею попереду — це не привітання, а вирок. */
+  const level = stats.visits > 0
+    ? playerLevel(
+      { visits: stats.visits, hours: stats.hours, spent: stats.spent },
+      ladderWithMe(
+        await clubLadder(customer.clubId, now),
+        customer.id,
+        { visits: stats.visits, hours: stats.hours, spent: stats.spent },
+      ),
+    )
+    : null;
+
+  /* Витрати лишаються на сервері. Вони входять у рівень, але окремим
+     числом гравцю не показуються: профіль у віджеті — про звичку ходити,
+     а не про те, скільки людина занесла в касу. */
+  const { spent: _spent, ...publicStats } = stats;
+
   res.json({
     name: customer.name,
     phone: customer.phone,
-    stats,
+    stats: publicStats,
+    level,
+    /* passId гравцю ні до чого: скасувати чи змінити абонемент він не
+       може, а зайвий ідентифікатор у відповіді — це зайвий ідентифікатор
+       у відповіді. label теж лишається адмінці: у віджеті число й дата
+       верстаються окремо. */
+    /* Клуб, який абонементів не веде, не має показувати залишок навіть
+       тоді, коли в базі щось лежить: вимикач у налаштуваннях означає «ми
+       цим більше не займаємось», і залишок на екрані гравця після нього —
+       обіцянка, якої на ресепшені не виконають. */
+    pass: club?.passesEnabled === false || !pass ? null : {
+      type: pass.type,
+      left: pass.left,
+      total: pass.total,
+      validUntil: pass.validUntil.toISOString(),
+      daysLeft: pass.daysLeft,
+    },
     /* Правило клубу їде разом зі списком: віджет має пояснити гравцю, чому
        кнопки більше немає, а не мовчки її прибрати. */
     cancelCutoffMinutes: cutoff,
