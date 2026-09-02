@@ -48,9 +48,18 @@ export type BillingInfo = {
   state: BillingState;
   /** Дата, до якої оплачено. null — ще жодного разу не платили */
   paidUntil: Date | null;
+  /** Дата кінця пробного періоду. null — пробного не давали */
+  trialEndsAt: Date | null;
   /**
-   * Днів до кінця оплаченого періоду. Відʼємне — стільки днів прострочено.
-   * null, якщо paidUntil не заданий.
+   * Дата, яка реально тримає доступ, — пізніша з двох. Саме від неї
+   * рахується daysLeft, і саме її показує кабінет.
+   */
+  until: Date | null;
+  /** Доступ тримає пробний період, а не оплата. Підпис у кабінеті інший. */
+  trial: boolean;
+  /**
+   * Днів до кінця періоду. Відʼємне — стільки днів прострочено.
+   * null, якщо ні оплати, ні пробного не задано.
    */
   daysLeft: number | null;
   /** Скільки днів пільги лишилось. 0 — пільга скінчилась */
@@ -61,6 +70,7 @@ export type BillingInfo = {
 
 type ClubLike = {
   paidUntil?: Date | null;
+  trialEndsAt?: Date | null;
   isActive?: boolean;
 };
 
@@ -74,51 +84,79 @@ type ClubLike = {
  * Різниця видна на переході на зимовий час: доба тоді 25 годин, і «залишилось
  * 7 днів» перетворилось би на 6,96 -> 6 після Math.floor. Клуб побачив би, що
  * день зник нізвідки.
+ *
+ * ── Пробний період тримає доступ нарівні з оплатою ────────────────────────
+ *
+ * Раніше `trialEndsAt` не читав ніхто: оператор натискав «+14 днів пробного»,
+ * поле в базі мінялось — і не вмикало нічого. Клуб з пробним періодом і клуб
+ * без нього були нерозрізненні, бо порожній `paidUntil` і так означав «усе
+ * працює». Кнопка обіцяла дію, якої не було.
+ *
+ * Тепер доступ тримає ПІЗНІША з двох дат. Це те, чого від пробного чекають:
+ * дав на два тижні — через два тижні розмова про гроші почнеться сама.
+ *
+ * Пільговий тиждень діє однаково для обох. Спокуса відрубати пробний рівно
+ * в дату велика, але клуб, який дві години налаштовував корти й ціни, у
+ * понеділок вранці має побачити робочий віджет і рахунок, а не вимкнений
+ * онлайн-запис. Це той самий аргумент, що й для простроченої оплати вище.
  */
 export function clubBilling(club: ClubLike, now: Date = new Date()): BillingInfo {
+  const paidUntil = club.paidUntil ?? null;
+  const trialEndsAt = club.trialEndsAt ?? null;
+
+  /* Пізніша з двох дат — вона й тримає доступ. Пробний вважається головним
+     тільки якщо він справді далі оплати: інакше клуб, який уже заплатив за
+     рік, показував би в кабінеті «пробний період» через давню роздачу. */
+  const trial = Boolean(trialEndsAt && (!paidUntil || trialEndsAt > paidUntil));
+  const until = trial ? trialEndsAt : paidUntil;
+
   // Вимкнений вручну — це не про гроші, а про рішення людини. Але назовні
   // виглядає так само: онлайн-запис не працює.
   if (club.isActive === false) {
     return {
       state: 'blocked',
-      paidUntil: club.paidUntil ?? null,
+      paidUntil,
+      trialEndsAt,
+      until,
+      trial,
       daysLeft: null,
       graceLeft: 0,
       online: false,
     };
   }
 
-  const paidUntil = club.paidUntil ?? null;
+  const base = { paidUntil, trialEndsAt, until, trial };
 
-  // Ще жодного разу не платили. Так виглядає свіже впровадження, де перший
-  // рік входить у встановлення, — блокувати такий клуб було б абсурдом.
-  if (!paidUntil) {
-    return { state: 'ok', paidUntil: null, daysLeft: null, graceLeft: GRACE_DAYS, online: true };
+  // Ще жодного разу не платили і пробного не давали. Так виглядає свіже
+  // впровадження, де перший рік входить у встановлення, — блокувати такий
+  // клуб було б абсурдом.
+  if (!until) {
+    return { ...base, state: 'ok', daysLeft: null, graceLeft: GRACE_DAYS, online: true };
   }
 
-  const end = DateTime.fromJSDate(paidUntil).startOf('day');
+  const end = DateTime.fromJSDate(until).startOf('day');
   const today = DateTime.fromJSDate(now).startOf('day');
   const daysLeft = Math.round(end.diff(today, 'days').days);
 
   if (daysLeft > WARN_DAYS) {
-    return { state: 'ok', paidUntil, daysLeft, graceLeft: GRACE_DAYS, online: true };
+    return { ...base, state: 'ok', daysLeft, graceLeft: GRACE_DAYS, online: true };
   }
   if (daysLeft >= 0) {
-    return { state: 'due', paidUntil, daysLeft, graceLeft: GRACE_DAYS, online: true };
+    return { ...base, state: 'due', daysLeft, graceLeft: GRACE_DAYS, online: true };
   }
 
   const overdue = -daysLeft;
   if (overdue <= GRACE_DAYS) {
     return {
+      ...base,
       state: 'grace',
-      paidUntil,
       daysLeft,
       graceLeft: GRACE_DAYS - overdue,
       online: true,
     };
   }
 
-  return { state: 'blocked', paidUntil, daysLeft, graceLeft: 0, online: false };
+  return { ...base, state: 'blocked', daysLeft, graceLeft: 0, online: false };
 }
 
 /** Наступна дата закінчення, якщо продовжити на один період від `from` */

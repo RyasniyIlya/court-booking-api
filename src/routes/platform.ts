@@ -7,6 +7,7 @@ import rateLimit from 'express-rate-limit';
 import { prisma } from '../lib/db';
 import { JWT_SECRET } from '../lib/authSecret';
 import { PLAN_SELECT } from '../lib/plans';
+import { nextPeriod, periodAmount } from '../lib/subscription';
 import { sendMessage } from '../lib/telegram';
 
 export const platformRouter = Router();
@@ -444,4 +445,168 @@ platformRouter.post('/resets/:id/reject', requirePlatformAuth, async (req, res) 
 
   if (r.count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
   res.status(204).end();
+});
+
+/* -------------------------------------------------------------------------- */
+/* ПІДПИСКА                                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Видача підписки — головна дія, заради якої платформенка й існує.
+ *
+ * Гроші приходять поза системою: переказом, посиланням у Telegram, готівкою.
+ * Еквайринг заради 500 грн на місяць ми свідомо не заводимо, тому «видати
+ * підписку» означає рівно те, що робить оператор після дзвінка: записати, що
+ * гроші дійшли, і посунути дату.
+ *
+ * Дві речі відбуваються РАЗОМ і тільки разом:
+ *   1) створюється ClubInvoice — рядок в історії, який бачить сам клуб;
+ *   2) посувається Club.paidUntil — те, від чого залежить онлайн-запис.
+ *
+ * Раніше не було ні першого, ні другого: таблиця рахунків існувала, кабінет
+ * клубу вже малював історію оплат, але створити рахунок було нічим — жоден
+ * роут у неї не писав. Історія у всіх клубів була порожня назавжди, а дата
+ * рухалась вручну через форму. Транзакція тут не формальність: рахунок без
+ * посунутої дати означає «клуб заплатив і не працює», а посунута дата без
+ * рахунку — «працює, а за що платив, не видно».
+ */
+const subscriptionSchema = z.object({
+  /** Не задано — беремо період плану, а якщо плану немає, період клубу */
+  period: z.enum(['MONTH', 'QUARTER', 'YEAR']).optional(),
+  /** Копійки. Не задано — рахуємо за планом і прайсом. 0 дозволений. */
+  amount: z.number().int().min(0).max(1_000_000_00).optional(),
+  /** 'transfer' | 'link' | 'cash' — вільний рядок, як у моделі */
+  method: z.string().trim().max(40).optional(),
+  note: z.string().trim().max(500).optional(),
+});
+
+platformRouter.post('/clubs/:id/subscription', requirePlatformAuth, async (req, res) => {
+  const parsed = subscriptionSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  const club = await prisma.club.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      name: true,
+      paidUntil: true,
+      billingPeriod: true,
+      planPrice: true,
+      plan: { select: PLAN_SELECT },
+      users: { where: { role: 'OWNER' }, select: { tgChatId: true }, take: 1 },
+    },
+  });
+
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const period = parsed.data.period ?? club.plan?.period ?? club.billingPeriod;
+  const { from, to } = nextPeriod(club.paidUntil, period);
+  const amount = parsed.data.amount ?? periodAmount(club.plan, club.planPrice, period);
+
+  const [invoice, updated] = await prisma.$transaction([
+    prisma.clubInvoice.create({
+      data: {
+        clubId: club.id,
+        periodFrom: from,
+        periodTo: to,
+        amount,
+        status: 'PAID',
+        paidAt: new Date(),
+        method: parsed.data.method || null,
+        note: parsed.data.note || null,
+      },
+    }),
+    prisma.club.update({
+      where: { id: club.id },
+      /* billingPeriod підтягується за виданим періодом: клуб, який перейшов
+         з місяця на рік, має бачити в кабінеті рік, а не старий підпис. */
+      data: { paidUntil: to, billingPeriod: period },
+      include: { plan: { select: PLAN_SELECT } },
+    }),
+  ]);
+
+  /* Власнику — рядок у Telegram. Не «дякуємо за оплату», а дата: єдине, що
+     він хотів дізнатись, коли переказував гроші. */
+  const tgChatId = club.users[0]?.tgChatId;
+  if (tgChatId) {
+    await sendMessage(
+      tgChatId,
+      `✅ Оплату зараховано. Обслуговування ${club.name} діє до ${to.toLocaleDateString('uk-UA')}.`,
+    ).catch(() => {
+      /* Бот вимкнений або чат заблокований. Гроші вже зараховані, і валити
+         через це відповідь оператору не можна. */
+    });
+  }
+
+  res.json({ ok: true, club: updated, invoice });
+});
+
+/**
+ * GET /api/platform/clubs/:id/invoices
+ *
+ * Історія оплат клубу — те, що оператор читає під час дзвінка «а коли я
+ * платив востаннє?». Двадцять чотири рядки: два роки помісячних оплат.
+ */
+platformRouter.get('/clubs/:id/invoices', requirePlatformAuth, async (req, res) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  const rows = await prisma.clubInvoice.findMany({
+    where: { clubId: id },
+    orderBy: { periodTo: 'desc' },
+    take: 24,
+  });
+
+  res.json(rows);
+});
+
+/**
+ * POST /api/platform/invoices/:id/void
+ *
+ * Скасувати помилковий рахунок. Не видалити: видалений рядок неможливо
+ * пояснити клубу, який бачив його вчора в кабінеті.
+ *
+ * Дата відкочується ТІЛЬКИ якщо вона й досі дорівнює кінцю цього періоду.
+ * Інакше оператор, який скасовує торішній рахунок, зніс би клубу оплату,
+ * внесену після нього, — і дізнався б про це від клуба, а не від нас.
+ *
+ * Куди саме відкочувати, вирішує наявність попередніх оплат. Якщо цей
+ * рахунок був у клуба першим, дата стає null — тобто «ще не платили», а це
+ * стан, у якому все працює (див. lib/billing.ts). Повернути замість цього
+ * `periodFrom` означало б вимкнути онлайн-запис клубу, який до нашої ж
+ * помилки працював без обмежень.
+ */
+platformRouter.post('/invoices/:id/void', requirePlatformAuth, async (req, res) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  const invoice = await prisma.clubInvoice.findUnique({
+    where: { id },
+    select: { id: true, clubId: true, periodFrom: true, periodTo: true, status: true },
+  });
+
+  if (!invoice) return res.status(404).json({ error: 'NOT_FOUND' });
+  if (invoice.status === 'VOID') return res.status(409).json({ error: 'ALREADY_VOID' });
+
+  const earlier = await prisma.clubInvoice.count({
+    where: {
+      clubId: invoice.clubId,
+      status: 'PAID',
+      id: { not: invoice.id },
+      periodTo: { lte: invoice.periodTo },
+    },
+  });
+
+  const [, rolled] = await prisma.$transaction([
+    prisma.clubInvoice.update({
+      where: { id: invoice.id },
+      data: { status: 'VOID', paidAt: null },
+    }),
+    prisma.club.updateMany({
+      where: { id: invoice.clubId, paidUntil: invoice.periodTo },
+      data: { paidUntil: earlier > 0 ? invoice.periodFrom : null },
+    }),
+  ]);
+
+  res.json({ ok: true, rolledBack: rolled.count > 0 });
 });
