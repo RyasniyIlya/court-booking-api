@@ -56,8 +56,30 @@ describe('periodAmount', () => {
   });
 
   /* Головна пастка: план на 400 грн/місяць не означає 400 грн за рік. */
-  it('інший період — прайс за нього, а не ціна плану', () => {
-    expect(periodAmount(monthPlan, null, 'YEAR')).toBe(PERIOD_PRICE.YEAR);
-    expect(periodAmount(monthPlan, 250_00, 'YEAR')).toBe(PERIOD_PRICE.YEAR);
+  it('квартал — три місячні ставки плану', () => {
+    expect(periodAmount(monthPlan, null, 'QUARTER')).toBe(1_200_00);
+  });
+
+  it('рік — десять місячних ставок: два місяці даруються', () => {
+    expect(periodAmount(monthPlan, null, 'YEAR')).toBe(4_000_00);
+  });
+
+  it('індивідуальна ціна розтягується на інший період так само', () => {
+    expect(periodAmount(monthPlan, 250_00, 'YEAR')).toBe(2_500_00);
+  });
+
+  /* Реальні цифри каталогу: план «Броні» за 1199 грн/міс. Загальний прайс
+     дав би 5000 грн за рік — менш ніж половину того, що клуб має заплатити. */
+  it('план за 1199 грн/міс дає 3597 за квартал і 11990 за рік', () => {
+    const plan = { price: 1_199_00, period: 'MONTH' };
+    expect(periodAmount(plan, null, 'QUARTER')).toBe(3_597_00);
+    expect(periodAmount(plan, null, 'YEAR')).toBe(11_990_00);
+    expect(periodAmount(plan, null, 'YEAR')).not.toBe(PERIOD_PRICE.YEAR);
+  });
+
+  it('план, записаний за рік, дає свою місячну ставку назад', () => {
+    const yearPlan = { price: 12_000_00, period: 'YEAR' };
+    expect(periodAmount(yearPlan, null, 'YEAR')).toBe(12_000_00);
+    expect(periodAmount(yearPlan, null, 'MONTH')).toBe(1_200_00);
   });
 });
