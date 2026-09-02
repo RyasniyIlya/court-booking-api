@@ -22,6 +22,9 @@ billingRouter.get(
         },
         select: {
           paidUntil: true,
+          /* Без цього поля clubBilling бачить undefined і вважає, що пробного
+             періоду немає взагалі: клуб на пробному читав би «не оплачено». */
+          trialEndsAt: true,
           billingPeriod: true,
           isActive: true,
           createdAt: true,
@@ -70,6 +73,15 @@ billingRouter.get(
       online: info.online,
       paidUntil:
         info.paidUntil,
+      /* Пробний період окремими полями, а не підмішаний у paidUntil: клуб має
+         бачити «пробний до 16.09», а не «оплачено до 16.09» за те, чого не
+         платив. `until` — дата, від якої рахується daysLeft. */
+      trialEndsAt:
+        info.trialEndsAt,
+      trial:
+        info.trial,
+      until:
+        info.until,
       daysLeft:
         info.daysLeft,
       graceLeft:
