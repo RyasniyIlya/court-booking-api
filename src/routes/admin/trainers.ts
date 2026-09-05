@@ -40,6 +40,76 @@ trainersRouter.get(
   },
 );
 
+const trainerHoursSchema = z.array(z.object({
+  weekday: z.number().int().min(0).max(6),
+  openMinute: z.number().int().min(0).max(1799),
+  closeMinute: z.number().int().min(0).max(1800),
+  isClosed: z.boolean(),
+}).superRefine((row, ctx) => {
+  if (!row.isClosed && row.closeMinute <= row.openMinute) {
+    ctx.addIssue({ code: 'custom', message: 'closeMinute must be after openMinute' });
+  }
+})).length(7).superRefine((rows, ctx) => {
+  if (new Set(rows.map((row) => row.weekday)).size !== 7) {
+    ctx.addIssue({ code: 'custom', message: 'Every weekday must be present once' });
+  }
+});
+
+/**
+ * Особистий графік тренера. Окремий `/me`, а не довільний id: навіть
+ * підмінивши адресу запиту, тренер фізично не зможе переписати чужі години.
+ */
+trainersRouter.get('/trainer-hours/me', requireAuth, async (req, res) => {
+  if (req.auth!.role !== 'TRAINER' || !req.auth!.trainerId) {
+    return res.status(403).json({ error: 'TRAINER_NOT_LINKED' });
+  }
+
+  const trainer = await prisma.trainer.findFirst({
+    where: { id: req.auth!.trainerId, clubId: req.auth!.clubId },
+    select: {
+      id: true,
+      hours: { orderBy: { weekday: 'asc' } },
+      club: { select: { hours: { orderBy: { weekday: 'asc' } } } },
+    },
+  });
+  if (!trainer) return res.status(404).json({ error: 'TRAINER_NOT_FOUND' });
+
+  res.json({
+    configured: trainer.hours.length > 0,
+    hours: trainer.hours.length > 0 ? trainer.hours : trainer.club.hours,
+  });
+});
+
+trainersRouter.put(
+  '/trainer-hours/me',
+  requireAuth,
+  requireLevel(2),
+  requireFeature('trainers'),
+  async (req, res) => {
+    if (req.auth!.role !== 'TRAINER' || !req.auth!.trainerId) {
+      return res.status(403).json({ error: 'TRAINER_NOT_LINKED' });
+    }
+
+    const parsed = trainerHoursSchema.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+    const trainer = await prisma.trainer.findFirst({
+      where: { id: req.auth!.trainerId, clubId: req.auth!.clubId },
+      select: { id: true },
+    });
+    if (!trainer) return res.status(404).json({ error: 'TRAINER_NOT_FOUND' });
+
+    await prisma.$transaction([
+      prisma.trainerHours.deleteMany({ where: { trainerId: trainer.id } }),
+      prisma.trainerHours.createMany({
+        data: parsed.data.map((row) => ({ ...row, trainerId: trainer.id })),
+      }),
+    ]);
+
+    res.json({ ok: true });
+  },
+);
+
 const trainerSchema =
   z.object({
     name: z

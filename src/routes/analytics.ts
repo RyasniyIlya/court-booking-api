@@ -4,6 +4,7 @@ import { DateTime } from 'luxon';
 import { prisma } from '../lib/db';
 import { requireAuth, requireRole, requireFeature } from './admin';
 import { buildLoadProfile } from '../lib/loadProfile';
+import { bookingFunnel, retentionFromVisits, roundPct, type FunnelBooking } from '../lib/deepAnalytics';
 
 /**
  * CRM-аналітика кабінету. Окремий файл, а не ще один розділ
@@ -395,6 +396,189 @@ analyticsRouter.get('/load', async (req, res) => {
   }
 
   res.json({ available: true, ...range, ...profile });
+});
+
+/* -------------------------------------------------------------------------- */
+/* PRO: ЗДОРОВʼЯ КЛУБУ — НЕ ЩЕ ОДИН СПИСОК ЦИФР, А ПРИЧИНИ ДЛЯ ДІЇ           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * GET /api/admin/analytics/deep?period=week|month
+ *
+ * Дорогий, але один агрегований зріз для найвищого пакета. Він навмисно
+ * об'єднує три різні питання власника:
+ *   1. де губляться записи і гроші (статуси); 2. хто перестає ходити
+ *   (утримання); 3. який корт продає свій доступний час найкраще.
+ *
+ * Звичайний `summary` лишається швидкою панеллю «сьогодні». Тут останні
+ * вісім ПОВНИХ тижнів: незавершений тиждень не псує ні завантаження, ні
+ * рейтинг кортів. Блокування віднімаються з ємності через buildLoadProfile,
+ * отже ремонт не видається за непроданий час.
+ */
+analyticsRouter.get('/deep', async (req, res) => {
+  const parsed = periodQuery.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const clubId = req.auth!.clubId;
+  const club = await prisma.club.findUnique({
+    where: { id: clubId },
+    select: {
+      timezone: true,
+      createdAt: true,
+      hours: { select: { weekday: true, openMinute: true, closeMinute: true, isClosed: true } },
+    },
+  });
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const now = DateTime.now().setZone(club.timezone);
+  const period = parsed.data.period;
+  const unit = period === 'week' ? 'week' : 'month';
+  const operationalFrom = now.startOf(unit as 'week' | 'month').toJSDate();
+  const operationalTo = now.toJSDate();
+
+  // Рівно вісім завершених тижнів — для змінного попиту це достатньо
+  // згладжує випадковість, але ще не перетворює літні дані на «норму» зими.
+  const loadTo = now.startOf('week').toJSDate();
+  const nominalLoadFrom = now.startOf('week').minus({ weeks: 8 }).toJSDate();
+  const loadFrom = club.createdAt > nominalLoadFrom ? club.createdAt : nominalLoadFrom;
+
+  const [courts, blocks, loadBookings, funnelBookings, funnelSeats, directVisits, seatVisits] = await Promise.all([
+    prisma.court.findMany({
+      where: { clubId, isActive: true },
+      select: { id: true, name: true, pricePerHour: true, sortOrder: true },
+      orderBy: { sortOrder: 'asc' },
+    }),
+    prisma.block.findMany({
+      where: { clubId, startTime: { lt: loadTo }, endTime: { gt: loadFrom } },
+      select: { courtId: true, startTime: true, endTime: true },
+    }),
+    prisma.booking.findMany({
+      where: {
+        clubId, status: 'CONFIRMED', startTime: { lt: loadTo }, endTime: { gt: loadFrom },
+      },
+      select: { courtId: true, startTime: true, endTime: true, priceTotal: true },
+    }),
+    prisma.booking.findMany({
+      where: { clubId, startTime: { gte: operationalFrom, lte: operationalTo } },
+      select: {
+        status: true, priceTotal: true,
+        payment: { select: { status: true } },
+      },
+    }),
+    // У груповому занятті контейнер бронює корт, а «запис» клієнта — це
+    // місце. Воронка без цього запиту показувала б одну бронь замість
+    // восьми заявок і ховала б саме ті неоплати/скасування, які власнику
+    // треба помітити.
+    prisma.bookingSeat.findMany({
+      where: { booking: { clubId, startTime: { gte: operationalFrom, lte: operationalTo } } },
+      select: { status: true, price: true, payment: { select: { status: true } } },
+    }),
+    prisma.booking.findMany({
+      where: { clubId, status: 'CONFIRMED', startTime: { lte: operationalTo }, customerId: { not: null } },
+      select: { customerId: true, startTime: true },
+    }),
+    prisma.bookingSeat.findMany({
+      where: {
+        status: 'BOOKED', customerId: { not: null },
+        booking: { clubId, status: 'CONFIRMED', startTime: { lte: operationalTo } },
+      },
+      select: { customerId: true, booking: { select: { startTime: true } } },
+    }),
+  ]);
+
+  const profileInput = {
+    from: loadFrom, to: loadTo, timezone: club.timezone, hours: club.hours, blocks, bookings: loadBookings,
+  };
+  const load = buildLoadProfile({ ...profileInput, courts });
+  const courtPerformance = courts.map((court) => {
+    const one = buildLoadProfile({ ...profileInput, courts: [{ id: court.id }] }).totals;
+    const bookedHours = one.bookedMinutes / 60;
+    const availableHours = one.openMinutes / 60;
+    return {
+      courtId: court.id,
+      name: court.name,
+      bookings: one.bookings,
+      revenue: one.revenue,
+      occupancy: roundPct(one.occupancy),
+      availableHours: Math.round(availableHours * 10) / 10,
+      bookedHours: Math.round(bookedHours * 10) / 10,
+      unsoldHours: Math.max(0, Math.round((availableHours - bookedHours) * 10) / 10),
+      revenuePerBookedHour: bookedHours ? Math.round(one.revenue / bookedHours) : 0,
+      revenuePerAvailableHour: availableHours ? Math.round(one.revenue / availableHours) : 0,
+    };
+  }).sort((a, b) => b.revenuePerAvailableHour - a.revenuePerAvailableHour || b.occupancy - a.occupancy);
+
+  const funnelRows: FunnelBooking[] = [
+    ...funnelBookings.map((booking) => ({
+      ...booking,
+      paymentStatus: booking.payment?.status ?? null,
+    })),
+    ...funnelSeats.map((seat): FunnelBooking => ({
+      status: seat.status === 'BOOKED'
+        ? 'CONFIRMED'
+        : seat.status === 'PENDING'
+          ? 'PENDING'
+          : seat.status === 'CANCELLED'
+            ? 'CANCELLED'
+            : 'EXPIRED',
+      priceTotal: seat.price,
+      paymentStatus: seat.payment?.status ?? null,
+    })),
+  ];
+  const funnel = bookingFunnel(funnelRows);
+  const retention = retentionFromVisits([
+    ...directVisits.map((v) => ({ customerId: v.customerId!, at: v.startTime })),
+    ...seatVisits.map((v) => ({ customerId: v.customerId!, at: v.booking.startTime })),
+  ], operationalTo, 30);
+
+  const atRisk = retention.atRiskIds.length
+    ? await prisma.customer.findMany({
+      where: { clubId, id: { in: retention.atRiskIds.slice(0, 6) } },
+      select: { id: true, name: true, phone: true },
+    })
+    : [];
+
+  const insights: { tone: 'alert' | 'watch' | 'good'; title: string; body: string }[] = [];
+  if (funnel.cancellationRate !== null && funnel.cancellationRate >= 15 && funnel.CANCELLED >= 3) {
+    insights.push({
+      tone: 'alert', title: `Скасування — ${funnel.cancellationRate}%`,
+      body: `${funnel.CANCELLED} записів скасовано. Перевірте вікно скасування, нагадування та доступність часу.`,
+    });
+  }
+  if (load.totals.openMinutes > 0 && load.totals.occupancy < 0.45) {
+    insights.push({
+      tone: 'watch', title: `Непродано ${Math.round((load.totals.openMinutes - load.totals.bookedMinutes) / 60)} год`,
+      body: 'Це доступний час за 8 повних тижнів без урахування ремонтів. Почніть із тихих годин у тепловій карті.',
+    });
+  }
+  if (retention.atRiskIds.length >= 3) {
+    insights.push({
+      tone: 'watch', title: `${retention.atRiskIds.length} клієнтів під ризиком відтоку`,
+      body: 'Вони приходили у попередні 30 днів, але не повернулися в останні 30. Нижче є контакти для персонального нагадування.',
+    });
+  }
+  if (funnel.conversionRate !== null && funnel.conversionRate >= 85 && load.totals.occupancy >= 0.65) {
+    insights.push({
+      tone: 'good', title: 'Сильний операційний ритм',
+      body: 'Підтверджується більшість вирішених записів, а корти стабільно завантажені. Перевірте, чи не час тестувати вищу ціну у пікові години.',
+    });
+  }
+  if (!insights.length) {
+    insights.push({
+      tone: 'good', title: 'Критичних сигналів немає',
+      body: 'Дивіться на рух показників між періодами: аналітика показує факти, а не вигадує проблему з кількох записів.',
+    });
+  }
+
+  res.json({
+    operationalRange: { from: operationalFrom.toISOString(), to: operationalTo.toISOString(), period },
+    loadRange: { from: loadFrom.toISOString(), to: loadTo.toISOString(), weeks: 8 },
+    funnel,
+    retention: { ...retention, atRisk },
+    load: { available: load.totals.bookings >= LOAD_MIN_BOOKINGS, bookings: load.totals.bookings, ...load },
+    courtPerformance,
+    insights,
+  });
 });
 
 /* -------------------------------------------------------------------------- */

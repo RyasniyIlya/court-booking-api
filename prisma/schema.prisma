@@ -330,10 +330,9 @@ model ClubInvoice {
 
 /// Тренер клубу.
 ///
-/// Робочих годин і відпусток свідомо не ведемо — клуб сам знає, хто коли
-/// працює, а повноцінний розклад тренерів це вже CRM, куди ми не лізем.
-/// Від накладок захищає перевірка при створенні броні (див. routes/public.ts):
-/// у віджеті видно тільки вільних на цю годину.
+/// Регулярний робочий час лежить у TrainerHours. Порожній список означає,
+/// що тренер ще не налаштував графік і доступний у всі години клубу — так
+/// міграція не ховає наявних тренерів із віджета.
 model Trainer {
   id     String @id @default(uuid()) @db.Uuid
   clubId String @db.Uuid
@@ -355,8 +354,30 @@ model Trainer {
   bookings      Booking[]
   staffAccounts User[]
   notes         Note[]
+  hours         TrainerHours[]
 
   @@index([clubId, isActive])
+}
+
+/// Регулярний тижневий графік конкретного тренера.
+/// Один рядок на день: для першої версії цього досить, а унікальність не дає
+/// випадково створити два суперечливі інтервали на той самий день.
+model TrainerHours {
+  id        String  @id @default(uuid()) @db.Uuid
+  trainerId String  @db.Uuid
+  trainer   Trainer @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+
+  /// 0 = неділя … 6 = субота
+  weekday     Int
+  openMinute  Int
+  /// Може бути > 1440 для зміни після півночі.
+  closeMinute Int
+  isClosed    Boolean @default(false)
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([trainerId, weekday])
+  @@index([trainerId])
 }
 
 enum NoteSubject {

@@ -13,6 +13,7 @@ import { playerStats } from '../lib/playerStats';
 import { playerLevel } from '../lib/playerLevel';
 import { clubLadder, ladderWithMe } from '../lib/clubLadder';
 import { notifyTrainerBooked } from '../lib/notifyTrainer';
+import { isTrainerAvailable } from '../lib/trainerAvailability';
 import {
   signCustomerToken, verifyCustomerToken, verifyCustomerPin, hashPinLookup, isPinTakenError,
 } from '../lib/customerAuth';
@@ -43,7 +44,11 @@ async function loadClub(slug: string) {
     include: {
       hours: true,
       courts: { where: { isActive: true }, orderBy: { sortOrder: 'asc' } },
-      trainers: { where: { isActive: true }, orderBy: { sortOrder: 'asc' } },
+      trainers: {
+        where: { isActive: true },
+        orderBy: { sortOrder: 'asc' },
+        include: { hours: true },
+      },
     },
   });
 }
@@ -187,9 +192,8 @@ publicRouter.get('/clubs/:slug/logo', async (req, res) => {
  *
  * Тренери, вільні на цей проміжок. Без start/end — просто весь список.
  *
- * Розкладу тренерів ми не ведемо: клуб сам знає, хто коли працює.
- * Тут відсіюються тільки ті, у кого на цю годину вже є заняття, —
- * щоб гравець не обрав зайнятого.
+ * Доступність = інтервал входить у регулярний графік тренера І на ньому
+ * ще немає заняття. Порожній графік лишає стару поведінку.
  */
 publicRouter.get('/clubs/:slug/trainers', async (req, res) => {
   const parsed = z.object({
@@ -218,12 +222,16 @@ publicRouter.get('/clubs/:slug/trainers', async (req, res) => {
     busy = new Set(taken.map((t) => t.trainerId!));
   }
 
+  const range = start && end ? { start: new Date(start), end: new Date(end) } : null;
+
   res.json(club.trainers.map((t) => ({
     id: t.id,
     name: t.name,
     pricePerHour: t.pricePerHour,
     note: t.note,
-    available: !busy.has(t.id),
+    available: !busy.has(t.id) && (!range || isTrainerAvailable(
+      t.hours, range.start, range.end, club.timezone,
+    )),
   })));
 });
 
@@ -510,6 +518,10 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
   if (body.trainerId) {
     trainer = club.trainers.find((t) => t.id === body.trainerId && t.isActive) ?? null;
     if (!trainer) return res.status(404).json({ error: 'TRAINER_NOT_FOUND' });
+
+    if (!isTrainerAvailable(trainer.hours, start, end, club.timezone)) {
+      return res.status(409).json({ error: 'TRAINER_UNAVAILABLE' });
+    }
 
     const clash = await prisma.booking.findFirst({
       where: {
