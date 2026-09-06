@@ -28,6 +28,7 @@ const BTN_REVENUE = '💰 Виручка';
 const BTN_STAFF = '👥 Персонал';
 const BTN_SESSIONS = '📋 Мої заняття';
 const BTN_HELP = '❓ Довідка';
+const BTN_ANALYTICS = '🔎 Аналітика';
 
 /**
  * Підпис кнопки -> команда.
@@ -45,6 +46,7 @@ const BY_LABEL: Record<string, string> = {
   [BTN_STAFF]: '/staff',
   [BTN_SESSIONS]: '/today',
   [BTN_HELP]: '/help',
+  [BTN_ANALYTICS]: '/analytics',
 };
 
 /** Команда за натиснутою кнопкою, або null, якщо це звичайний текст */
@@ -62,7 +64,7 @@ export function commandForLabel(text: string): string | null {
 export function replyKeyboard(role: Role) {
   const rows = isTrainer(role)
     ? [[BTN_SESSIONS], [BTN_HELP]]
-    : [[BTN_TODAY, BTN_YESTERDAY], [BTN_WEEK, BTN_REVENUE], [BTN_STAFF, BTN_HELP]];
+    : [[BTN_TODAY, BTN_YESTERDAY], [BTN_WEEK, BTN_REVENUE], [BTN_STAFF, BTN_ANALYTICS], [BTN_HELP]];
 
   return {
     keyboard: rows.map((row) => row.map((text) => ({ text }))),
@@ -170,6 +172,7 @@ export function periodButtons(section: Section, days: number) {
 /* ── Синє меню «/» ───────────────────────────────────────────────────── */
 
 const COMMANDS_OWNER = [
+  { command: 'analytics', description: 'Детальний звіт по кортах за період або дату' },
   { command: 'today', description: 'Цифри за сьогодні' },
   { command: 'yesterday', description: 'За вчора' },
   { command: 'week', description: 'Тиждень із графіком' },

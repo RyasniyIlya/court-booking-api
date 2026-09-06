@@ -73,6 +73,9 @@ export function resetThrottle() {
  * двома окремими списками.
  */
 const MENU_OWNER = [
+  '🔎 <b>Аналітика</b> — корти, суми, завантаження, оплати й скасування',
+  '<code>/analytics today</code> · <code>/analytics yesterday</code>',
+  '<code>/analytics week</code> · <code>/analytics month</code> · <code>/analytics YYYY-MM-DD</code>',
   '📊 <b>Сьогодні</b> — виручка, броні, нові клієнти',
   '📅 <b>Вчора</b> — те саме за попередній день',
   '📈 <b>Тиждень</b> — графік із перемикачем на 2 і 4 тижні',

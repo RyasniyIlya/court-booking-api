@@ -269,6 +269,7 @@ clubRouter.patch(
         prepayRequired: true,
         paymentProvider: true,
         payHoldMinutes: true,
+        paymentTokenEnc: true,
       },
     });
 
@@ -289,6 +290,15 @@ clubRouter.patch(
         requiredLevel: 3,
         currentLevel: req.auth!.level,
       });
+    }
+
+    const enabled = rest.prepayEnabled ?? current?.prepayEnabled;
+    const provider = rest.paymentProvider !== undefined ? rest.paymentProvider : current?.paymentProvider;
+    const hasToken = paymentToken !== undefined
+      ? Boolean(paymentToken)
+      : Boolean(current?.paymentTokenEnc) && provider === current?.paymentProvider;
+    if (paymentFieldsTouched && enabled && (!provider || (provider !== 'mock' && !hasToken))) {
+      return res.status(400).json({ error: 'PAYMENTS_NOT_CONFIGURED' });
     }
 
     /* Перевірки на billingPeriod тут більше немає: поле прибране зі схеми
@@ -494,4 +504,3 @@ clubRouter.post(
     }
   },
 );
-

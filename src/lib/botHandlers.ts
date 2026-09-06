@@ -24,6 +24,7 @@ import {
   replyKeyboard,
 } from './botKeyboard';
 import { revenueBreakdown, revenueText, staffReport, staffText } from './sections';
+import { botAnalytics } from './botAnalytics';
 
 /**
  * Що бот відповідає на команди.
@@ -390,6 +391,16 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
 
   const keyboard = replyKeyboard(me.role);
   const menu = menuFor(me.role);
+
+  if (cmd === '/analytics') {
+    if (msg.chat.type !== 'private' || !['OWNER', 'ADMIN'].includes(me.role)) {
+      await sendMessage(chatId, 'Аналітика доступна власнику та модератору лише в особистому чаті з ботом.');
+      return;
+    }
+    const messages = await botAnalytics(me.club.id, args.join(' '));
+    for (const text of messages) await sendMessage(chatId, text, keyboard);
+    return;
+  }
 
   if (cmd === '/help' || cmd === '/start') {
     await setMyCommands(commandsFor(me.role), chatId);
