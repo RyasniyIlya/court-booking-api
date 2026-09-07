@@ -47,6 +47,7 @@ export type WebhookEvent = {
 
 export interface PayProvider {
   readonly name: string;
+  testConnection?(): Promise<void>;
   createInvoice(input: CreateInvoiceInput): Promise<Invoice>;
   /**
    * Перевіряє підпис і розбирає тіло. Отримує СИРЕ тіло: підпис рахується

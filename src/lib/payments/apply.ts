@@ -48,9 +48,10 @@ type LoadedSeat = NonNullable<LoadedPayment['seat']>;
 type Fmt = (d: Date) => string;
 type Hrn = (kop: number) => string;
 
-export async function applyPayEvent(provider: string, ev: WebhookEvent): Promise<ApplyResult> {
+export async function applyPayEvent(provider: string, ev: WebhookEvent, clubId?: string): Promise<ApplyResult> {
   const payment = await loadPayment(provider, ev.providerRef);
   if (!payment) return 'unknown-invoice';
+  if (clubId && payment.clubId !== clubId) return 'unknown-invoice';
 
   if (ev.at && payment.providerAt && ev.at.getTime() < payment.providerAt.getTime()) {
     return 'stale';

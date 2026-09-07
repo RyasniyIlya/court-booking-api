@@ -6,6 +6,7 @@ import { KNOWN_PROVIDERS, providerFor, publicBase } from '../../lib/payments';
 import { encryptSecret, paymentsSecretReady } from '../../lib/crypto';
 import { requireAuth, requireStaff, requireLevel } from './shared';
 import { logoSrcOf } from '../public';
+import { liqPayKeys } from '../../lib/payments/liqpay';
 
 export const clubRouter = Router();
 
@@ -294,6 +295,17 @@ clubRouter.patch(
 
     const enabled = rest.prepayEnabled ?? current?.prepayEnabled;
     const provider = rest.paymentProvider !== undefined ? rest.paymentProvider : current?.paymentProvider;
+    if (provider === 'liqpay' && paymentToken) {
+      try { liqPayKeys(paymentToken); }
+      catch { return res.status(400).json({ error: 'PAYMENT_CREDENTIALS_INVALID' }); }
+    }
+    // One credential set per club: keep it available to outstanding callbacks
+    // and refunds. A provider switch is not an automatic per-payment fallback.
+    const replacingCredentials = current?.paymentTokenEnc &&
+      (provider !== current.paymentProvider || paymentToken !== undefined);
+    if (replacingCredentials && await prisma.payment.count({
+      where: { clubId: req.auth!.clubId, status: { in: ['PENDING', 'PAID'] } },
+    })) return res.status(409).json({ error: 'PAYMENT_PROVIDER_IN_USE' });
     const hasToken = paymentToken !== undefined
       ? Boolean(paymentToken)
       : Boolean(current?.paymentTokenEnc) && provider === current?.paymentProvider;
@@ -311,6 +323,10 @@ clubRouter.patch(
     > = {
       ...rest,
     };
+
+    if (provider !== current?.paymentProvider && paymentToken === undefined) {
+      data.paymentTokenEnc = null;
+    }
 
     if (
       paymentToken !== undefined
@@ -474,6 +490,10 @@ clubRouter.post(
     }
 
     try {
+      if (provider.testConnection) {
+        await provider.testConnection();
+        return res.json({ ok: true, provider: provider.name });
+      }
       const invoice = await provider.createInvoice({
         amountKop: 100,
         reference: `test-${club.id}`,

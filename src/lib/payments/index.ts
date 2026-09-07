@@ -1,5 +1,6 @@
 import type { PayProvider } from './types';
 import { MonoProvider } from './mono';
+import { LiqPayProvider } from './liqpay';
 import { MockProvider } from './mock';
 import { decryptSecret } from '../crypto';
 
@@ -42,10 +43,11 @@ export function providerFor(club: ClubPay): PayProvider | null {
     return new MockProvider(publicBase());
   }
 
-  if (kind === 'mono') {
+  if (kind === 'mono' || kind === 'liqpay') {
     if (!club.paymentTokenEnc) return null;
     try {
-      return new MonoProvider(decryptSecret(club.paymentTokenEnc));
+      const credentials = decryptSecret(club.paymentTokenEnc);
+      return kind === 'liqpay' ? new LiqPayProvider(credentials, publicBase()) : new MonoProvider(credentials);
     } catch (e) {
       // Найчастіша причина — змінили PAYMENTS_SECRET, і старі токени
       // більше не розшифровуються. Клубу треба ввести токен заново.
@@ -59,4 +61,4 @@ export function providerFor(club: ClubPay): PayProvider | null {
 }
 
 /** Список того, що можна вибрати у налаштуваннях клубу */
-export const KNOWN_PROVIDERS = ['mono', 'mock'] as const;
+export const KNOWN_PROVIDERS = ['mono', 'liqpay', 'mock'] as const;

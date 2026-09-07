@@ -2,6 +2,8 @@ import { Router } from 'express';
 import { prisma } from '../lib/db';
 import { providerFor, publicBase } from '../lib/payments';
 import { applyPayEvent } from '../lib/payments/apply';
+import { LiqPayProvider } from '../lib/payments/liqpay';
+import { randomUUID } from 'node:crypto';
 
 export const payRouter = Router();
 
@@ -44,7 +46,7 @@ payRouter.post('/webhook/:clubId', async (req, res) => {
   }
 
   try {
-    const result = await applyPayEvent(provider.name, event);
+    const result = await applyPayEvent(provider.name, event, club.id);
     if (result !== 'applied') console.warn('[pay] webhook', event.providerRef, result);
   } catch (e) {
     console.error('[pay] apply failed', e);
@@ -59,6 +61,45 @@ payRouter.post('/webhook/:clubId', async (req, res) => {
 
 const esc = (s: string) => s.replace(/[<>&"]/g, (c) =>
   ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c] as string));
+
+payRouter.get('/liqpay/checkout', async (req, res) => {
+  res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' });
+  const { data, signature } = req.query;
+  if (typeof data !== 'string' || typeof signature !== 'string' || data.length > 12000) return res.sendStatus(400);
+  let orderId;
+  try { orderId = JSON.parse(Buffer.from(data, 'base64').toString('utf8')).order_id; }
+  catch { return res.sendStatus(400); }
+  if (typeof orderId !== 'string' || !/^[a-f0-9-]{36}$/.test(orderId)) return res.sendStatus(400);
+  // Untrusted ID is used only to find credentials; nothing is sent to LiqPay
+  // before the signature, merchant, and live booking have been checked.
+  const payment = await prisma.payment.findUnique({
+    where: { provider_providerRef: { provider: 'liqpay', providerRef: orderId } },
+    include: { club: true, booking: true, seat: { include: { booking: true } } },
+  });
+  if (!payment) return res.sendStatus(404);
+  const provider = providerFor(payment.club);
+  if (!(provider instanceof LiqPayProvider)) return res.sendStatus(409);
+  let body;
+  try { body = provider.readSigned(data, signature); }
+  catch { return res.sendStatus(400); }
+  if (body.action !== 'pay' || body.currency !== 'UAH' || Math.round(Number(body.amount) * 100) !== payment.amount || body.order_id !== payment.providerRef) return res.sendStatus(400);
+  const target = payment.seat ?? payment.booking;
+  const expires = typeof body.expired_date === 'string' ? Date.parse(body.expired_date.replace(' ', 'T') + 'Z') : NaN;
+  if (payment.status !== 'PENDING' || !target || target.status !== 'PENDING'
+    || !target.expiresAt || target.expiresAt.getTime() <= Date.now()
+    || !Number.isFinite(expires) || expires <= Date.now()
+    || (payment.seat && ['CANCELLED', 'EXPIRED'].includes(payment.seat.booking.status))) {
+    return res.status(410).type('text').send('Ця оплата вже завершена або час бронювання минув. Поверніться до розкладу.');
+  }
+  const nonce = randomUUID();
+  res.set('Content-Security-Policy', `default-src 'none'; script-src 'nonce-${nonce}'; form-action https://www.liqpay.ua; base-uri 'none'; frame-ancestors 'none'`);
+  return res.type('html').send(`<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Оплата LiqPay</title></head><body>
+    <p>Переходимо до безпечної оплати LiqPay…</p>
+    <form id="checkout" method="POST" action="https://www.liqpay.ua/api/3/checkout" accept-charset="utf-8">
+    <input type="hidden" name="data" value="${esc(data)}"><input type="hidden" name="signature" value="${esc(signature)}">
+    <button type="submit">Перейти до оплати</button></form>
+    <script nonce="${nonce}">document.getElementById('checkout').submit()</script></body></html>`);
+});
 
 const page = (title: string, body: string) => `<!doctype html>
 <html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
