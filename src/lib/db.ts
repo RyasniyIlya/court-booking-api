@@ -1,4 +1,5 @@
 import { PrismaClient } from '@prisma/client';
+import { sendMessage } from './telegram';
 
 export const prisma = new PrismaClient();
 
@@ -20,14 +21,11 @@ export function isSlotTakenError(e: unknown): boolean {
 
 /** Сповіщення адміністратору клубу. Помилка Telegram не має ламати бронь. */
 export async function notifyClub(chatId: string | null | undefined, text: string) {
-  const token = process.env.TELEGRAM_BOT_TOKEN;
-  if (!token || !chatId) return;
+  if (!chatId) return;
   try {
-    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text, parse_mode: 'HTML' }),
-    });
+    // Єдиний Telegram-транспорт має таймаут і однакову обробку помилок.
+    // Так завислий Telegram не накопичує відкриті запити в API.
+    await sendMessage(chatId, text);
   } catch (e) {
     console.error('[telegram] send failed', e);
   }

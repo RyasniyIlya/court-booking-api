@@ -50,6 +50,11 @@ services:
       - key: TELEGRAM_BOT_TOKEN
         sync: false
 
+      # Вхідні команди приходять від Telegram через webhook. URL API бере
+      # автоматично з PUBLIC_API_URL; випадковий секрет захищає endpoint.
+      - key: TELEGRAM_WEBHOOK_SECRET
+        generateValue: true
+
       # О котрій слати щоденне зведення — за часом клубу. Без цієї змінної
       # 21:00; тут стоїть явно, щоб її було видно в панелі Render.
       - key: DIGEST_HOUR

@@ -2,7 +2,7 @@
  * Клієнт Telegram Bot API. Тільки транспорт — жодної логіки про клуби.
  *
  * Без бібліотеки навмисно. Нам потрібні три виклики з усього API
- * (sendMessage, getUpdates, setWebhook), а будь-який фреймворк тягне свою
+ * (sendMessage, setWebhook), а будь-який фреймворк тягне свою
  * модель сцен і станів, під яку довелось би підганяти наші ролі й клуби.
  */
 
@@ -34,6 +34,9 @@ async function call<T>(method: string, body: unknown): Promise<T | null> {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      // Telegram не повинен утримувати ресурси API безкінечно, якщо мережа
+      // зависла. Всі повідомлення подієві; помилка не валить бронювання.
+      signal: AbortSignal.timeout(10_000),
     });
   } catch (e) {
     /* Мережа. Тимчасово — про це варто сказати й спробувати ще. */
@@ -124,10 +127,7 @@ export function setMyCommands(
   });
 }
 
-/* ── Оновлення ────────────────────────────────────────────────────────────
-   Два режими одним кодом. Локально публічної адреси немає, тому polling;
-   на проді Render дає HTTPS, і вебхук дешевший — не тримає процес у
-   постійному опитуванні. Вибір робить одна змінна оточення. */
+/* ── Оновлення через webhook ───────────────────────────────────────────── */
 
 export type TgUpdate = {
   update_id: number;
@@ -151,24 +151,12 @@ export type TgUpdate = {
    ніде не буде, що робить причину неочевидною. */
 const UPDATES = ['message', 'callback_query'];
 
-export function getUpdates(offset: number, timeoutSec = 25) {
-  return call<TgUpdate[]>('getUpdates', {
-    offset,
-    timeout: timeoutSec,
-    allowed_updates: UPDATES,
-  });
-}
-
 export function setWebhook(url: string, secret: string) {
   return call<boolean>('setWebhook', {
     url,
     secret_token: secret,
     allowed_updates: UPDATES,
   });
-}
-
-export function deleteWebhook() {
-  return call<boolean>('deleteWebhook', { drop_pending_updates: false });
 }
 
 /**

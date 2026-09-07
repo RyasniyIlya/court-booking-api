@@ -7,7 +7,7 @@ import { analyticsRouter } from './routes/analytics';
 import { platformRouter } from './routes/platform';
 import { payRouter } from './routes/pay';
 import { startExpirySweeper } from './lib/expire';
-import { startBot } from './lib/botRunner';
+import { startBot, telegramWebhookSecret } from './lib/botRunner';
 import { startDigestScheduler } from './lib/digestScheduler';
 import { handleUpdate } from './lib/botHandlers';
 import { paymentsSecretReady } from './lib/crypto';
@@ -74,7 +74,8 @@ app.use('/api/admin/analytics', analyticsRouter);
 app.use('/api/platform', platformRouter);
 
 /**
- * Вебхук Telegram (прод). Локально бот працює polling-ом і сюди не ходить.
+ * Вебхук Telegram. Це єдиний шлях для вхідних команд: фоновий polling
+ * вимкнений, щоб бот не створював постійний мережевий трафік.
  *
  * Секрет перевіряємо заголовком, який Telegram шле сам, — адреса вебхука
  * рано чи пізно потрапляє в логи проксі, і одного знання URL має бути
@@ -85,7 +86,7 @@ app.use('/api/platform', platformRouter);
  * похід у базу. Повільна відповідь означала б дублі повідомлень клубу.
  */
 app.post('/api/telegram/webhook', (req, res) => {
-  const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
+  const secret = telegramWebhookSecret();
 
   if (!secret || req.get('X-Telegram-Bot-Api-Secret-Token') !== secret) {
     return res.status(401).json({ error: 'UNAUTHORIZED' });
@@ -121,8 +122,8 @@ app.listen(port, () => {
   // коли гравець просто закрив вкладку і банк нічого не надішле.
   startExpirySweeper();
 
-  // Бот сам вирішує, polling чи вебхук — за наявністю TELEGRAM_WEBHOOK_URL.
-  // Без токена мовчки не вмикається: API має піднятись і без Telegram.
+  // Бот приймає команди тільки через webhook. Без публічної адреси він
+  // лишається в режимі вихідних подієвих сповіщень і нічого не опитує.
   void startBot();
 
   // Щоденне зведення власнику о DIGEST_HOUR за часом клубу. Без токена

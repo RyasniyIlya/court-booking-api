@@ -1,3 +1,4 @@
+import { planFeatures } from './plans';
 import { DateTime } from 'luxon';
 
 import { prisma } from './db';
@@ -51,7 +52,7 @@ async function recipients() {
     select: {
       id: true,
       tgChatId: true,
-      club: { select: { id: true, name: true, timezone: true } },
+      club: { select: { id: true, name: true, timezone: true, plan: true } },
     },
   });
 }
@@ -63,7 +64,7 @@ export async function runDigestTick(now: DateTime = DateTime.now()): Promise<num
   let delivered = 0;
 
   for (const p of people) {
-    if (!p.tgChatId) continue;
+    if (!p.tgChatId || !planFeatures(p.club.plan).telegram) continue;
 
     const local = now.setZone(p.club.timezone);
 

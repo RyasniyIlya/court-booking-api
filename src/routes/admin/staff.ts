@@ -3,7 +3,7 @@ import { z } from 'zod';
 import bcrypt from 'bcryptjs';
 
 import { prisma } from '../../lib/db';
-import { requireAuth, requireRole, requireLevel, param } from './shared';
+import { hasFeature, requireAuth, requireRole, requireLevel, param } from './shared';
 
 export const staffRouter = Router();
 
@@ -95,6 +95,10 @@ staffRouter.post(
       return res.status(409).json({
         error: 'EMAIL_TAKEN',
       });
+    }
+
+    if (parsed.data.role === 'TRAINER' && !await hasFeature(req.auth!.clubId, 'trainers')) {
+      return res.status(402).json({ error: 'PLAN_REQUIRED', feature: 'trainers' });
     }
 
     if (parsed.data.trainerId) {

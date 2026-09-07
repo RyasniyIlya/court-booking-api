@@ -1,76 +1,55 @@
 import {
   botReady,
-  deleteWebhook,
-  getUpdates,
+  botToken,
   setMyCommands,
   setWebhook,
-  TelegramFatal,
 } from './telegram';
-import { handleUpdate } from './botHandlers';
 import { COMMANDS_GUEST } from './botKeyboard';
+import { createHash } from 'node:crypto';
 
 /**
- * Як бот отримує повідомлення.
+ * Вхідні повідомлення бот отримує тільки через webhook.
  *
- * Два режими одним кодом:
- *   TELEGRAM_WEBHOOK_URL задано -> вебхук (прод, Render дає HTTPS);
- *   не задано                   -> long polling (локальна розробка).
+ * Раніше за відсутності TELEGRAM_WEBHOOK_URL процес переходив у long
+ * polling і безперервно викликав getUpdates. На проді одна пропущена
+ * змінна оточення перетворювалась на нескінченний цикл мережевих запитів,
+ * а при проблемах із мережею — ще й на потік однакових помилок у логах.
  *
- * Чому не завжди вебхук: на машині розробника немає публічної адреси, і
- * без тунелю бот не перевіряється взагалі. Чому не завжди polling: він
- * тримає процес у постійному опитуванні, а на Render це зайвий трафік і
- * зайва причина для рестарту.
- *
- * У Telegram два режими взаємовиключні: увімкнений вебхук просто не дає
- * викликати getUpdates. Тому polling першою дією знімає вебхук — інакше
- * після переїзду з прода на локальну машину бот мовчав би, а причина
- * лежала б на боці Telegram, а не в коді.
+ * Тепер немає запасного polling-режиму. Якщо публічний webhook не
+ * налаштований, API продовжує надсилати подієві повідомлення через
+ * sendMessage, але не опитує Telegram і не приймає команди від користувача.
  */
 
-let polling = false;
+const WEBHOOK_PATH = '/api/telegram/webhook';
 
-/** Скільки чекати після падіння мережі, щоб не забити лог за секунду */
-const RETRY_MS = 5000;
+/** Повертає публічну HTTPS-адресу webhook або null для локального API. */
+export function telegramWebhookUrl(): string | null {
+  const explicit = process.env.TELEGRAM_WEBHOOK_URL?.trim();
+  if (explicit) return explicit.replace(/\/+$/, '');
 
-async function pollLoop() {
-  let offset = 0;
+  const rawBase = process.env.PUBLIC_API_URL?.trim().replace(/\/+$/, '');
+  if (!rawBase) return null;
 
-  while (polling) {
-    let updates;
+  const base = /^https?:\/\//.test(rawBase) ? rawBase : `https://${rawBase}`;
+  if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(base)) return null;
 
-    try {
-      updates = await getUpdates(offset);
-    } catch (e) {
-      /* Невірний токен. Повторювати немає сенсу — зупиняємось і кажемо
-         причину ОДИН раз. Без цього цикл писав би те саме «Not Found»
-         кожні пʼять секунд, і справжня причина губилась би в логу. */
-      if (e instanceof TelegramFatal) {
-        polling = false;
-        console.error(`[bot] зупинено: ${e.message}`);
-        return;
-      }
-      throw e;
-    }
+  return `${base}${WEBHOOK_PATH}`;
+}
 
-    if (!updates) {
-      /* null — мережа або Telegram віддали помилку. getUpdates уже написав
-         причину в лог; тут лишається тільки не крутити цикл упритул. */
-      await new Promise((r) => setTimeout(r, RETRY_MS));
-      continue;
-    }
+/**
+ * Спільний секрет для реєстрації та приймання webhook.
+ *
+ * Явне значення має пріоритет. Запасний варіант — стабільний SHA-256 від
+ * токена: сам токен назовні не потрапляє, результат відповідає дозволеному
+ * Telegram алфавіту, а старий Render-сервіс переходить на webhook без
+ * ручного додавання нової змінної оточення.
+ */
+export function telegramWebhookSecret(): string {
+  const explicit = process.env.TELEGRAM_WEBHOOK_SECRET?.trim();
+  if (explicit) return explicit;
 
-    for (const u of updates) {
-      offset = u.update_id + 1;
-      /* Одне зламане оновлення не має зупиняти чергу: інакше повідомлення,
-         на якому впав обробник, блокувало б бота назавжди — offset не
-         зрушив би, і Telegram віддавав би його знову й знову. */
-      try {
-        await handleUpdate(u);
-      } catch (e) {
-        console.error('[bot] update failed', u.update_id, e);
-      }
-    }
-  }
+  const token = botToken();
+  return token ? createHash('sha256').update(`court-booking:${token}`).digest('hex') : '';
 }
 
 export async function startBot() {
@@ -79,51 +58,36 @@ export async function startBot() {
     return;
   }
 
-  /* Меню «/» для чатів, які ще не увійшли. Персональні списки ставляться
-     при вході; цей — те, що бачить незнайомець, і в ньому тільки вхід.
-     Через void: список команд не варте того, щоб через нього не піднявся
-     бот. */
-  void setMyCommands(COMMANDS_GUEST).catch(() => null);
+  const webhookUrl = telegramWebhookUrl();
+  const secret = telegramWebhookSecret();
 
-  const webhookUrl = process.env.TELEGRAM_WEBHOOK_URL;
-
-  if (webhookUrl) {
-    const secret = process.env.TELEGRAM_WEBHOOK_SECRET;
-    if (!secret) {
-      console.error('[bot] TELEGRAM_WEBHOOK_URL заданий без TELEGRAM_WEBHOOK_SECRET — вебхук не ставимо');
-      return;
-    }
-    try {
-      const ok = await setWebhook(webhookUrl, secret);
-      console.log(ok ? `[bot] вебхук: ${webhookUrl}` : '[bot] не вдалося поставити вебхук');
-    } catch (e) {
-      if (e instanceof TelegramFatal) {
-        console.error(`[bot] не запущено: ${e.message}`);
-        return;
-      }
-      throw e;
-    }
+  if (!webhookUrl || !secret) {
+    console.log('[bot] webhook не налаштований — працюють лише вихідні сповіщення');
     return;
   }
 
-  /* Знімати вебхук теж може впасти на невірному токені — тоді бота просто
-     не вмикаємо, а не валимо разом з ним увесь API. */
-  try {
-    await deleteWebhook();
-  } catch (e) {
-    if (e instanceof TelegramFatal) {
-      console.error(`[bot] не запущено: ${e.message}`);
-      return;
-    }
-    throw e;
+  if (!webhookUrl.startsWith('https://')) {
+    console.error('[bot] webhook має використовувати https — вхідні команди вимкнені');
+    return;
   }
 
-  polling = true;
-  void pollLoop();
-  console.log('[bot] long polling');
-}
+  try {
+    const ok = await setWebhook(webhookUrl, secret);
+    if (!ok) {
+      console.error('[bot] Telegram не прийняв webhook — вхідні команди вимкнені');
+      return;
+    }
 
-/** Для тестів і акуратного зупину */
-export function stopBot() {
-  polling = false;
+    console.log(`[bot] webhook: ${webhookUrl}`);
+
+    // Це один запит під час старту, а не фоновий цикл. Помилка меню не
+    // впливає на webhook і не повинна зупиняти API.
+    void setMyCommands(COMMANDS_GUEST).catch((e) => {
+      console.error('[bot] не вдалося оновити меню команд', e);
+    });
+  } catch (e) {
+    // Telegram не є умовою запуску API. Навіть невірний токен або тимчасова
+    // мережна помилка не повинні валити бронювання й кабінет.
+    console.error('[bot] не вдалося налаштувати webhook', e);
+  }
 }

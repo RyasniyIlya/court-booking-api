@@ -2,7 +2,7 @@ import { Router } from 'express';
 
 import { prisma } from '../../lib/db';
 import { botReady } from '../../lib/telegram';
-import { requireAuth } from './shared';
+import { requireFeature, requireAuth } from './shared';
 
 export const telegramRouter = Router();
 
@@ -35,7 +35,7 @@ function makeCode() {
  * PIN означало б, що тренер, у якого його ще не задали, не підключиться
  * взагалі — а саме тренеру бот потрібен найбільше.
  */
-telegramRouter.post('/telegram/link', requireAuth, async (req, res) => {
+telegramRouter.post('/telegram/link', requireAuth, requireFeature('telegram'), async (req, res) => {
   if (!botReady()) {
     return res.status(503).json({ error: 'BOT_NOT_CONFIGURED' });
   }
@@ -72,7 +72,7 @@ telegramRouter.post('/telegram/link', requireAuth, async (req, res) => {
  * Сам chatId назовні не віддаємо: кабінету достатньо факту, а числовий
  * ідентифікатор чужого чату — зайва річ у відповіді API.
  */
-telegramRouter.get('/telegram', requireAuth, async (req, res) => {
+telegramRouter.get('/telegram', requireAuth, requireFeature('telegram'), async (req, res) => {
   const me = await prisma.user.findUnique({
     where: { id: req.auth!.userId },
     select: { tgChatId: true },

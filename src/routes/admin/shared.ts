@@ -259,9 +259,7 @@ export function requireStaff(
  * дзвонить і каже, що нічого не змінилось. Один індексований запит по
  * clubId дешевший за цю розмову.
  *
- * Клуб без призначеного плану проходить усі перевірки: planFeatures()
- * віддає для null повний набір (див. lib/plans.ts). Це навмисно — так
- * виглядають клуби, заведені до появи планів.
+ * Без призначеного плану платні можливості закриті.
  *
  * 402 PAYMENT_REQUIRED, а не 403: 403 означає «тобі не можна за роллю», і
  * кабінет уже показує на нього «недостатньо прав». Тут інша природа —
@@ -289,6 +287,7 @@ export function requireFeature(feature: keyof PlanFeatures) {
             featTrainers: true,
             featGroups: true,
             featAnalytics: true,
+            tier: true,
           },
         },
       },
@@ -327,6 +326,7 @@ export async function hasFeature(
           featTrainers: true,
           featGroups: true,
           featAnalytics: true,
+            tier: true,
         },
       },
     },

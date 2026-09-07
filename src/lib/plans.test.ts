@@ -1,58 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { planFeatures, clubPrice, ALL_FEATURES } from './plans';
-
-/**
- * Правила плану обслуговування.
- *
- * Головне тут — перша група. Решта перевірок описує три рівні, а вона
- * захищає від зміни, після якої всі наявні клуби мовчки втратять половину
- * кабінету в мить деплою.
- */
-
-const base = { featTrainers: false, featGroups: false, featAnalytics: false };
-const team = { featTrainers: true, featGroups: true, featAnalytics: false };
-const pro = { featTrainers: true, featGroups: true, featAnalytics: true };
-
-describe('planFeatures — відсутність плану нічого не обмежує', () => {
-  /*
-   * Клуби, заведені до появи планів, мають planId = null. Якщо колись
-   * захочеться прочитати null як «нульовий тариф», обидві ці перевірки
-   * впадуть — і це саме те, чого від них треба.
-   */
-  it('null — усе відкрито', () => {
-    expect(planFeatures(null)).toEqual(ALL_FEATURES);
-  });
-
-  it('undefined — теж усе відкрито', () => {
-    expect(planFeatures(undefined)).toEqual(ALL_FEATURES);
-  });
-
-  it('усе відкрито означає саме всі три можливості', () => {
-    expect(ALL_FEATURES).toEqual({ trainers: true, groups: true, analytics: true });
-  });
-});
-
-describe('planFeatures — три рівні', () => {
-  it('перший рівень: тільки броні й віджет', () => {
-    expect(planFeatures(base)).toEqual({ trainers: false, groups: false, analytics: false });
-  });
-
-  it('другий рівень: тренери й групові, аналітики ще немає', () => {
-    expect(planFeatures(team)).toEqual({ trainers: true, groups: true, analytics: false });
-  });
-
-  it('третій рівень: усе', () => {
-    expect(planFeatures(pro)).toEqual(ALL_FEATURES);
-  });
-
-  /* Прапорці незалежні навмисно: рівень — це лише порядок у списку, а не
-     ієрархія прав. Клубу можна продати аналітику без групових, не заводячи
-     четвертий рівень між другим і третім. */
-  it('можливості не залежать одна від одної', () => {
-    const odd = { featTrainers: false, featGroups: false, featAnalytics: true };
-    expect(planFeatures(odd)).toEqual({ trainers: false, groups: false, analytics: true });
-  });
-});
+import { planFeatures, clubPrice } from './plans';
 
 describe('clubPrice — індивідуальна ціна б’є ціну плану', () => {
   const plan = { price: 900_00 };
@@ -81,4 +28,16 @@ describe('clubPrice — індивідуальна ціна б’є ціну п�
   it('своя ціна працює навіть без плану', () => {
     expect(clubPrice(null, 500_00)).toBe(500_00);
   });
+});
+
+const base = { tier: 1, featTrainers: false, featGroups: false, featAnalytics: false };
+const team = { tier: 2, featTrainers: true, featGroups: true, featAnalytics: false };
+const pro = { tier: 3, featTrainers: true, featGroups: true, featAnalytics: true };
+describe('subscription packages', () => {
+ it.each([null, undefined, base])('does not grant paid features without a paid package: %s', plan => {
+ expect(planFeatures(plan)).toEqual({trainers:false, groups:false, analytics:false, telegram:false});
+ });
+ it('team includes trainers and groups only', () => expect(planFeatures(team)).toEqual({trainers:true,groups:true,analytics:false,telegram:false}));
+ it('maximum includes Telegram', () => expect(planFeatures(pro)).toEqual({trainers:true,groups:true,analytics:true,telegram:true}));
+ it('analytics on a custom lower tier does not grant Telegram', () => expect(planFeatures({...base,featAnalytics:true}).telegram).toBe(false));
 });

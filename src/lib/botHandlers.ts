@@ -1,3 +1,4 @@
+import { planFeatures } from './plans';
 import { DateTime } from 'luxon';
 
 import { prisma } from './db';
@@ -68,7 +69,7 @@ async function userByChat(chatId: string) {
       id: true,
       role: true,
       trainerId: true,
-      club: { select: { id: true, name: true, timezone: true } },
+      club: { select: { id: true, name: true, timezone: true, plan: true } },
     },
   });
 }
@@ -140,7 +141,7 @@ async function periodMessage(
 async function linkByCode(chatId: string, code: string): Promise<string> {
   const user = await prisma.user.findUnique({
     where: { tgLinkCode: code },
-    select: { id: true, role: true, tgLinkUntil: true, club: { select: { name: true } } },
+    select: { id: true, role: true, tgLinkUntil: true, club: { select: { name: true, plan: true } } },
   });
 
   if (!user) {
@@ -150,6 +151,8 @@ async function linkByCode(chatId: string, code: string): Promise<string> {
   if (!user.tgLinkUntil || user.tgLinkUntil < new Date()) {
     return 'Код протух — вони живуть 15 хвилин. Увійдіть командою <code>/login пошта пароль</code>.';
   }
+
+  if (!planFeatures(user.club.plan).telegram) return 'Telegram-бот доступний лише в максимальному пакеті.';
 
   await prisma.user.updateMany({ where: { tgChatId: chatId }, data: { tgChatId: null } });
   await prisma.user.update({
@@ -184,7 +187,7 @@ async function trainerToday(trainerId: string, timezone: string, clubName: strin
       endTime: true,
       customerName: true,
       status: true,
-      court: { select: { name: true } },
+      court: { select: { name: true, plan: true } },
     },
   });
 
@@ -244,6 +247,11 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
 
   if (!me) {
     await answerCallback(q.id, 'Спершу увійдіть: /login пошта пароль');
+    return;
+  }
+
+  if (!planFeatures(me.club.plan).telegram) {
+    await answerCallback(q.id, 'Telegram-бот доступний лише в максимальному пакеті.');
     return;
   }
 
@@ -386,6 +394,11 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
       return;
     }
     await sendMessage(chatId, HELP);
+    return;
+  }
+
+  if (cmd !== '/logout' && !planFeatures(me.club.plan).telegram) {
+    await sendMessage(chatId, 'Telegram-бот доступний лише в максимальному пакеті.', removeKeyboard);
     return;
   }
 

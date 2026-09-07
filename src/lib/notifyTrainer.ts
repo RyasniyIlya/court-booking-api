@@ -1,3 +1,4 @@
+import { planFeatures } from './plans';
 import { DateTime } from 'luxon';
 
 import { prisma } from './db';
@@ -31,10 +32,10 @@ export async function notifyTrainerBooked(params: {
      який кабінетом не користується взагалі. */
   const account = await prisma.user.findFirst({
     where: { trainerId, tgChatId: { not: null } },
-    select: { tgChatId: true, club: { select: { timezone: true } } },
+    select: { tgChatId: true, club: { select: { timezone: true, plan: true } } },
   });
 
-  if (!account?.tgChatId) return;
+  if (!account?.tgChatId || !planFeatures(account.club.plan).telegram) return;
 
   const tz = account.club.timezone;
   const when = `${DateTime.fromJSDate(startTime).setZone(tz).toFormat('dd.MM HH:mm')}–`

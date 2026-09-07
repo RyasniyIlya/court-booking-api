@@ -1,3 +1,4 @@
+import { planFeatures } from './plans';
 import bcrypt from 'bcryptjs';
 
 import { prisma } from './db';
@@ -31,9 +32,8 @@ const LOCK_MS = 15 * 60_000;
 /**
  * Лічильник живе в памʼяті процесу, а не в базі.
  *
- * Причина проста: у нас один процес API (бот в іншому впав би на
- * getUpdates — Telegram віддає оновлення лише одному клієнту), тож
- * загальний лічильник тут той самий, що й у базі, але без міграції і без
+ * Причина проста: у нас один процес API, тож загальний лічильник тут той
+ * самий, що й у базі, але без міграції і без
  * походу в Postgres на кожну спробу входу. Рестарт скидає блокування —
  * це прийнятно: перебір пароля рестартом сервера не прискорити.
  */
@@ -122,7 +122,7 @@ export async function loginByPassword(
       id: true,
       role: true,
       passwordHash: true,
-      club: { select: { name: true } },
+      club: { select: { name: true, plan: true } },
     },
   });
 
@@ -140,6 +140,7 @@ export async function loginByPassword(
   }
 
   clearFails(chatId);
+  if (!planFeatures(user.club.plan).telegram) return 'Telegram-бот доступний лише в максимальному пакеті.';
 
   /* Чат міг належати іншій людині клубу. Відвʼязуємо старого власника
      мовчки: unique-індекс на tgChatId інакше просто впаде, і людина

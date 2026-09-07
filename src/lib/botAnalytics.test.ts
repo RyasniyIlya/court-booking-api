@@ -30,7 +30,7 @@ it('does not grant a deleted club access via the legacy no-plan fallback', async
   expect((await botAnalytics('missing', 'today'))[0]).toContain('недоступна');
 });
 it('scopes all reads to the club and does not double-count group payments as revenue', async () => {
-  prisma.club.findUnique.mockResolvedValue({ isActive: true, name: 'Club', timezone: 'Europe/Kyiv', plan: null, createdAt: new Date('2020-01-01'), hours: [] });
+  prisma.club.findUnique.mockResolvedValue({ isActive: true, name: 'Club', timezone: 'Europe/Kyiv', plan: { tier: 3, featAnalytics: true }, createdAt: new Date('2020-01-01'), hours: [] });
   prisma.court.findMany.mockResolvedValue([{ id: 'court', name: 'Court', isActive: true }]);
   prisma.block.findMany.mockResolvedValue([]);
   prisma.booking.findMany.mockResolvedValue([{ courtId: 'court', startTime: new Date('2026-09-01T09:00:00Z'), endTime: new Date('2026-09-01T10:00:00Z'), status: 'CONFIRMED', priceTotal: 10500, payment: null, seats: [{ payment: { status: 'PAID' } }] }]);
