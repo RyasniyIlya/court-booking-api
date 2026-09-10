@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
-import { requireAuth, requireStaff, requireLevel } from './shared';
+import { requireAuth, requireStaff } from './shared';
 
 export const hoursRouter = Router();
 
@@ -33,7 +33,6 @@ hoursRouter.put(
   '/hours',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .array(
@@ -101,4 +100,3 @@ hoursRouter.put(
     });
   },
 );
-

@@ -160,11 +160,17 @@ describe('POST /clubs/:slug/bookings/:id/join', () => {
     expect(res.body.error).toBe('GROUP_CANCELLED');
   });
 
-  it('до початку менше за leadTime — 400 TOO_LATE', async () => {
+  it('за 15 хвилин до початку запис уже закритий', async () => {
     tx.$queryRaw.mockResolvedValue(groupRow({ startTime: new Date(Date.now() + 10 * 60_000) }));
     const res = await join();
-    expect(res.status).toBe(400);
-    expect(res.body.error).toBe('TOO_LATE');
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('REGISTRATION_CLOSED');
+  });
+
+  it('раніше ніж за 15 хвилин запис ще відкритий незалежно від leadTime корту', async () => {
+    tx.$queryRaw.mockResolvedValue(groupRow({ startTime: new Date(Date.now() + 16 * 60_000) }));
+    const res = await join();
+    expect(res.status).toBe(201);
   });
 
   it('заняття чужого клубу не видно — 404, а не 403', async () => {

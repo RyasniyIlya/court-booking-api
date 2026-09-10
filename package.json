@@ -1,6 +1,6 @@
 {
   "name": "court-booking-api",
-  "version": "2.5.0",
+  "version": "2.2.0",
   "description": "",
   "main": "index.js",
   "scripts": {
@@ -12,7 +12,7 @@
     "club:new": "tsx scripts/create-club.ts",
     "plans:init": "tsx scripts/plans-init.ts",
     "generate": "prisma generate",
-    "test": "vitest run",
+    "test": "vitest run --pool=threads",
     "test:watch": "vitest"
   },
   "keywords": [],

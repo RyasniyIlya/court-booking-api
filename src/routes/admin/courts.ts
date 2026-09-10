@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
-import { requireAuth, requireStaff, requireLevel, param } from './shared';
+import { requireAuth, requireStaff, param } from './shared';
 import { mountNoteRoutes } from './notes';
 
 export const courtsRouter = Router();
@@ -44,7 +44,6 @@ courtsRouter.post(
   '/courts',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .object({
@@ -107,7 +106,6 @@ courtsRouter.patch(
   '/courts/:id',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed =
       z.object({
@@ -190,7 +188,6 @@ courtsRouter.delete(
   '/courts/:id',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const court =
       await prisma.court.findFirst({
@@ -271,4 +268,3 @@ mountNoteRoutes(courtsRouter, {
   ratingAllowed: true,
   readRequiresStaff: true,
 });
-

@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
 import type { NoteSubject } from '@prisma/client';
-import { requireAuth, requireStaff, requireLevel, param } from './shared';
+import { requireAuth, requireStaff, param } from './shared';
 
 /**
  * Один рушій нотаток на дві сутності — тренер і корт. Раніше окремий
@@ -15,8 +15,8 @@ import { requireAuth, requireStaff, requireLevel, param } from './shared';
  * шляхом і своєю перевіркою "сутність належить клубу".
  *
  * Права й форма запису однакові для обох: журнал, а не чернетка — пише
- * персонал (OWNER/ADMIN) під PIN, видаляє автор або власник. Читання
- * відкрите персоналу завжди; для тренера про самого себе — теж, без PIN.
+ * персонал (OWNER/ADMIN) після входу, видаляє автор або власник. Читання
+ * відкрите персоналу завжди; для тренера про самого себе — теж.
  */
 
 type NoteScope = { trainerId: string | null; courtId: string | null };
@@ -96,7 +96,6 @@ export function mountNoteRoutes(
     opts.path,
     requireAuth,
     requireStaff,
-    requireLevel(2),
     async (req, res) => {
       const parsed = bodySchema.safeParse(req.body);
 
@@ -141,7 +140,6 @@ export function mountNoteRoutes(
     `${opts.path}/:noteId`,
     requireAuth,
     requireStaff,
-    requireLevel(2),
     async (req, res) => {
       const id = param(req, 'id');
       const noteId = param(req, 'noteId');

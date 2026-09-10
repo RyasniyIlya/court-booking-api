@@ -3,7 +3,7 @@ import { z } from 'zod';
 import bcrypt from 'bcryptjs';
 
 import { prisma } from '../../lib/db';
-import { hasFeature, requireAuth, requireRole, requireLevel, param } from './shared';
+import { hasFeature, requireAuth, requireRole, param } from './shared';
 
 export const staffRouter = Router();
 
@@ -48,9 +48,6 @@ staffRouter.get(
  * у себе. Інакше "майже нарівні" перестало б мати межу — досить завести
  * собі другий ADMIN-акаунт, і жодна дія вже не прив'язана до людини.
  *
- * LEVEL 2: новий акаунт у кабінеті — дія не менш чутлива, ніж перейменувати
- * корт, а той давно за PIN-ом.
- *
  * TRAINER без trainerId зайти зможе, але /bookings йому завжди
  * поверне порожній список — прив'язку до картки тренера можна
  * додати пізніше через PATCH /trainers/:id чи окремий endpoint.
@@ -59,19 +56,13 @@ staffRouter.post(
   '/staff',
   requireAuth,
   requireRole('OWNER', 'ADMIN'),
-  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .object({
         email: z.string().trim().toLowerCase().email(),
-        password: z.string().min(8).max(200),
+        password: z.string().min(8).max(128),
         role: z.enum(['ADMIN', 'TRAINER']),
         trainerId: z.string().uuid().nullable().optional(),
-        // Без цього новий співробітник заходив на LEVEL 1 і назавжди лишався
-        // там: /elevate вимагає pinModerHash, а поставити його самому можна
-        // тільки з LEVEL 2. Власник задає PIN одразу тут же, як і собі при
-        // реєстрації клубу — той самий патерн, той самий /elevate потім.
-        moderatorPin: z.string().regex(/^\d{4,8}$/).optional(),
       })
       .safeParse(req.body);
 
@@ -116,11 +107,7 @@ staffRouter.post(
       }
     }
 
-    const passwordHash = await bcrypt.hash(parsed.data.password, 10);
-
-    const pinModerHash = parsed.data.moderatorPin
-      ? await bcrypt.hash(parsed.data.moderatorPin, 12)
-      : null;
+    const passwordHash = await bcrypt.hash(parsed.data.password, 12);
 
     const user = await prisma.user.create({
       data: {
@@ -129,7 +116,6 @@ staffRouter.post(
         passwordHash,
         role: parsed.data.role,
         trainerId: parsed.data.trainerId ?? null,
-        pinModerHash,
       },
       select: {
         id: true,
@@ -156,7 +142,6 @@ staffRouter.delete(
   '/staff/:id',
   requireAuth,
   requireRole('OWNER', 'ADMIN'),
-  requireLevel(2),
   async (req, res) => {
     const id = param(req, 'id');
 

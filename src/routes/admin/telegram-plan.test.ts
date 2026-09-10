@@ -9,7 +9,7 @@ vi.mock('../../lib/authSecret', () => ({ JWT_SECRET: 'test-subscription-secret' 
 vi.mock('../../lib/telegram', () => ({ botReady: () => true }));
 const { telegramRouter } = await import('./telegram');
 const app = express(); app.use(express.json()); app.use(telegramRouter);
-const token = (role: string) => jwt.sign({userId:'u',clubId:'c',role,level:1,trainerId:role==='TRAINER'?'t':null}, 'test-subscription-secret');
+const token = (role: string) => jwt.sign({userId:'u',clubId:'c',role,trainerId:role==='TRAINER'?'t':null}, 'test-subscription-secret');
 beforeEach(() => { vi.clearAllMocks(); mocks.update.mockResolvedValue({}); mocks.user.mockResolvedValue({tgChatId:'123'}); });
 for (const role of ['OWNER','ADMIN','TRAINER']) {
  it.each([null,1,2,3])(role + ' Telegram API tier %s', async tier => {

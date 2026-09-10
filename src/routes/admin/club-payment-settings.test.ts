@@ -7,9 +7,9 @@ vi.mock('../../lib/payments', () => ({ KNOWN_PROVIDERS: ['mono', 'liqpay', 'mock
 vi.mock('../../lib/crypto', () => ({ encryptSecret: () => 'encrypted', paymentsSecretReady: () => true }));
 vi.mock('../public', () => ({ logoSrcOf: () => null }));
 vi.mock('./shared', () => ({
-  requireAuth: (req: { auth?: unknown }, _res: unknown, next: () => void) => { req.auth = { clubId: 'club', level: 3 }; next(); },
+  requireAuth: (req: { auth?: unknown }, _res: unknown, next: () => void) => { req.auth = { clubId: 'club', role: 'OWNER' }; next(); },
   requireStaff: (_req: unknown, _res: unknown, next: () => void) => next(),
-  requireLevel: () => (_req: unknown, _res: unknown, next: () => void) => next(),
+  requireRole: () => (_req: unknown, _res: unknown, next: () => void) => next(),
 }));
 const { clubRouter } = await import('./club');
 const app = express().use(express.json()).use(clubRouter);

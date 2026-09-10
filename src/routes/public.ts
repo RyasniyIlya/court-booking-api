@@ -5,7 +5,6 @@ import { DateTime } from 'luxon';
 import { prisma, isSlotTakenError, notifyClub } from '../lib/db';
 import { buildSlots, isAlignedToGrid, type Interval } from '../lib/slots';
 import { normalizePhone } from '../lib/phone';
-import bcrypt from 'bcryptjs';
 import { findOrCreateCustomer, getActivePass } from '../lib/customers';
 import { providerFor, publicBase } from '../lib/payments';
 import { clubBilling } from '../lib/billing';
@@ -14,9 +13,9 @@ import { playerLevel } from '../lib/playerLevel';
 import { clubLadder, ladderWithMe } from '../lib/clubLadder';
 import { notifyTrainerBooked } from '../lib/notifyTrainer';
 import { isTrainerAvailable } from '../lib/trainerAvailability';
-import {
-  signCustomerToken, verifyCustomerToken, verifyCustomerPin, hashPinLookup, isPinTakenError,
-} from '../lib/customerAuth';
+import { signCustomerToken, verifyCustomerToken } from '../lib/customerAuth';
+import { birthDateText, birthDateValue, dateOnly } from '../lib/birthday';
+import { isRegistrationOpen, registrationClosesAt } from '../lib/registrationCutoff';
 
 export const publicRouter = Router();
 
@@ -47,7 +46,7 @@ async function loadClub(slug: string) {
       trainers: {
         where: { isActive: true },
         orderBy: { sortOrder: 'asc' },
-        include: { hours: true },
+        include: { hours: true, exceptions: { where: { date: { gte: new Date(Date.now() - 86_400_000) } } } },
       },
     },
   });
@@ -230,7 +229,7 @@ publicRouter.get('/clubs/:slug/trainers', async (req, res) => {
     pricePerHour: t.pricePerHour,
     note: t.note,
     available: !busy.has(t.id) && (!range || isTrainerAvailable(
-      t.hours, range.start, range.end, club.timezone,
+      t.hours, range.start, range.end, club.timezone, t.exceptions,
     )),
   })));
 });
@@ -370,6 +369,8 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
             endLabel: DateTime.fromJSDate(g.endTime)
               .setZone(club.timezone).toFormat('HH:mm'),
             startsHere: g.startTime.getTime() === sMs,
+            registrationOpen: isRegistrationOpen(g.startTime, now.getTime()),
+            registrationClosesAt: registrationClosesAt(g.startTime).toISOString(),
           },
         };
       }),
@@ -386,6 +387,7 @@ const bookingSchema = z.object({
   end: z.string().datetime({ offset: true }),
   customerName: z.string().trim().min(2).max(80),
   customerPhone: z.string().trim().regex(/^\+?[0-9\s()-]{9,20}$/, 'invalid phone'),
+  customerEmail: z.string().trim().toLowerCase().email().max(254).optional(),
   comment: z.string().trim().max(300).optional(),
   /** Тренер на заняття. null або відсутнє — грають самі. */
   trainerId: z.string().uuid().nullable().optional(),
@@ -397,12 +399,7 @@ const bookingSchema = z.object({
    * якщо клуб того вимагає, і не платить, якщо оплати в клубі немає.
    */
   payChoice: z.enum(['online', 'onsite']).optional(),
-  /**
-   * Необов'язково: гравець заодно заводить собі кабінет — наступного разу
-   * не вводити ім'я й телефон, а увійти по цьому PIN. Без окремого екрана
-   * реєстрації, без SMS — просто галочка "запам'ятати мене" у формі броні.
-   */
-  setPin: z.string().regex(/^\d{4,8}$/).optional(),
+  birthDate: birthDateText,
 });
 
 /**
@@ -483,27 +480,20 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     clubId: club.id,
     name: body.customerName,
     rawPhone: body.customerPhone,
+    email: body.customerEmail,
+    birthDate: body.birthDate ? birthDateValue(body.birthDate) : undefined,
   });
   if (customer?.isBlocked) return res.status(403).json({ error: 'CUSTOMER_BLOCKED' });
-
-  let customerToken: string | undefined;
-  let pinTaken = false;
-  if (customer && body.setPin) {
-    const pinHash = await bcrypt.hash(body.setPin, 12);
-    const pinLookupHash = hashPinLookup(club.id, body.setPin);
-    try {
-      await prisma.customer.update({
-        where: { id: customer.id },
-        data: { pinHash, pinLookupHash, pinFails: 0, pinLockedUntil: null },
-      });
-      customerToken = signCustomerToken({ customerId: customer.id, clubId: club.id });
-    } catch (e) {
-      // Цей PIN уже чийсь у клубі — бронь усе одно має пройти, просто без
-      // кабінету. Гравець спробує інший PIN наступного разу.
-      if (!isPinTakenError(e)) throw e;
-      pinTaken = true;
-    }
+  if (customer && dateOnly(customer.birthDate) !== body.birthDate) {
+    return res.status(403).json({ error: 'BIRTH_DATE_MISMATCH' });
   }
+
+  // Після першої броні кабінет відкривається одразу. Для наявної картки
+  // токен видаємо лише коли дата збігається: одного номера телефону для
+  // доступу до історії та бонусів недостатньо.
+  const customerToken = customer
+    ? signCustomerToken({ customerId: customer.id, clubId: club.id })
+    : undefined;
 
   const minutes = (end.getTime() - start.getTime()) / 60_000;
   const courtPrice = Math.round((court.pricePerHour * minutes) / 60);
@@ -519,7 +509,7 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     trainer = club.trainers.find((t) => t.id === body.trainerId && t.isActive) ?? null;
     if (!trainer) return res.status(404).json({ error: 'TRAINER_NOT_FOUND' });
 
-    if (!isTrainerAvailable(trainer.hours, start, end, club.timezone)) {
+    if (!isTrainerAvailable(trainer.hours, start, end, club.timezone, trainer.exceptions)) {
       return res.status(409).json({ error: 'TRAINER_UNAVAILABLE' });
     }
 
@@ -537,7 +527,8 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     trainerPrice = Math.round((trainer.pricePerHour * minutes) / 60);
   }
 
-  const priceTotal = courtPrice + trainerPrice;
+  const priceBeforeDiscount = courtPrice + trainerPrice;
+  const priceTotal = Math.round(priceBeforeDiscount * (100 - (customer?.discountPercent ?? 0)) / 100);
 
   // Три стани клуба: оплати немає (prepayEnabled=false), оплата обов'язкова
   // (prepayRequired=true, типово) — і новий: гравець сам обирає при броні.
@@ -572,7 +563,9 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
         priceTotal,
         trainerId: trainer?.id ?? null,
         trainerPrice,
-        status: needsPay ? 'PENDING' : (club.autoConfirm ? 'CONFIRMED' : 'PENDING'),
+        /* Платна бронь підтверджується тільки фактом повної оплати.
+           Обіцянка заплатити на місці лишає її PENDING без таймера. */
+        status: priceTotal > 0 ? 'PENDING' : (club.autoConfirm ? 'CONFIRMED' : 'PENDING'),
         expiresAt,
         source: 'WIDGET',
       },
@@ -619,7 +612,6 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
         payUrl: invoice.pageUrl,
         expiresAt: expiresAt!.toISOString(),
         customerToken,
-        pinTaken,
       });
     } catch (e) {
       // Рахунок не виставився — тримати слот немає підстав, віддаємо назад одразу.
@@ -662,7 +654,6 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     cancelToken: booking.cancelToken,
     priceTotal,
     customerToken,
-    pinTaken,
   });
 });
 
@@ -776,8 +767,8 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
       if (b.capacity == null) throw new HttpError(400, 'NOT_A_GROUP');
       if (!BUSY_STATUSES.includes(b.status as never)) throw new HttpError(409, 'GROUP_CANCELLED');
 
-      if (b.startTime.getTime() < Date.now() + club.leadTimeMinutes * 60_000) {
-        throw new HttpError(400, 'TOO_LATE');
+      if (!isRegistrationOpen(b.startTime)) {
+        throw new HttpError(409, 'REGISTRATION_CLOSED');
       }
 
       /* PENDING рахується зайнятим нарівні з BOOKED: поки один платить,
@@ -796,7 +787,7 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
       });
       if (already) throw new HttpError(409, 'ALREADY_JOINED');
 
-      const price = b.pricePerSeat ?? 0;
+      const price = Math.round((b.pricePerSeat ?? 0) * (100 - (customer?.discountPercent ?? 0)) / 100);
       const needsPay = Boolean(provider) && price > 0;
 
       const created = await tx.bookingSeat.create({
@@ -1006,12 +997,11 @@ const customerLoginLimiter = rateLimit({
 /**
  * POST /api/public/clubs/:slug/customer/login
  *
- * Телефон + PIN, заведений раніше через setPin при броні. Немає картки або
- * немає PIN — PIN_NOT_SET: віджет тоді просто показує звичайну форму.
+ * Телефон + дата народження з картки клієнта.
  */
 publicRouter.post('/clubs/:slug/customer/login', customerLoginLimiter, async (req, res) => {
   const parsed = z
-    .object({ phone: z.string().trim(), pin: z.string().regex(/^\d{4,8}$/) })
+    .object({ phone: z.string().trim(), birthDate: birthDateText })
     .safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
@@ -1025,22 +1015,17 @@ publicRouter.post('/clubs/:slug/customer/login', customerLoginLimiter, async (re
   const customer = await prisma.customer.findUnique({
     where: { clubId_phone: { clubId: club.id, phone: phone.e164 } },
   });
-  if (!customer) return res.status(404).json({ error: 'PIN_NOT_SET' });
-
-  const result = await verifyCustomerPin(customer.id, parsed.data.pin);
-  if (!result.ok) {
-    const status = result.reason === 'LOCKED' ? 423 : result.reason === 'NOT_SET' ? 404 : 403;
-    const error =
-      result.reason === 'LOCKED' ? 'PIN_LOCKED'
-        : result.reason === 'NOT_SET' ? 'PIN_NOT_SET'
-          : 'INVALID_PIN';
-    return res.status(status).json({ error });
+  if (!customer) return res.status(404).json({ error: 'CUSTOMER_NOT_FOUND' });
+  if (dateOnly(customer.birthDate) !== parsed.data.birthDate) {
+    return res.status(403).json({ error: 'INVALID_CREDENTIALS' });
   }
 
   res.json({
     token: signCustomerToken({ customerId: customer.id, clubId: club.id }),
     name: customer.name,
     phone: customer.phone,
+    email: customer.email,
+    birthDate: dateOnly(customer.birthDate),
   });
 });
 
@@ -1124,6 +1109,7 @@ publicRouter.get('/customer/me', async (req, res) => {
         startTime: { lte: now },
       },
       select: {
+        id: true,
         startTime: true,
         endTime: true,
         priceTotal: true,
@@ -1139,6 +1125,7 @@ publicRouter.get('/customer/me', async (req, res) => {
         booking: { status: 'CONFIRMED', startTime: { lte: now } },
       },
       select: {
+        id: true,
         price: true,
         booking: {
           select: {
@@ -1209,6 +1196,10 @@ publicRouter.get('/customer/me', async (req, res) => {
   res.json({
     name: customer.name,
     phone: customer.phone,
+    email: customer.email,
+    birthDate: dateOnly(customer.birthDate),
+    discountPercent: customer.discountPercent,
+    bonusBalance: customer.bonusBalance,
     stats: publicStats,
     level,
     /* passId гравцю ні до чого: скасувати чи змінити абонемент він не
@@ -1254,6 +1245,24 @@ publicRouter.get('/customer/me', async (req, res) => {
       price: s.price,
       canCancel: canCancelNow(s.booking.startTime, cutoff),
     })),
+    history: [
+      ...pastBookings.map((b) => ({
+        id: `booking:${b.id}`,
+        kind: 'court' as const,
+        start: b.startTime.toISOString(),
+        end: b.endTime.toISOString(),
+        courtName: b.court?.name ?? 'Корт',
+        trainerName: b.trainer?.name ?? null,
+      })),
+      ...pastSeats.map((s) => ({
+        id: `seat:${s.id}`,
+        kind: 'group' as const,
+        start: s.booking.startTime.toISOString(),
+        end: s.booking.endTime.toISOString(),
+        courtName: s.booking.court?.name ?? 'Корт',
+        trainerName: s.booking.trainer?.name ?? null,
+      })),
+    ].sort((a, b) => b.start.localeCompare(a.start)),
   });
 });
 

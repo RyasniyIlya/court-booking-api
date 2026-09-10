@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma, isSlotTakenError } from '../../lib/db';
-import { requireAuth, requireStaff, requireLevel, param } from './shared';
+import { requireAuth, requireStaff, param } from './shared';
 
 export const blocksRouter = Router();
 
@@ -73,7 +73,6 @@ blocksRouter.post(
   '/blocks',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .object({
@@ -185,7 +184,6 @@ blocksRouter.delete(
   '/blocks/:id',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed =
       z.string()
@@ -229,4 +227,3 @@ blocksRouter.delete(
     });
   },
 );
-

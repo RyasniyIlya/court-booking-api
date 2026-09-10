@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
 import { getActivePass } from '../../lib/customers';
-import { requireAuth, requireStaff, requireLevel, param } from './shared';
+import { requireAuth, requireStaff, param } from './shared';
 
 /**
  * Абонементи клубу: тарифи й видача.
@@ -68,7 +68,6 @@ passesRouter.post(
   '/pass-plans',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed = planSchema.safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
@@ -96,7 +95,6 @@ passesRouter.patch(
   '/pass-plans/:id',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed = planSchema.partial().safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
@@ -130,7 +128,6 @@ passesRouter.delete(
   '/pass-plans/:id',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const plan = await prisma.passPlan.findFirst({
       where: { id: param(req, 'id'), clubId: req.auth!.clubId },
@@ -215,7 +212,6 @@ passesRouter.post(
   '/passes/:id/revoke',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const pass = await prisma.pass.findFirst({
       where: { id: param(req, 'id'), clubId: req.auth!.clubId },

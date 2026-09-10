@@ -47,19 +47,21 @@ enum UserRole {
 
 /// Спортивний клуб = один тенант SaaS
 model Club {
-  id       String  @id @default(uuid()) @db.Uuid
-  name     String
-  slug     String  @unique
+  settlementSettings Json                 @default("{}")
+  ledgerEntries      BookingLedgerEntry[]
+  id                 String               @id @default(uuid()) @db.Uuid
+  name               String
+  slug               String               @unique
   /// IANA-таймзона, напр. "Europe/Kyiv". Уся конвертація рахується від неї.
-  timezone String  @default("Europe/Kyiv")
+  timezone           String               @default("Europe/Kyiv")
   /// Телефон адміністратора. Показується у шапці віджета посиланням tel:
-  phone    String?
+  phone              String?
   /// Адреса клубу для шапки віджета: "Київ, вул. Хрещатик, 1"
-  address  String?
+  address            String?
   /// Логотип для шапки віджета. Абсолютний https-URL на чужому хостингу
   /// Зовнішнє посилання на логотип. Лишилось для клубів, у яких файл уже
   /// лежить на власному сайті — вставити адресу швидше, ніж вивантажувати.
-  logoUrl  String?
+  logoUrl            String?
 
   // ── Завантажений логотип ─────────────────────────────────────────────
   // Байти в базі, а не файл на диску: у Render файлова система ефемерна,
@@ -167,6 +169,11 @@ model Club {
   /// окремий план у каталозі означає каталог із двадцяти рядків.
   planPrice Int?
 
+  /// Мережа точок одного бізнесу. Клуб і далі лишається окремою точкою зі
+  /// своїми кортами та акаунтами; група потрібна оператору для масових дій.
+  groupId String?    @db.Uuid
+  group   ClubGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -186,6 +193,18 @@ model Club {
   /// Коли ми підтвердили клуб після реєстрації. null = чекає на дзвінок/оплату.
   /// Впливає на віддачу даних для публічного віджета.
   approvedAt    DateTime?
+
+  @@index([groupId])
+}
+
+/// Кілька клубів-точок, якими оператор керує як однією мережею.
+model ClubGroup {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  note      String?
+  clubs     Club[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 enum ExpenseCategory {
@@ -355,6 +374,7 @@ model Trainer {
   staffAccounts User[]
   notes         Note[]
   hours         TrainerHours[]
+  exceptions    TrainerScheduleException[]
 
   @@index([clubId, isActive])
 }
@@ -380,6 +400,32 @@ model TrainerHours {
   @@index([trainerId])
 }
 
+/// Виняток на конкретну календарну дату: відпустка, вихідний або інші години.
+/// intervals — робочі або недоступні інтервали залежно від kind.
+model TrainerScheduleException {
+  id        String   @id @default(uuid()) @db.Uuid
+  trainerId String   @db.Uuid
+  trainer   Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  date      DateTime @db.Date
+  isClosed  Boolean  @default(false)
+  kind      TrainerScheduleExceptionKind @default(WORKING)
+  intervals Json     @default("[]")
+  note      String?
+  updatedBy String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([trainerId, date])
+  @@index([trainerId, date])
+}
+
+enum TrainerScheduleExceptionKind {
+  WORKING
+  UNAVAILABLE
+  DAY_OFF
+  VACATION
+}
+
 enum NoteSubject {
   TRAINER
   COURT
@@ -396,7 +442,7 @@ enum NoteSubject {
 ///
 /// Не плутати з Trainer.note чи майбутнім Court.note — ті одні й публічні,
 /// летять у віджет як категорія («дитяча група», «ґрунт»). Тут — приватний
-/// журнал персоналу: пишуть OWNER/ADMIN під PIN, старі записи не
+/// журнал персоналу: пишуть OWNER/ADMIN після входу, старі записи не
 /// переписуються. Сам тренер свою справу тільки читає.
 model Note {
   id      String      @id @default(uuid()) @db.Uuid
@@ -462,12 +508,17 @@ model Court {
 }
 
 model Booking {
-  id      String @id @default(uuid()) @db.Uuid
+  paymentPlan   Json                 @default("{}")
+  createdBy     String?
+  confirmedBy   String?
+  confirmedAt   DateTime?
+  ledgerEntries BookingLedgerEntry[]
+  id            String               @id @default(uuid()) @db.Uuid
   /// Денормалізовано навмисно: усі адмінські вибірки йдуть по клубу
-  clubId  String @db.Uuid
-  club    Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
-  courtId String @db.Uuid
-  court   Court  @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  clubId        String               @db.Uuid
+  club          Club                 @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  courtId       String               @db.Uuid
+  court         Court                @relation(fields: [courtId], references: [id], onDelete: Cascade)
 
   /// Копія на момент броні — імʼя в картці клієнта може змінитись пізніше.
   ///
@@ -570,9 +621,10 @@ enum SeatStatus {
 /// хто записався й передумав, інакше «нас було восьмеро, чому порожньо»
 /// не буде на що відповісти.
 model BookingSeat {
-  id        String  @id @default(uuid()) @db.Uuid
-  bookingId String  @db.Uuid
-  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  ledgerEntries BookingLedgerEntry[]
+  id            String               @id @default(uuid()) @db.Uuid
+  bookingId     String               @db.Uuid
+  booking       Booking              @relation(fields: [bookingId], references: [id], onDelete: Cascade)
 
   /// Картка клієнта — та сама, що й у звичайній броні. Nullable з тієї ж
   /// причини: історія важливіша за звʼязок, який може зникнути.
@@ -626,15 +678,16 @@ model BookingSeat {
 /// зберігає обидві: NULL у Postgres не конфліктує з NULL, тому @unique на
 /// кожній працює рівно там, де вона потрібна.
 model Payment {
-  id        String       @id @default(uuid()) @db.Uuid
-  clubId    String       @db.Uuid
-  club      Club         @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  refundRequestedBy String?
+  id                String       @id @default(uuid()) @db.Uuid
+  clubId            String       @db.Uuid
+  club              Club         @relation(fields: [clubId], references: [id], onDelete: Cascade)
   /// Приватна бронь корту. null — платять за місце в групі.
-  bookingId String?      @unique @db.Uuid
-  booking   Booking?     @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  bookingId         String?      @unique @db.Uuid
+  booking           Booking?     @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   /// Місце в груповому занятті. null — платять за бронь корту.
-  seatId    String?      @unique @db.Uuid
-  seat      BookingSeat? @relation(fields: [seatId], references: [id], onDelete: Cascade)
+  seatId            String?      @unique @db.Uuid
+  seat              BookingSeat? @relation(fields: [seatId], references: [id], onDelete: Cascade)
 
   /// 'mono' | 'mock'
   provider    String
@@ -695,15 +748,12 @@ model User {
   clubId       String   @db.Uuid
   club         Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
   email        String   @unique
+  /// Єдиний пароль акаунта, bcrypt.
   passwordHash String
   role         UserRole @default(OWNER)
   createdAt    DateTime @default(now())
-  pinModerHash String?
 
-  /// ПІН режиму власника (рівень 3). bcrypt.
-  pinOwnerHash String?
-
-  /// Захист від перебору: 4 цифри підбираються за хвилини.
+  /// Захист від перебору пароля.
   pinFails       Int       @default(0)
   pinLockedUntil DateTime?
 
@@ -746,13 +796,20 @@ enum PassType {
 /// Картка учасника клубу. Створюється автоматично при першій броні —
 /// жодної реєстрації з боку клієнта не потрібно, ідентифікатор = телефон.
 model Customer {
-  id     String @id @default(uuid()) @db.Uuid
-  clubId String @db.Uuid
-  club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  bonusBalance    Int                  @default(0)
+  birthDate       DateTime?            @db.Date
+  discountPercent Int                  @default(0)
+  ledgerEntries   BookingLedgerEntry[]
+  rewards         CustomerReward[]
+  id              String               @id @default(uuid()) @db.Uuid
+  clubId          String               @db.Uuid
+  club            Club                 @relation(fields: [clubId], references: [id], onDelete: Cascade)
 
   name      String
   /// Нормалізований E.164, напр. +380671234567
   phone     String
+  /// Контакт для квитанцій і повідомлень клубу
+  email     String?
   /// Останні 7 цифр — пошук на ресепшені за 4+ цифрами
   phoneTail String
 
@@ -772,20 +829,6 @@ model Customer {
   /// руками не ставиться. Мітка — те, чого система знати не може.
   tags String[] @default([])
 
-  /// Особистий кабінет гравця: телефон + PIN, той самий патерн, що й PIN
-  /// персоналу в User. Не пароль і не SMS-код — жодного зовнішнього
-  /// провайдера відправки не додаємо. null = кабінет ще не заведено,
-  /// гравець просто вводить ім'я й телефон щоразу, як і раніше.
-  pinHash        String?
-  pinFails       Int       @default(0)
-  pinLockedUntil DateTime?
-  /// HMAC(PIN) — швидкий детермінований відбиток лише для перевірки
-  /// унікальності PIN у межах клубу. НЕ використовується для входу (для
-  /// цього bcrypt-порівняння з pinHash) — сам по собі він нічого не пускає,
-  /// тільки дозволяє БД миттєво відхилити дубль замість перебору bcrypt
-  /// по всіх клієнтах клубу.
-  pinLookupHash  String?
-
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -798,10 +841,8 @@ model Customer {
   /// Телефон унікальний у межах клубу, а не глобально:
   /// одна людина може ходити у два клуби — це різні картки.
   @@unique([clubId, phone])
-  /// Один PIN — один клієнт клубу. NULL не бере участі в унікальності
-  /// (у Postgres NULL != NULL), тому клієнтів без кабінету це не чіпає.
-  @@unique([clubId, pinLookupHash])
   @@index([clubId, phoneTail])
+  @@index([clubId, email])
 }
 
 /// Тариф абонемента: те, що власник виставляє в кабінеті, а модератор
@@ -936,4 +977,51 @@ model PasswordReset {
   /// Панель відкривається списком нових заявок — індекс саме під нього.
   @@index([status, createdAt])
   @@index([clubId])
+}
+
+/// Immutable receipts/refunds. Money is stored in kopecks; actor is a historical snapshot.
+model BookingLedgerEntry {
+  id         String               @id @default(uuid()) @db.Uuid
+  clubId     String               @db.Uuid
+  club       Club                 @relation(fields: [clubId], references: [id], onDelete: Restrict)
+  bookingId  String               @db.Uuid
+  booking    Booking              @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  seatId     String?              @db.Uuid
+  seat       BookingSeat?         @relation(fields: [seatId], references: [id], onDelete: Restrict)
+  customerId String?              @db.Uuid
+  customer   Customer?            @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  requestId  String               @db.Uuid
+  kind       String
+  method     String
+  amount     Int
+  account    String
+  note       String
+  actorId    String               @db.Uuid
+  actorEmail String
+  actorRole  String
+  originalId String?              @db.Uuid
+  original   BookingLedgerEntry?  @relation("LedgerRefunds", fields: [originalId], references: [id], onDelete: Restrict)
+  refunds    BookingLedgerEntry[] @relation("LedgerRefunds")
+  createdAt  DateTime             @default(now())
+
+  @@unique([clubId, requestId])
+  @@index([clubId, bookingId, seatId])
+  @@index([originalId])
+}
+
+/// Подарунки й ручні коригування бонусів у картці клієнта.
+/// Окремо від BookingLedgerEntry: подарунок не прив'язаний до конкретної броні.
+model CustomerReward {
+  id         String   @id @default(uuid()) @db.Uuid
+  clubId     String   @db.Uuid
+  customerId String   @db.Uuid
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  amount     Int
+  reason     String
+  actorId    String   @db.Uuid
+  actorEmail String
+  actorRole  String
+  createdAt  DateTime @default(now())
+
+  @@index([clubId, customerId, createdAt])
 }

@@ -1,15 +1,22 @@
 import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
+import { paymentPlanSchema, totals } from '../../lib/settlements';
 import { z } from 'zod';
 import { DateTime } from 'luxon';
 
 import { prisma, isSlotTakenError } from '../../lib/db';
 import { normalizePhone } from '../../lib/phone';
 import { getActivePasses, findOrCreateCustomer } from '../../lib/customers';
-import { requireAuth, requireStaff, requireLevel, hasFeature, param } from './shared';
+import { requireAuth, requireStaff, hasFeature, param } from './shared';
 import { notifyTrainerBooked } from '../../lib/notifyTrainer';
+import { isRegistrationOpen } from '../../lib/registrationCutoff';
 
 export const bookingsRouter = Router();
+
+async function paymentPlanSnapshot(plan: { method: string; account: string }, userId: string) {
+  const actor = await prisma.user.findUniqueOrThrow({ where: { id: userId }, select: { email: true } });
+  return { ...plan, by: actor.email, at: new Date().toISOString() };
+}
 
 /* BOOKINGS                                                                   */
 /* -------------------------------------------------------------------------- */
@@ -88,6 +95,15 @@ bookingsRouter.get(
         },
       },
       include: {
+        ledgerEntries: req.auth!.role !== 'TRAINER' ? {
+          where: { seatId: null },
+          select: {
+            id: true, kind: true, amount: true, method: true,
+            account: true, note: true, actorEmail: true, actorRole: true,
+            createdAt: true,
+          },
+          orderBy: { createdAt: 'asc' },
+        } : false,
         court: {
           select: {
             name: true,
@@ -107,7 +123,7 @@ bookingsRouter.get(
             amount: true,
             /* Щоб кабінет міг сказати «повернення в дорозі» замість того,
                щоб пропонувати натиснути кнопку вдруге. */
-            refundRequestedAt: true,
+            refundRequestedAt: true, refundRequestedBy: true, provider: true, providerRef: true,
             refundedAt: true,
           },
         },
@@ -130,14 +146,25 @@ bookingsRouter.get(
             customerPhone: true,
             status: true,
             price: true,
+            ledgerEntries: req.auth!.role !== 'TRAINER'
+              ? {
+                select: {
+                  id: true, kind: true, amount: true, method: true,
+                  account: true, note: true, actorEmail: true, actorRole: true,
+                  createdAt: true,
+                },
+                orderBy: { createdAt: 'asc' },
+              }
+              : false,
             /* У групі платить кожен за себе, тому й повертати доводиться
                поштучно — панель має показати гроші на рівні місця, а не
                заняття цілком. */
             payment: {
               select: {
                 status: true,
+                paidAt: true,
                 amount: true,
-                refundRequestedAt: true,
+                refundRequestedAt: true, refundRequestedBy: true, provider: true, providerRef: true,
                 refundedAt: true,
               },
             },
@@ -191,7 +218,6 @@ bookingsRouter.post(
   '/bookings',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .object({
@@ -204,6 +230,7 @@ bookingsRouter.post(
         }),
         /* Необовʼязкове, бо в групового заняття одного клієнта немає.
            Що саме має бути заповнене — стежить superRefine нижче. */
+        paymentPlan: paymentPlanSchema.optional(),
         customerName: z
           .string()
           .trim()
@@ -404,7 +431,7 @@ bookingsRouter.post(
        гроші з кожного гравця окремо. Тому контейнер створюється з нулем і
        росте, коли люди записуються. Так підсумок дня рахується сам, без
        окремої гілки в аналітиці. */
-    const priceTotal = isGroup
+    const priceBeforeDiscount = isGroup
       ? (d.priceTotal ?? 0)
       : (d.priceTotal ??
         courtPrice +
@@ -425,6 +452,14 @@ bookingsRouter.post(
           rawPhone: d.customerPhone!,
         })
       : null;
+
+    const priceTotal = !isGroup && d.priceTotal === undefined
+      ? Math.round(priceBeforeDiscount * (100 - (customer?.discountPercent ?? 0)) / 100)
+      : priceBeforeDiscount;
+
+    const initialStatus = isGroup || priceTotal === 0
+      ? d.status
+      : 'PENDING';
 
     try {
       const booking =
@@ -457,8 +492,14 @@ bookingsRouter.post(
             startTime: start,
             endTime: end,
             priceTotal,
-            status: d.status,
+            status: initialStatus,
             source: 'ADMIN',
+            ...(d.paymentPlan && !isGroup ? { paymentPlan: await paymentPlanSnapshot(d.paymentPlan, req.auth!.userId) } : {}),
+            createdBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
+            ...(initialStatus === 'CONFIRMED' ? {
+              confirmedBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
+              confirmedAt: new Date(),
+            } : {}),
           },
           include: {
             court: {
@@ -519,10 +560,10 @@ bookingsRouter.post(
 bookingsRouter.patch(
   '/bookings/:id',
   requireAuth,
-  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .object({
+        paymentPlan: paymentPlanSchema.optional(),
         status: z
           .enum([
             'PENDING',
@@ -595,6 +636,12 @@ bookingsRouter.patch(
           id: param(req, 'id'),
           clubId,
         },
+        include: {
+          payment: true,
+          ledgerEntries: {
+            where: { seatId: null },
+          },
+        },
       });
 
     if (!booking) {
@@ -622,6 +669,7 @@ bookingsRouter.patch(
       // перекроювання чужої сітки, робота ресепшена.
       if (
         p.trainerId !== undefined ||
+        p.paymentPlan !== undefined ||
         p.courtId !== undefined ||
         p.start !== undefined ||
         p.end !== undefined
@@ -637,6 +685,11 @@ bookingsRouter.patch(
       string,
       unknown
     > = {};
+
+    if (p.paymentPlan) {
+      if (booking.capacity !== null) return res.status(400).json({ error: 'BAD_REQUEST' });
+      data.paymentPlan = await paymentPlanSnapshot(p.paymentPlan, req.auth!.userId);
+    }
 
     const start = p.start
       ? new Date(p.start)
@@ -755,6 +808,32 @@ bookingsRouter.patch(
       }
     }
 
+    /* Для платної приватної броні статус визначають гроші, а не ручний
+       перемикач. Це також захищає від випадку, коли після перенесення або
+       додавання тренера ціна зросла: бронь знову чекає доплати. */
+    if (booking.capacity === null && p.status !== 'CANCELLED') {
+      const finalPrice = (data.priceTotal as number | undefined) ?? booking.priceTotal;
+      const paid = totals(
+        booking.ledgerEntries,
+        booking.payment?.status === 'PAID' ? booking.payment.amount : 0,
+      ).net;
+
+      if (finalPrice > 0) {
+        if (p.status === 'CONFIRMED' && paid < finalPrice) {
+          return res.status(409).json({ error: 'PAYMENT_REQUIRED' });
+        }
+
+        const paidInFull = paid >= finalPrice;
+        data.status = paidInFull ? 'CONFIRMED' : 'PENDING';
+        data.expiresAt = paidInFull ? null : booking.expiresAt;
+
+        if (!paidInFull) {
+          data.confirmedBy = null;
+          data.confirmedAt = null;
+        }
+      }
+    }
+
     const finalTrainerId =
       p.trainerId !== undefined
         ? p.trainerId
@@ -800,7 +879,13 @@ bookingsRouter.patch(
         where: {
           id: booking.id,
         },
-        data,
+        data: {
+          ...data,
+          ...(data.status === 'CONFIRMED' && booking.status !== 'CONFIRMED' ? {
+            confirmedBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
+            confirmedAt: new Date(),
+          } : {}),
+        },
       });
 
       res.json({
@@ -826,7 +911,6 @@ bookingsRouter.post(
   '/bookings/series',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .object({
@@ -839,6 +923,7 @@ bookingsRouter.post(
         }),
         /* Як і в одиночній броні: у групи імені немає, є назва.
            Перевіряє superRefine нижче. */
+        paymentPlan: paymentPlanSchema.optional(),
         customerName: z
           .string()
           .trim()
@@ -1033,6 +1118,10 @@ bookingsRouter.post(
         })
       : null;
 
+    const initialStatus = isGroup || priceTotal === 0
+      ? d.status
+      : 'PENDING';
+
     const seriesId = randomUUID();
 
     const tz =
@@ -1150,10 +1239,16 @@ bookingsRouter.post(
               endTime: e,
               priceTotal,
               status:
-                d.status,
+                initialStatus,
               source:
                 'ADMIN',
+              createdBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
+              ...(initialStatus === 'CONFIRMED' ? {
+                confirmedBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
+                confirmedAt: new Date(),
+              } : {}),
               seriesId,
+              ...(d.paymentPlan && d.capacity == null ? { paymentPlan: await paymentPlanSnapshot(d.paymentPlan, req.auth!.userId) } : {}),
             },
             select: {
               id: true,
@@ -1212,7 +1307,6 @@ bookingsRouter.post(
   '/series/:seriesId/cancel',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed =
       z.string()
@@ -1282,7 +1376,6 @@ bookingsRouter.post(
   '/bookings/:id/seats',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const id = z.string().uuid().safeParse(req.params.id);
     if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
@@ -1313,13 +1406,14 @@ bookingsRouter.post(
         /* Той самий FOR UPDATE, що й у публічному записі: ресепшен і
            гравець можуть тиснути в одну мілісекунду на останнє місце. */
         const rows = await tx.$queryRaw<
-          { id: string; clubId: string; capacity: number | null; pricePerSeat: number | null }[]
-        >`SELECT "id", "clubId", "capacity", "pricePerSeat"
+          { id: string; clubId: string; capacity: number | null; pricePerSeat: number | null; startTime: Date }[]
+        >`SELECT "id", "clubId", "capacity", "pricePerSeat", "startTime"
             FROM "Booking" WHERE "id" = ${id.data}::uuid FOR UPDATE`;
 
         const b = rows[0];
         if (!b || b.clubId !== clubId) throw new SeatError(404, 'NOT_FOUND');
         if (b.capacity == null) throw new SeatError(400, 'NOT_A_GROUP');
+        if (!isRegistrationOpen(b.startTime)) throw new SeatError(409, 'REGISTRATION_CLOSED');
 
         /* PENDING зайняте нарівні з BOOKED: місце, за яке гравець саме
            зараз платить у віджеті, ресепшен не має віддати іншому. */
@@ -1336,7 +1430,7 @@ bookingsRouter.post(
         });
         if (already) throw new SeatError(409, 'ALREADY_JOINED');
 
-        const price = b.pricePerSeat ?? 0;
+        const price = Math.round((b.pricePerSeat ?? 0) * (100 - (customer?.discountPercent ?? 0)) / 100);
 
         const created = await tx.bookingSeat.create({
           data: {
@@ -1379,7 +1473,6 @@ bookingsRouter.post(
   '/seats/:id/cancel',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const id = z.string().uuid().safeParse(req.params.id);
     if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });

@@ -5,35 +5,24 @@ import rateLimit from 'express-rate-limit';
 
 import { prisma } from '../../lib/db';
 import {
-  type AccessLevel,
   requireAuth,
-  requireLevel,
-  param,
   signToken,
-  verifyStepUpPin,
+  verifyAccountPassword,
 } from './shared';
 import { planFeatures } from '../../lib/plans';
 
 export const authRouter = Router();
 
 /**
- * IP-ліміти на вхід/PIN — другий рубіж поверх bcrypt і власного
- * pinFails/pinLockedUntil на елевейті. Той лічильник блокує один акаунт;
- * цей — заважає перебирати паролі/PIN одразу по багатьох акаунтах з однієї
+ * IP-ліміти на вхід — другий рубіж поверх bcrypt і лічильника невдалих
+ * спроб акаунта. Він блокує один акаунт; цей заважає перебирати паролі
+ * одразу по багатьох акаунтах з однієї
  * адреси. standardHeaders: додає RateLimit-* у відповідь, щоб фронт міг
  * колись показати «спробуйте пізніше», а не просто ловити 429.
  */
 const loginLimiter = rateLimit({
   windowMs: 15 * 60_000,
   limit: 10,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'TOO_MANY_ATTEMPTS' },
-});
-
-const elevateLimiter = rateLimit({
-  windowMs: 15 * 60_000,
-  limit: 20,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'TOO_MANY_ATTEMPTS' },
@@ -68,14 +57,7 @@ const registerSchema = z.object({
     .email()
     .toLowerCase(),
 
-  password: z
-    .string()
-    .min(8)
-    .max(128),
-
-  moderatorPin: z
-    .string()
-    .regex(/^\d{4,8}$/),
+  password: z.string().min(8).max(128),
 
   phone: z
     .string()
@@ -96,9 +78,8 @@ const registerSchema = z.object({
  * - widget ещё не активирован публично
  *
  * Аккаунт:
- * - LEVEL 1
- * - пароль хранится только как bcrypt hash
- * - PIN модератора хранится только как bcrypt hash
+ * - роль визначає доступ
+ * - єдиний пароль зберігається тільки як bcrypt hash
  */
 authRouter.post('/register', registerLimiter, async (req, res) => {
   const parsed = registerSchema.safeParse(req.body);
@@ -147,11 +128,6 @@ authRouter.post('/register', registerLimiter, async (req, res) => {
     12,
   );
 
-  const moderatorPinHash = await bcrypt.hash(
-    data.moderatorPin,
-    12,
-  );
-
   try {
     const result = await prisma.$transaction(
       async (tx) => {
@@ -182,7 +158,6 @@ authRouter.post('/register', registerLimiter, async (req, res) => {
           data: {
             email: data.email,
             passwordHash,
-            pinModerHash: moderatorPinHash,
             role: 'OWNER',
             clubId: club.id,
           },
@@ -195,26 +170,18 @@ authRouter.post('/register', registerLimiter, async (req, res) => {
       },
     );
 
-    // Рівень 2, а не 1: PIN модератора щойно заданий у цьому самому запиті —
-    // перепитувати його одразу ж окремим /elevate було б абсурдним UX
-    // ("ви щойно ввели PIN, а тепер введіть ще раз, щоб зберегти майстер").
-    // 45 хвилин, а не 7 днів токена логіну: та сама тривалість, що й у
-    // звичайного /elevate — рівень 2 залишається коротким вікном, навіть
-    // коли отриманий одразу при реєстрації.
     const token = signToken(
       {
         userId: result.user.id,
         clubId: result.club.id,
         role: result.user.role,
-        level: 2,
         trainerId: null,
       },
-      '45m',
+      '7d',
     );
 
     return res.status(201).json({
       token,
-      level: 2,
       club: {
         id: result.club.id,
         name: result.club.name,
@@ -237,15 +204,14 @@ authRouter.post('/register', registerLimiter, async (req, res) => {
 /**
  * POST /api/admin/login
  *
- * Каждый обычный вход начинается с Level 1.
- *
- * Level 2 получается только через /elevate + PIN.
+ * Пошта визначає акаунт, його єдиний пароль підтверджує вхід, а роль у
+ * токені визначає доступ. Повторного підтвердження для окремих дій немає.
  */
 authRouter.post('/login', loginLimiter, async (req, res) => {
   const parsed = z
     .object({
       email: z.string().email(),
-      password: z.string().min(8),
+      password: z.string().min(1).max(128),
     })
     .safeParse(req.body);
 
@@ -269,23 +235,16 @@ authRouter.post('/login', loginLimiter, async (req, res) => {
     });
   }
 
-  const valid = await bcrypt.compare(
-    parsed.data.password,
-    user.passwordHash,
-  );
-
-  if (!valid) {
-    return res.status(401).json({
-      error: 'INVALID_CREDENTIALS',
-    });
-  }
+  const valid = await verifyAccountPassword(user.id, parsed.data.password);
+  if (!valid.ok) return res.status(valid.reason === 'LOCKED' ? 423 : 401).json({
+    error: valid.reason === 'LOCKED' ? 'PASSWORD_LOCKED' : 'INVALID_CREDENTIALS',
+  });
 
   const token = signToken(
     {
       userId: user.id,
       clubId: user.clubId,
       role: user.role,
-      level: 1,
       trainerId: user.trainerId,
     },
     '7d',
@@ -293,110 +252,9 @@ authRouter.post('/login', loginLimiter, async (req, res) => {
 
   return res.json({
     token,
-    level: 1,
     role: user.role,
   });
 });
-
-/* -------------------------------------------------------------------------- */
-/* ELEVATE                                                                    */
-/* -------------------------------------------------------------------------- */
-
-/**
- * POST /api/admin/elevate
- *
- * Перевіряє PIN модератора або власника.
- *
- * type: 'moderator' -> LEVEL 1/2 -> LEVEL 2
- * type: 'owner'      -> LEVEL 1/2 -> LEVEL 3 (тільки role OWNER)
- *
- * П'ять невдалих спроб — блокування на 15 хвилин (спільне для обох PIN).
- * Новий токен живе 45 хвилин.
- */
-authRouter.post(
-  '/elevate',
-  elevateLimiter,
-  requireAuth,
-  async (req, res) => {
-    const parsed = z
-      .object({
-        pin: z.string().regex(/^\d{4,8}$/),
-        type: z.enum(['moderator', 'owner']).default('moderator'),
-      })
-      .safeParse(req.body);
-
-    if (!parsed.success) {
-      return res.status(400).json({
-        error: 'BAD_REQUEST',
-      });
-    }
-
-    const user = await prisma.user.findUnique({
-      where: {
-        id: req.auth!.userId,
-      },
-      select: {
-        id: true,
-        clubId: true,
-        role: true,
-        trainerId: true,
-      },
-    });
-
-    if (!user) {
-      return res.status(401).json({
-        error: 'UNAUTHORIZED',
-      });
-    }
-
-    const targetLevel: AccessLevel =
-      parsed.data.type === 'owner' ? 3 : 2;
-
-    if (targetLevel === 3 && user.role !== 'OWNER') {
-      return res.status(403).json({
-        error: 'FORBIDDEN',
-      });
-    }
-
-    const field =
-      parsed.data.type === 'owner' ? 'pinOwnerHash' : 'pinModerHash';
-
-    const result = await verifyStepUpPin(
-      user.id,
-      parsed.data.pin,
-      field,
-    );
-
-    if (!result.ok) {
-      const status = result.reason === 'LOCKED' ? 423 : 403;
-      return res.status(status).json({
-        error:
-          result.reason === 'LOCKED'
-            ? 'PIN_LOCKED'
-            : result.reason === 'NOT_SET'
-              ? 'PIN_NOT_SET'
-              : 'INVALID_PIN',
-      });
-    }
-
-    const token = signToken(
-      {
-        userId: user.id,
-        clubId: user.clubId,
-        role: user.role,
-        level: targetLevel,
-        trainerId: user.trainerId,
-      },
-      '45m',
-    );
-
-    return res.json({
-      token,
-      level: targetLevel,
-      expiresIn: 2700,
-    });
-  },
-);
 
 /* -------------------------------------------------------------------------- */
 /* ME                                                                         */
@@ -416,7 +274,6 @@ authRouter.get(
         role: true,
         clubId: true,
         trainerId: true,
-        pinOwnerHash: true,
         club: {
           select: {
             plan: {
@@ -444,20 +301,10 @@ authRouter.get(
       email: user.email,
       role: user.role,
       clubId: user.clubId,
-      level: req.auth!.level,
       trainerId: user.trainerId,
 
-      // Чи заведений PIN власника. Сам хеш, звісно, не віддаємо — потрібен
-      // тільки факт: кабінет має розрізняти «введіть PIN» і «придумайте
-      // PIN». Свіжозареєстрований клуб має лише PIN модератора (його
-      // питають при реєстрації), тому рівень 3 — а з ним і платіжна
-      // інтеграція — до цього був для нього просто недосяжним: майстер
-      // пропонував увімкнути передоплату й отримував 403, а кнопка
-      // «Режим власника» в шапці нічого не давала, бо PIN ще не існував.
-      hasOwnerPin: Boolean(user.pinOwnerHash),
-
-      /* Можливості за планом — тут, поруч із роллю й рівнем, бо це третя
-         вісь тих самих прав, і кабінет має отримувати всі три одним
+      /* Можливості за планом — тут, поруч із роллю, бо кабінет має
+         отримувати обидві частини прав одним
          запитом. Через /billing їх не віддати: ту вкладку бачить не кожен,
          а ховати «Аналітику» треба до того, як хтось у неї зайде.
          Клуб без плану отримує повний набір — див. lib/plans.ts. */
@@ -468,39 +315,25 @@ authRouter.get(
   },
 );
 
-/* PIN SETTINGS                                                               */
+/* PASSWORD SETTINGS                                                          */
 /* -------------------------------------------------------------------------- */
 
 /**
- * POST /api/admin/pins
+ * POST /api/admin/password
  *
- * Зміна власних PIN. Кожен акаунт задає PIN тільки собі — where завжди
- * по req.auth!.userId, підмінити чужий PIN так не вийде.
+ * Зміна власного пароля. Кожен акаунт задає пароль тільки собі — where
+ * завжди по req.auth!.userId, підмінити чужий пароль так не вийде.
  *
- * moderatorPin — LEVEL 2, будь-яка роль.
- * ownerPin     — тільки role OWNER (інакше ADMIN міг би сам собі видати
- *                перепустку на LEVEL 3).
+ * У кожного акаунта рівно один пароль. Зміна впливає на наступний вхід.
  */
 authRouter.post(
-  '/pins',
+  '/password',
   requireAuth,
-  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .object({
-        moderatorPin: z
-          .string()
-          .regex(/^\d{4,8}$/)
-          .optional(),
-        ownerPin: z
-          .string()
-          .regex(/^\d{4,8}$/)
-          .optional(),
+        password: z.string().min(8).max(128),
       })
-      .refine(
-        (v) => v.moderatorPin || v.ownerPin,
-        { message: 'NOTHING_TO_UPDATE' },
-      )
       .safeParse(req.body);
 
     if (!parsed.success) {
@@ -509,33 +342,13 @@ authRouter.post(
       });
     }
 
-    if (parsed.data.ownerPin && req.auth!.role !== 'OWNER') {
-      return res.status(403).json({
-        error: 'FORBIDDEN',
-      });
-    }
-
-    const data: Record<string, string> = {};
-
-    if (parsed.data.moderatorPin) {
-      data.pinModerHash = await bcrypt.hash(
-        parsed.data.moderatorPin,
-        12,
-      );
-    }
-
-    if (parsed.data.ownerPin) {
-      data.pinOwnerHash = await bcrypt.hash(
-        parsed.data.ownerPin,
-        12,
-      );
-    }
+    const passwordHash = await bcrypt.hash(parsed.data.password, 12);
 
     await prisma.user.update({
       where: {
         id: req.auth!.userId,
       },
-      data,
+      data: { passwordHash, pinFails: 0, pinLockedUntil: null },
     });
 
     res.json({
@@ -543,4 +356,3 @@ authRouter.post(
     });
   },
 );
-

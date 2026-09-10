@@ -4,7 +4,7 @@ import { z } from 'zod';
 import { prisma } from '../../lib/db';
 import { KNOWN_PROVIDERS, providerFor, publicBase } from '../../lib/payments';
 import { encryptSecret, paymentsSecretReady } from '../../lib/crypto';
-import { requireAuth, requireStaff, requireLevel } from './shared';
+import { requireAuth, requireStaff, requireRole } from './shared';
 import { logoSrcOf } from '../public';
 import { liqPayKeys } from '../../lib/payments/liqpay';
 
@@ -97,7 +97,6 @@ clubRouter.patch(
   '/club',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .object({
@@ -283,13 +282,12 @@ clubRouter.patch(
       (rest.paymentProvider !== undefined && rest.paymentProvider !== current?.paymentProvider) ||
       (rest.payHoldMinutes !== undefined && rest.payHoldMinutes !== current?.payHoldMinutes);
 
-    // Платіжна інтеграція — гроші клубу йдуть повз нас напряму на його
-    // еквайринг, тому переприв'язати токен має право тільки LEVEL 3.
-    if (paymentFieldsTouched && req.auth!.level < 3) {
+    // Платіжну інтеграцію змінює тільки власник. Окремого рівня доступу
+    // більше немає: роль акаунта є єдиним джерелом прав.
+    if (paymentFieldsTouched && req.auth!.role !== 'OWNER') {
       return res.status(403).json({
         error: 'FORBIDDEN',
-        requiredLevel: 3,
-        currentLevel: req.auth!.level,
+        requiredRole: ['OWNER'],
       });
     }
 
@@ -458,8 +456,7 @@ clubRouter.patch(
 clubRouter.post(
   '/club/payment-test',
   requireAuth,
-  requireStaff,
-  requireLevel(3),
+  requireRole('OWNER'),
   async (req, res) => {
     const club = await prisma.club.findUnique({
       where: { id: req.auth!.clubId },

@@ -3,7 +3,7 @@ import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
 import { providerFor } from '../../lib/payments';
-import { requireAuth, requireRole, requireLevel, param } from './shared';
+import { requireAuth, requireRole, param } from './shared';
 
 export const refundsRouter = Router();
 
@@ -16,9 +16,9 @@ export const refundsRouter = Router();
  * кабінет або показує, або переставляє в нашій базі; тут ми звертаємось до
  * чужого еквайрингу з проханням віддати назад справжні гривні.
  *
- * Тому: тільки OWNER (`requireRole`) і тільки під PIN власника
- * (`requireLevel(3)`) — рівно ті самі права, що й на переприв'язку токена
- * еквайрингу. Модератор веде клуб, але не розпоряджається його рахунком.
+ * Тому: тільки OWNER (`requireRole`) — рівно ті самі права, що й на
+ * переприв'язку токена еквайрингу. Модератор веде клуб, але не
+ * розпоряджається його рахунком.
  *
  * ── Чому кнопка, а не автоматика при скасуванні ──────────────────────────
  *
@@ -52,6 +52,7 @@ async function refundPayment(
   paymentId: string,
   clubId: string,
   target: Target,
+  actorId: string,
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const payment = await prisma.payment.findFirst({
     where: { id: paymentId, clubId },
@@ -75,6 +76,7 @@ async function refundPayment(
 
   const provider = providerFor(payment.club);
   if (!provider) return { status: 409, body: { error: 'PAYMENTS_OFF' } };
+  const actor = await prisma.user.findUniqueOrThrow({ where: { id: actorId }, select: { email: true } });
 
   /* Порядок важливий: спершу банк, потім наша позначка. Якщо зробити
      навпаки і банк відмовить, кабінет показував би «повернення в дорозі»
@@ -89,7 +91,7 @@ async function refundPayment(
 
   await prisma.payment.update({
     where: { id: payment.id },
-    data: { refundRequestedAt: new Date() },
+    data: { refundRequestedAt: new Date(), refundRequestedBy: actor.email },
   });
 
   console.log(`[refund] запит прийнято: ${target.kind} ${target.label}, ${payment.amount} коп.`);
@@ -106,7 +108,6 @@ refundsRouter.post(
   '/bookings/:id/refund',
   requireAuth,
   requireRole('OWNER'),
-  requireLevel(3),
   async (req, res) => {
     const id = z.string().uuid().safeParse(param(req, 'id'));
     if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
@@ -122,6 +123,7 @@ refundsRouter.post(
       booking.payment.id,
       req.auth!.clubId,
       { kind: 'booking', label: booking.id },
+      req.auth!.userId,
     );
     res.status(out.status).json(out.body);
   },
@@ -139,7 +141,6 @@ refundsRouter.post(
   '/seats/:id/refund',
   requireAuth,
   requireRole('OWNER'),
-  requireLevel(3),
   async (req, res) => {
     const id = z.string().uuid().safeParse(param(req, 'id'));
     if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
@@ -162,6 +163,7 @@ refundsRouter.post(
       seat.payment.id,
       req.auth!.clubId,
       { kind: 'seat', label: seat.id },
+      req.auth!.userId,
     );
     res.status(out.status).json(out.body);
   },

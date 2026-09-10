@@ -5,6 +5,7 @@ import { prisma } from '../lib/db';
 import { requireAuth, requireRole, requireFeature } from './admin';
 import { buildLoadProfile } from '../lib/loadProfile';
 import { bookingFunnel, retentionFromVisits, roundPct, type FunnelBooking } from '../lib/deepAnalytics';
+import { dateOnly, daysUntilBirthday } from '../lib/birthday';
 
 /**
  * CRM-аналітика кабінету. Окремий файл, а не ще один розділ
@@ -14,8 +15,7 @@ import { bookingFunnel, retentionFromVisits, roundPct, type FunnelBooking } from
  * OWNER і ADMIN. Тренер — ні: виручка клубу й список найчастіших клієнтів
  * не мають стосунку до його розкладу. Модератор веде клуб щодня і без цифр
  * не веде його взагалі, тому дані тут ті самі, що й у власника.
- * requireLevel не потрібен — це той самий "перегляд", що список броней на
- * рівні 1, просто звужений по ролі, а не по рівню.
+ * Це той самий перегляд, що список броней, просто звужений за роллю.
  */
 export const analyticsRouter = Router();
 
@@ -777,7 +777,7 @@ analyticsRouter.get('/customers', async (req, res) => {
       tier: z.enum(['ACTIVE', 'FADING', 'LOST', 'NEW']).optional(),
       tag: z.string().trim().min(1).max(40).optional(),
       q: z.string().trim().min(1).max(40).optional(),
-      sort: z.enum(['visits', 'spend', 'recent', 'name']).default('recent'),
+      sort: z.enum(['visits', 'spend', 'recent', 'name', 'birthday']).default('recent'),
       limit: z.coerce.number().int().min(1).max(500).default(100),
     })
     .safeParse(req.query);
@@ -797,6 +797,7 @@ analyticsRouter.get('/customers', async (req, res) => {
   const search = q
     ? [
       { name: { contains: q, mode: 'insensitive' as const } },
+      { email: { contains: q, mode: 'insensitive' as const } },
       ...(digits.length >= 3 ? [{ phoneTail: { endsWith: digits } }] : []),
     ]
     : null;
@@ -809,7 +810,9 @@ analyticsRouter.get('/customers', async (req, res) => {
     },
     select: {
       id: true, name: true, phone: true, note: true, tags: true,
+      email: true,
       isBlocked: true, createdAt: true, telegramChatId: true,
+      birthDate: true, discountPercent: true, bonusBalance: true,
     },
   });
   if (customers.length === 0) return res.json({ tiers: {}, customers: [] });
@@ -858,10 +861,15 @@ analyticsRouter.get('/customers', async (req, res) => {
       id: c.id,
       name: c.name,
       phone: c.phone,
+      email: c.email,
       note: c.note,
       tags: c.tags,
       isBlocked: c.isBlocked,
-      hasCabinet: Boolean(c.telegramChatId),
+      hasCabinet: Boolean(c.birthDate),
+      birthDate: dateOnly(c.birthDate),
+      daysUntilBirthday: daysUntilBirthday(c.birthDate, now),
+      discountPercent: c.discountPercent,
+      bonusBalance: c.bonusBalance,
       since: c.createdAt.toISOString(),
       visits: r.visits,
       spend: r.spend,
@@ -883,6 +891,7 @@ analyticsRouter.get('/customers', async (req, res) => {
     if (sort === 'visits') return b.visits - a.visits;
     if (sort === 'spend') return b.spend - a.spend;
     if (sort === 'name') return a.name.localeCompare(b.name, 'uk');
+    if (sort === 'birthday') return (a.daysUntilBirthday ?? 999) - (b.daysUntilBirthday ?? 999);
     // recent: хто був найпізніше. Ті, хто не був жодного разу, — у кінці.
     if (!a.lastVisit && !b.lastVisit) return 0;
     if (!a.lastVisit) return 1;

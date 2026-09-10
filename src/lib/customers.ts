@@ -12,22 +12,40 @@ export async function findOrCreateCustomer(params: {
   clubId: string;
   name: string;
   rawPhone: string;
+  email?: string;
+  birthDate?: Date;
 }) {
   const phone = normalizePhone(params.rawPhone);
   if (!phone) return null;
 
-  return prisma.customer.upsert({
+  const customer = await prisma.customer.upsert({
     where: { clubId_phone: { clubId: params.clubId, phone: phone.e164 } },
     // Імʼя не перезаписуємо: у картці може бути виправлене адміном,
     // а у формі людина щоразу пише як завгодно.
-    update: {},
+    update: {
+      ...(params.email ? { email: params.email } : {}),
+    },
     create: {
       clubId: params.clubId,
       name: params.name,
       phone: phone.e164,
       phoneTail: phone.tail,
+      email: params.email,
+      birthDate: params.birthDate,
     },
   });
+
+  // Дата народження тепер є даними входу в кабінет. Формою нової броні
+  // не можна перезаписати вже збережену дату: інакше стороння людина могла
+  // б забрати доступ, знаючи лише номер телефону. Стару картку без дати
+  // доповнюємо один раз під час першої броні після оновлення.
+  if (!customer.birthDate && params.birthDate) {
+    return prisma.customer.update({
+      where: { id: customer.id },
+      data: { birthDate: params.birthDate },
+    });
+  }
+  return customer;
 }
 
 export type PassBalance = {

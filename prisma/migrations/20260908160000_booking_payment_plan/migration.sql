@@ -1,0 +1,1 @@
+ALTER TABLE "Booking" ADD COLUMN "paymentPlan" JSONB NOT NULL DEFAULT '{}';

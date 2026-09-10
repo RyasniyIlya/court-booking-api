@@ -1,7 +1,7 @@
 import { Router, raw } from 'express';
 
 import { prisma } from '../../lib/db';
-import { requireAuth, requireStaff, requireLevel } from './shared';
+import { requireAuth, requireStaff } from './shared';
 
 export const logoRouter = Router();
 
@@ -55,15 +55,13 @@ function sniff(buf: Buffer): string | null {
 /**
  * POST /api/admin/club/logo
  *
- * Рівень 2 і персонал — та сама межа, що й у решти змін клубу. Окремого
- * PIN власника не питаємо: логотип не гроші, а помилку видно одразу й
- * виправляється вона повторним завантаженням.
+ * Персонал — та сама межа, що й у решти змін клубу. Логотип не гроші, а
+ * помилку видно одразу й виправляється вона повторним завантаженням.
  */
 logoRouter.post(
   '/club/logo',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   raw({ type: '*/*', limit: MAX_BYTES }),
   async (req, res) => {
     const body = req.body;
@@ -119,7 +117,6 @@ logoRouter.delete(
   '/club/logo',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     await prisma.club.update({
       where: {

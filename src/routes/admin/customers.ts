@@ -4,7 +4,8 @@ import { z } from 'zod';
 import { prisma } from '../../lib/db';
 import { isSearchableTail } from '../../lib/phone';
 import { getActivePass, getActivePasses } from '../../lib/customers';
-import { requireAuth, requireStaff, requireLevel, requireRole, param } from './shared';
+import { requireAuth, requireStaff, requireRole, param } from './shared';
+import { birthDateText, birthDateValue, dateOnly } from '../../lib/birthday';
 
 export const customersRouter = Router();
 
@@ -95,6 +96,9 @@ customersRouter.get(
           isBlocked:
             c.isBlocked,
           note: c.note,
+          birthDate: dateOnly(c.birthDate),
+          discountPercent: c.discountPercent,
+          bonusBalance: c.bonusBalance,
           pass:
             passes.get(
               c.id,
@@ -126,7 +130,6 @@ customersRouter.post(
   '/customers/:id/passes',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const parsed = z
       .object({
@@ -348,7 +351,6 @@ customersRouter.post(
   '/bookings/:id/use-pass',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const booking =
       await prisma.booking.findFirst({
@@ -447,7 +449,6 @@ customersRouter.delete(
   '/bookings/:id/use-pass',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const usage =
       await prisma.passUsage.findUnique({
@@ -520,13 +521,12 @@ customersRouter.delete(
  *
  * Рівень 2, як і решта змін у кабінеті: «боржник» на картці — це те, що
  * побачить наступна зміна адміністраторів, і ставити його з відкритого
- * ноутбука на ресепшені без PIN не варто.
+ * ноутбука на ресепшені без авторизації не варто.
  */
 customersRouter.patch(
   '/customers/:id',
   requireAuth,
   requireStaff,
-  requireLevel(2),
   async (req, res) => {
     const id = z.string().uuid().safeParse(req.params.id);
     if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
@@ -545,12 +545,14 @@ customersRouter.patch(
           .optional(),
         note: z.string().trim().max(1000).nullable().optional(),
         isBlocked: z.boolean().optional(),
+        birthDate: birthDateText.nullable().optional(),
+        discountPercent: z.number().int().min(0).max(90).optional(),
       })
       .safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
     const d = parsed.data;
-    if (d.tags === undefined && d.note === undefined && d.isBlocked === undefined) {
+    if (d.tags === undefined && d.note === undefined && d.isBlocked === undefined && d.birthDate === undefined && d.discountPercent === undefined) {
       return res.status(400).json({ error: 'NOTHING_TO_UPDATE' });
     }
 
@@ -566,14 +568,42 @@ customersRouter.patch(
         ...(tags ? { tags } : {}),
         ...(d.note !== undefined ? { note: d.note } : {}),
         ...(d.isBlocked !== undefined ? { isBlocked: d.isBlocked } : {}),
+        ...(d.birthDate !== undefined ? { birthDate: d.birthDate ? birthDateValue(d.birthDate) : null } : {}),
+        ...(d.discountPercent !== undefined ? { discountPercent: d.discountPercent } : {}),
       },
     });
     if (count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
 
     const customer = await prisma.customer.findUnique({
       where: { id: id.data },
-      select: { id: true, name: true, phone: true, tags: true, note: true, isBlocked: true },
+      select: { id: true, name: true, phone: true, tags: true, note: true, isBlocked: true,
+        birthDate: true, discountPercent: true, bonusBalance: true },
     });
-    res.json(customer);
+    res.json(customer && { ...customer, birthDate: dateOnly(customer.birthDate) });
   },
 );
+
+customersRouter.post('/customers/:id/rewards', requireAuth, requireStaff, async (req, res) => {
+  const id = z.string().uuid().safeParse(param(req, 'id'));
+  const parsed = z.object({
+    amount: z.number().int().positive().max(100_000_000),
+    reason: z.string().trim().min(3).max(300),
+  }).safeParse(req.body);
+  if (!id.success || !parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const result = await prisma.$transaction(async (tx) => {
+    const customer = await tx.customer.findFirst({ where: { id: id.data, clubId: req.auth!.clubId } });
+    if (!customer) return null;
+    const actor = await tx.user.findFirst({ where: { id: req.auth!.userId, clubId: req.auth!.clubId } });
+    if (!actor) return null;
+    const reward = await tx.customerReward.create({ data: {
+      clubId: req.auth!.clubId, customerId: customer.id, amount: parsed.data.amount,
+      reason: parsed.data.reason, actorId: actor.id, actorEmail: actor.email, actorRole: actor.role,
+    } });
+    const updated = await tx.customer.update({
+      where: { id: customer.id }, data: { bonusBalance: { increment: parsed.data.amount } },
+    });
+    return { reward, bonusBalance: updated.bonusBalance };
+  });
+  if (!result) return res.status(404).json({ error: 'NOT_FOUND' });
+  res.status(201).json(result);
+});

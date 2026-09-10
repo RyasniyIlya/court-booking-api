@@ -15,18 +15,15 @@ import { planFeatures, type PlanFeatures } from '../../lib/plans';
 /* AUTH                                                                       */
 /* -------------------------------------------------------------------------- */
 //
-// Спільне для всіх /api/admin роутів: перевірка JWT, рівня доступу (1–3)
-// і step-up PIN. Розрізане з колишнього монолітного admin.ts (3500+ рядків
+// Спільне для всіх /api/admin роутів: перевірка JWT і ролі акаунта.
+// Розрізане з колишнього монолітного admin.ts (3500+ рядків
 // на все підряд) на файли по доменах — цей лишається єдиним, бо кожен домен
-// (bookings, courts, trainers, ...) потребує requireAuth/requireLevel.
-
-export type AccessLevel = 1 | 2 | 3;
+// (bookings, courts, trainers, ...) потребує requireAuth/requireRole.
 
 export type Auth = {
   userId: string;
   clubId: string;
   role: string;
-  level: AccessLevel;
   /// Тільки для role === 'TRAINER'. Яку картку тренера бачить цей акаунт.
   trainerId: string | null;
 };
@@ -79,8 +76,7 @@ export function requireAuth(
     if (
       typeof payload.userId !== 'string' ||
       typeof payload.clubId !== 'string' ||
-      typeof payload.role !== 'string' ||
-      (payload.level !== 1 && payload.level !== 2 && payload.level !== 3)
+      typeof payload.role !== 'string'
     ) {
       return res.status(401).json({
         error: 'INVALID_TOKEN',
@@ -91,7 +87,6 @@ export function requireAuth(
       userId: payload.userId,
       clubId: payload.clubId,
       role: payload.role,
-      level: payload.level,
       trainerId: payload.trainerId ?? null,
     };
 
@@ -101,30 +96,6 @@ export function requireAuth(
       error: 'UNAUTHORIZED',
     });
   }
-}
-
-export function requireLevel(level: AccessLevel) {
-  return (
-    req: Request,
-    res: Response,
-    next: NextFunction,
-  ) => {
-    if (!req.auth) {
-      return res.status(401).json({
-        error: 'UNAUTHORIZED',
-      });
-    }
-
-    if (req.auth.level < level) {
-      return res.status(403).json({
-        error: 'FORBIDDEN',
-        requiredLevel: level,
-        currentLevel: req.auth.level,
-      });
-    }
-
-    next();
-  };
 }
 
 export function requireRole(...roles: string[]) {
@@ -150,27 +121,23 @@ export function requireRole(...roles: string[]) {
   };
 }
 
-const MAX_PIN_FAILS = 5;
-const PIN_LOCK_MINUTES = 15;
+const MAX_PASSWORD_FAILS = 5;
+const PASSWORD_LOCK_MINUTES = 15;
 
 /**
- * Перевіряє PIN (moder/owner) з блокуванням після невдалих спроб.
- * Лічильник і блокування спільні для обох PIN одного акаунта — прицільний
- * підбір "просто спробую власника" так само вважається невдалою спробою.
+ * Перевіряє єдиний пароль акаунта з блокуванням після невдалих спроб.
  */
-export async function verifyStepUpPin(
+export async function verifyAccountPassword(
   userId: string,
-  pin: string,
-  field: 'pinModerHash' | 'pinOwnerHash',
+  password: string,
 ): Promise<
   | { ok: true }
-  | { ok: false; reason: 'LOCKED' | 'NOT_SET' | 'INVALID_PIN' }
+  | { ok: false; reason: 'LOCKED' | 'NOT_SET' | 'INVALID_PASSWORD' }
 > {
   const user = await prisma.user.findUnique({
     where: { id: userId },
     select: {
-      pinModerHash: true,
-      pinOwnerHash: true,
+      passwordHash: true,
       pinFails: true,
       pinLockedUntil: true,
     },
@@ -184,29 +151,23 @@ export async function verifyStepUpPin(
     return { ok: false, reason: 'LOCKED' };
   }
 
-  const hash = user[field];
-
-  if (!hash) {
-    return { ok: false, reason: 'NOT_SET' };
-  }
-
-  const valid = await bcrypt.compare(pin, hash);
+  const valid = await bcrypt.compare(password, user.passwordHash);
 
   if (!valid) {
     const fails = user.pinFails + 1;
-    const locked = fails >= MAX_PIN_FAILS;
+    const locked = fails >= MAX_PASSWORD_FAILS;
 
     await prisma.user.update({
       where: { id: userId },
       data: {
         pinFails: fails,
         pinLockedUntil: locked
-          ? new Date(Date.now() + PIN_LOCK_MINUTES * 60000)
+          ? new Date(Date.now() + PASSWORD_LOCK_MINUTES * 60000)
           : undefined,
       },
     });
 
-    return { ok: false, reason: 'INVALID_PIN' };
+    return { ok: false, reason: 'INVALID_PASSWORD' };
   }
 
   if (user.pinFails > 0 || user.pinLockedUntil) {
@@ -220,14 +181,7 @@ export async function verifyStepUpPin(
 }
 
 /**
- * Персонал клубу: OWNER або ADMIN. Тренера відсікає незалежно від рівня.
- *
- * Раніше цього не було потрібно: тренер фізично не міг взяти LEVEL 2, і
- * requireLevel(2) сам по собі означав "не тренер". Тепер тренер має свій
- * PIN і піднімається до рівня 2 — щоб закрити власне заняття, а не щоб
- * правити корти, години й чужі броні. Рівень і роль перестали бути
- * взаємозамінними: рівень каже "щойно підтвердив, що це справді він",
- * роль — "що йому взагалі можна".
+ * Персонал клубу: OWNER або ADMIN. Тренера відсікає роль акаунта.
  */
 export function requireStaff(
   req: Request,

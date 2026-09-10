@@ -26,7 +26,7 @@ vi.mock('../../lib/db', () => ({ prisma }));
 vi.mock('../../lib/customers', () => ({ getActivePass, getActivePasses: vi.fn() }));
 
 /* Авторизацію підміняємо цілком: вона своя й перевірена окремо, а тут
-   заважала б розгледіти саму видачу. Рівень береться із заголовка, щоб
+   заважала б розгледіти саму видачу. Роль береться із заголовка, щоб
    один тест міг прийти модератором, а інший — тренером. */
 vi.mock('./shared', async () => {
   const actual = await vi.importActual<typeof import('./shared')>('./shared');
@@ -37,7 +37,6 @@ vi.mock('./shared', async () => {
         userId: 'u-1',
         clubId: 'club-1',
         role: String(req.headers['x-role'] ?? 'OWNER'),
-        level: Number(req.headers['x-level'] ?? 3) as 1 | 2 | 3,
         trainerId: null,
       };
       next();

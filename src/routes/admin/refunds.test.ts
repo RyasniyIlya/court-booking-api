@@ -12,6 +12,7 @@ import request from 'supertest';
  */
 
 const prisma = {
+  user: { findUniqueOrThrow: vi.fn(async () => ({ email: 'owner@club.test' })) },
   payment: { findFirst: vi.fn(), update: vi.fn() },
   booking: { findFirst: vi.fn() },
   bookingSeat: { findUnique: vi.fn() },
@@ -23,15 +24,14 @@ const providerFor = vi.fn(() => ({ name: 'mock', refund }));
 vi.mock('../../lib/db', () => ({ prisma }));
 vi.mock('../../lib/payments', () => ({ providerFor: (c: unknown) => providerFor(c as never) }));
 
-/* Права перевіряються своїми тестами (lib/access), тут вони лише не мають
-   заважати: підставляємо власника з рівнем 3. */
+/* Права перевіряються окремо, тут вони лише не мають заважати:
+   підставляємо власника. */
 vi.mock('./shared', () => ({
   requireAuth: (req: { auth?: unknown }, _res: unknown, next: () => void) => {
-    req.auth = { userId: 'u1', clubId: 'club-1', role: 'OWNER', level: 3, trainerId: null };
+    req.auth = { userId: 'u1', clubId: 'club-1', role: 'OWNER', trainerId: null };
     next();
   },
   requireRole: () => (_q: unknown, _s: unknown, next: () => void) => next(),
-  requireLevel: () => (_q: unknown, _s: unknown, next: () => void) => next(),
   requireStaff: (_q: unknown, _s: unknown, next: () => void) => next(),
   param: (req: { params: Record<string, string> }, name: string) => req.params[name],
 }));
@@ -78,7 +78,7 @@ describe('повернення за бронь корту', () => {
     expect(refund).toHaveBeenCalledWith('inv-1', 45000);
     expect(prisma.payment.update).toHaveBeenCalledWith({
       where: { id: 'pay-1' },
-      data: { refundRequestedAt: expect.any(Date) },
+      data: { refundRequestedAt: expect.any(Date), refundRequestedBy: 'owner@club.test' },
     });
   });
 

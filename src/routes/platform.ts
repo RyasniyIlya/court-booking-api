@@ -127,6 +127,7 @@ platformRouter.get('/clubs', requirePlatformAuth, async (_req, res) => {
       billingNote: true,
       planPrice: true,
       plan: { select: PLAN_SELECT },
+      group: { select: { id: true, name: true } },
       createdAt: true,
       users: {
         where: { role: 'OWNER' },
@@ -148,6 +149,115 @@ platformRouter.get('/clubs', requirePlatformAuth, async (_req, res) => {
       _count: undefined,
     })),
   );
+});
+
+/* -------------------------------------------------------------------------- */
+/* CLUB GROUPS                                                                */
+/* -------------------------------------------------------------------------- */
+
+const groupBody = z.object({
+  name: z.string().trim().min(2).max(120),
+  note: z.string().trim().max(500).nullable().optional(),
+  clubIds: z.array(z.string().uuid()).max(100).default([]),
+});
+
+const groupInclude = {
+  clubs: {
+    orderBy: { name: 'asc' as const },
+    select: {
+      id: true, name: true, slug: true, paidUntil: true, trialEndsAt: true,
+      billingPeriod: true, planPrice: true, plan: { select: PLAN_SELECT },
+    },
+  },
+};
+
+platformRouter.get('/groups', requirePlatformAuth, async (_req, res) => {
+  const groups = await prisma.clubGroup.findMany({
+    orderBy: { name: 'asc' },
+    include: groupInclude,
+  });
+  res.json(groups);
+});
+
+platformRouter.post('/groups', requirePlatformAuth, async (req, res) => {
+  const parsed = groupBody.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const clubIds = [...new Set(parsed.data.clubIds)];
+
+  const group = await prisma.$transaction(async (tx) => {
+    const created = await tx.clubGroup.create({
+      data: { name: parsed.data.name, note: parsed.data.note || null },
+    });
+    if (clubIds.length) {
+      await tx.club.updateMany({ where: { id: { in: clubIds } }, data: { groupId: created.id } });
+    }
+    return tx.clubGroup.findUniqueOrThrow({ where: { id: created.id }, include: groupInclude });
+  });
+  res.status(201).json(group);
+});
+
+platformRouter.patch('/groups/:id', requirePlatformAuth, async (req, res) => {
+  const parsed = groupBody.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const clubIds = [...new Set(parsed.data.clubIds)];
+
+  try {
+    const group = await prisma.$transaction(async (tx) => {
+      await tx.clubGroup.update({
+        where: { id },
+        data: { name: parsed.data.name, note: parsed.data.note || null },
+      });
+      await tx.club.updateMany({ where: { groupId: id, id: { notIn: clubIds } }, data: { groupId: null } });
+      if (clubIds.length) {
+        await tx.club.updateMany({ where: { id: { in: clubIds } }, data: { groupId: id } });
+      }
+      return tx.clubGroup.findUniqueOrThrow({ where: { id }, include: groupInclude });
+    });
+    res.json(group);
+  } catch {
+    res.status(404).json({ error: 'NOT_FOUND' });
+  }
+});
+
+platformRouter.delete('/groups/:id', requirePlatformAuth, async (req, res) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  try {
+    await prisma.clubGroup.delete({ where: { id } });
+    res.status(204).end();
+  } catch {
+    res.status(404).json({ error: 'NOT_FOUND' });
+  }
+});
+
+const groupSettingsBody = z.object({
+  planId: z.string().uuid().nullable().optional(),
+  planPrice: z.number().int().min(0).max(100_000_00).nullable().optional(),
+  billingPeriod: z.enum(['MONTH', 'QUARTER', 'YEAR']).optional(),
+  paidUntil: z.string().date().nullable().optional(),
+  trialEndsAt: z.string().date().nullable().optional(),
+});
+
+platformRouter.patch('/groups/:id/settings', requirePlatformAuth, async (req, res) => {
+  const parsed = groupSettingsBody.safeParse(req.body);
+  if (!parsed.success || Object.keys(parsed.data).length === 0) {
+    return res.status(400).json({ error: 'BAD_REQUEST' });
+  }
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const exists = await prisma.clubGroup.findUnique({ where: { id }, select: { id: true } });
+  if (!exists) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const { paidUntil, trialEndsAt, ...rest } = parsed.data;
+  const data: Record<string, unknown> = { ...rest };
+  if (paidUntil !== undefined) data.paidUntil = paidUntil ? new Date(`${paidUntil}T23:59:59.999Z`) : null;
+  if (trialEndsAt !== undefined) data.trialEndsAt = trialEndsAt ? new Date(`${trialEndsAt}T23:59:59.999Z`) : null;
+
+  try {
+    const result = await prisma.club.updateMany({ where: { groupId: id }, data });
+    res.json({ ok: true, updated: result.count });
+  } catch {
+    res.status(400).json({ error: 'BAD_REQUEST' });
+  }
 });
 
 const patchSchema = z.object({
@@ -541,6 +651,64 @@ platformRouter.post('/clubs/:id/subscription', requirePlatformAuth, async (req, 
   }
 
   res.json({ ok: true, club: updated, invoice });
+});
+
+/** Зарахувати однаковий період усім точкам мережі. amount — за одну точку. */
+platformRouter.post('/groups/:id/subscription', requirePlatformAuth, async (req, res) => {
+  const parsed = subscriptionSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const group = await prisma.clubGroup.findUnique({
+    where: { id },
+    select: {
+      name: true,
+      clubs: {
+        select: {
+          id: true, paidUntil: true, billingPeriod: true, planPrice: true,
+          plan: { select: PLAN_SELECT },
+        },
+      },
+    },
+  });
+  if (!group) return res.status(404).json({ error: 'NOT_FOUND' });
+  if (group.clubs.length === 0) return res.status(409).json({ error: 'EMPTY_GROUP' });
+
+  const rows = group.clubs.map((club) => {
+    const period = parsed.data.period ?? club.plan?.period ?? club.billingPeriod;
+    const { from, to } = nextPeriod(club.paidUntil, period);
+    return {
+      club,
+      period,
+      from,
+      to,
+      amount: parsed.data.amount ?? periodAmount(club.plan, club.planPrice, period),
+    };
+  });
+
+  await prisma.$transaction(rows.flatMap((row) => [
+    prisma.clubInvoice.create({
+      data: {
+        clubId: row.club.id,
+        periodFrom: row.from,
+        periodTo: row.to,
+        amount: row.amount,
+        status: 'PAID',
+        paidAt: new Date(),
+        method: parsed.data.method || null,
+        note: parsed.data.note || `Мережа: ${group.name}`,
+      },
+    }),
+    prisma.club.update({
+      where: { id: row.club.id },
+      data: { paidUntil: row.to, billingPeriod: row.period },
+    }),
+  ]));
+
+  res.json({
+    ok: true,
+    updated: rows.length,
+    totalAmount: rows.reduce((sum, row) => sum + row.amount, 0),
+  });
 });
 
 /**

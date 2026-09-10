@@ -36,9 +36,6 @@ vi.mock('../lib/payments', () => ({
 vi.mock('../lib/customerAuth', () => ({
   signCustomerToken: vi.fn(),
   verifyCustomerToken,
-  verifyCustomerPin: vi.fn(),
-  hashPinLookup: vi.fn(),
-  isPinTakenError: () => false,
 }));
 
 const { publicRouter } = await import('./public');
