@@ -15,6 +15,8 @@ import { blocksRouter } from './blocks';
 import { customersRouter } from './customers';
 import { passesRouter } from './passes';
 import { staffRouter } from './staff';
+import { promosRouter } from './promos';
+import { inventoryRouter } from './inventory';
 
 /**
  * /api/admin — кабінет клубу, розрізаний по доменах замість одного
@@ -44,6 +46,10 @@ adminRouter.use(blocksRouter);
 adminRouter.use(customersRouter);
 adminRouter.use(passesRouter);
 adminRouter.use(staffRouter);
+adminRouter.use(promosRouter);
+/* Перед clubRouter не можна — фото їде сирим тілом, як і логотип: роутер
+   тримає свій express.raw на власному шляху. */
+adminRouter.use(inventoryRouter);
 
 // analytics.ts монтується окремо в index.ts (src/index.ts), але захищає
 // свої роути тим самим requireAuth/requireRole, що й кабінет.

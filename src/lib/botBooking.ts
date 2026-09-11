@@ -1,0 +1,44 @@
+export type BookingClub = { slug: string; name: string };
+
+const trimSlash = (value: string) => value.trim().replace(/\/+$/, '');
+
+/** Public frontend that hosts /c/:slug. The first CORS origin is a safe fallback. */
+export function publicWebBase(env: NodeJS.ProcessEnv = process.env): string | null {
+  const explicit = trimSlash(env.PUBLIC_WEB_URL ?? '');
+  if (explicit) return explicit;
+  const firstOrigin = (env.ADMIN_ORIGINS ?? '').split(',').map(trimSlash).find(Boolean);
+  return firstOrigin ?? null;
+}
+
+export function clubStartPayload(slug: string) {
+  return `club_${slug}`;
+}
+
+export function slugFromStartPayload(payload: string | undefined): string | null {
+  if (!payload?.startsWith('club_')) return null;
+  const slug = payload.slice(5);
+  return /^[a-z0-9][a-z0-9-]{1,47}$/.test(slug) ? slug : null;
+}
+
+export function bookingUrl(slug: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const base = publicWebBase(env);
+  return base ? `${base}/c/${encodeURIComponent(slug)}` : null;
+}
+
+export function clubChoiceKeyboard(clubs: BookingClub[]) {
+  return {
+    inline_keyboard: clubs.map((club) => [{
+      text: `🎾 ${club.name}`,
+      callback_data: `bookclub:${club.slug}`,
+    }]),
+  };
+}
+
+export function openBookingKeyboard(slug: string, env: NodeJS.ProcessEnv = process.env) {
+  const url = bookingUrl(slug, env);
+  if (!url) return undefined;
+  const button = url.startsWith('https://')
+    ? { text: 'Обрати час і забронювати', web_app: { url } }
+    : { text: 'Обрати час і забронювати', url };
+  return { inline_keyboard: [[button]] };
+}

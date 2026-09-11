@@ -26,6 +26,11 @@ import {
 } from './botKeyboard';
 import { revenueBreakdown, revenueText, staffReport, staffText } from './sections';
 import { botAnalytics } from './botAnalytics';
+import {
+  clubChoiceKeyboard,
+  openBookingKeyboard,
+  slugFromStartPayload,
+} from './botBooking';
 
 /**
  * Що бот відповідає на команди.
@@ -45,9 +50,12 @@ import { botAnalytics } from './botAnalytics';
 const HELP = [
   '🎾 <b>Бот вашого клубу</b>',
   '',
-  'Показує цифри клубу: виручку за день, за вчора і тиждень із графіком.',
+  '<b>Для гравця</b>',
+  'Натисніть /book, оберіть клуб і відкрийте його розклад.',
+  'Якщо клуб надіслав своє посилання на бота — вибирати клуб повторно не потрібно.',
   '',
-  '<b>Щоб увійти</b>',
+  '<b>Для команди клубу</b>',
+  'Після входу бот показує броні, виручку та робочі звіти.',
   '<code>/login пошта пароль</code>',
   '',
   '<i>Пошта і пароль — ті самі, що й у кабінеті.</i>',
@@ -60,6 +68,41 @@ const HELP = [
 ].join('\n');
 
 type Club = { id: string; name: string; timezone: string };
+
+const html = (value: string) => value
+  .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
+
+async function bookingClub(slug: string) {
+  return prisma.club.findFirst({
+    where: { slug, isActive: true, approvedAt: { not: null } },
+    select: { slug: true, name: true },
+  });
+}
+
+async function showBookingClub(chatId: string, slug: string): Promise<boolean> {
+  const club = await bookingClub(slug);
+  if (!club) return false;
+  const markup = openBookingKeyboard(club.slug);
+  const setup = markup
+    ? 'Натисніть кнопку нижче — розклад відкриється прямо в Telegram.'
+    : 'Адреса онлайн-бронювання ще не налаштована. Попросіть клуб надіслати посилання.';
+  await sendMessage(chatId, `🎾 <b>${html(club.name)}</b>\n\n${setup}`, markup);
+  return true;
+}
+
+async function showClubChoice(chatId: string) {
+  const clubs = await prisma.club.findMany({
+    where: { isActive: true, approvedAt: { not: null } },
+    select: { slug: true, name: true },
+    orderBy: { name: 'asc' },
+    take: 30,
+  });
+  if (clubs.length === 0) {
+    await sendMessage(chatId, 'Зараз немає клубів, доступних для онлайн-бронювання.');
+    return;
+  }
+  await sendMessage(chatId, 'Оберіть клуб, у якому хочете забронювати корт:', clubChoiceKeyboard(clubs));
+}
 
 /** Кого ми знаємо за цим чатом */
 async function userByChat(chatId: string) {
@@ -243,6 +286,13 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
   const chatId = String(q.message?.chat.id ?? q.from?.id ?? '');
   if (!chatId) return;
 
+  if (q.data?.startsWith('bookclub:')) {
+    const slug = q.data.slice('bookclub:'.length);
+    const shown = /^[a-z0-9][a-z0-9-]{1,47}$/.test(slug) && await showBookingClub(chatId, slug);
+    await answerCallback(q.id, shown ? undefined : 'Клуб не знайдено');
+    return;
+  }
+
   const me = await userByChat(chatId);
 
   if (!me) {
@@ -370,6 +420,15 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
     return;
   }
 
+  const startClub = cmd === '/start' ? slugFromStartPayload(args[0]) : null;
+  if (startClub) {
+    if (!await showBookingClub(chatId, startClub)) {
+      await sendMessage(chatId, 'Цей клуб не знайдено або онлайн-бронювання вимкнене.');
+      await showClubChoice(chatId);
+    }
+    return;
+  }
+
   /* /start із кодом — сумісність із кнопкою кабінету. */
   if (cmd === '/start' && args[0]) {
     const reply = await linkByCode(chatId, args[0]);
@@ -387,6 +446,11 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
   const me = await userByChat(chatId);
 
   if (!me) {
+    if (cmd === '/start' || cmd === '/book') {
+      await setMyCommands(COMMANDS_GUEST, chatId);
+      await showClubChoice(chatId);
+      return;
+    }
     /* Голий код без /start теж приймаємо: людина частіше просто вставляє
        його в чат, ніж пише команду з аргументом. */
     if (/^[A-Z0-9]{6}$/i.test(raw)) {

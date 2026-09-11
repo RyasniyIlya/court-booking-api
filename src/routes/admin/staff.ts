@@ -25,6 +25,7 @@ staffRouter.get(
       where: { clubId: req.auth!.clubId },
       select: {
         id: true,
+        name: true,
         email: true,
         role: true,
         trainerId: true,
@@ -60,6 +61,7 @@ staffRouter.post(
     const parsed = z
       .object({
         email: z.string().trim().toLowerCase().email(),
+        name: z.string().trim().min(2).max(80).optional(),
         password: z.string().min(8).max(128),
         role: z.enum(['ADMIN', 'TRAINER']),
         trainerId: z.string().uuid().nullable().optional(),
@@ -80,6 +82,10 @@ staffRouter.post(
         error: 'FORBIDDEN',
         requiredRole: ['OWNER'],
       });
+    }
+
+    if (parsed.data.role === 'ADMIN' && !parsed.data.name) {
+      return res.status(400).json({ error: 'NAME_REQUIRED' });
     }
 
     if (await prisma.user.findUnique({ where: { email: parsed.data.email } })) {
@@ -112,6 +118,7 @@ staffRouter.post(
     const user = await prisma.user.create({
       data: {
         clubId: req.auth!.clubId,
+        name: parsed.data.name ?? null,
         email: parsed.data.email,
         passwordHash,
         role: parsed.data.role,
@@ -119,6 +126,7 @@ staffRouter.post(
       },
       select: {
         id: true,
+        name: true,
         email: true,
         role: true,
         trainerId: true,

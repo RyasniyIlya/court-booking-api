@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
 import { paymentPlanSchema, totals } from '../../lib/settlements';
+import { isTournament } from '../../lib/tournamentPay';
 import { z } from 'zod';
 import { DateTime } from 'luxon';
 
@@ -494,7 +495,11 @@ bookingsRouter.post(
             priceTotal,
             status: initialStatus,
             source: 'ADMIN',
-            ...(d.paymentPlan && !isGroup ? { paymentPlan: await paymentPlanSnapshot(d.paymentPlan, req.auth!.userId) } : {}),
+            /* Те саме правило, що й у PATCH: план оплати дозволений
+               приватній броні й турніру, але не звичайній групі. */
+            ...(d.paymentPlan && (!isGroup || isTournament(d))
+              ? { paymentPlan: await paymentPlanSnapshot(d.paymentPlan, req.auth!.userId) }
+              : {}),
             createdBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
             ...(initialStatus === 'CONFIRMED' ? {
               confirmedBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
@@ -686,8 +691,14 @@ bookingsRouter.patch(
       unknown
     > = {};
 
+    /* План оплати є у приватної броні (домовленість із клієнтом) і в
+       турніру (правило для реєстрацій). У звичайного групового заняття
+       його немає: там кожне місце платить своїм способом, і одна
+       домовленість на всіх була б неправдою в картці. */
     if (p.paymentPlan) {
-      if (booking.capacity !== null) return res.status(400).json({ error: 'BAD_REQUEST' });
+      if (booking.capacity !== null && !isTournament(booking)) {
+        return res.status(400).json({ error: 'BAD_REQUEST' });
+      }
       data.paymentPlan = await paymentPlanSnapshot(p.paymentPlan, req.auth!.userId);
     }
 
@@ -752,6 +763,17 @@ bookingsRouter.patch(
         p.status === 'CANCELLED'
           ? new Date()
           : null;
+      if (p.status === 'CANCELLED') {
+        const actor = await prisma.user.findUniqueOrThrow({
+          where: { id: req.auth!.userId },
+          select: { email: true, name: true, role: true },
+        });
+        data.cancelledBy = actor.role === 'OWNER'
+          ? { role: 'OWNER' }
+          : { role: actor.role, name: actor.name, email: actor.email };
+      } else {
+        data.cancelledBy = null;
+      }
     }
 
     if (p.comment !== undefined) {
@@ -1324,6 +1346,11 @@ bookingsRouter.post(
       });
     }
 
+    const actor = await prisma.user.findUniqueOrThrow({
+      where: { id: req.auth!.userId },
+      select: { email: true, name: true, role: true },
+    });
+
     const result =
       await prisma.booking.updateMany({
         where: {
@@ -1343,6 +1370,9 @@ bookingsRouter.post(
             'CANCELLED',
           cancelledAt:
             new Date(),
+          cancelledBy: actor.role === 'OWNER'
+            ? { role: 'OWNER' }
+            : { role: actor.role, name: actor.name, email: actor.email },
         },
       });
 

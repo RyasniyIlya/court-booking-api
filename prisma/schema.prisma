@@ -189,6 +189,8 @@ model Club {
   invoices      ClubInvoice[]
   passPlans     PassPlan[]
   expenses      ClubExpense[]
+  promos        Promo[]
+  inventory     InventoryItem[]
   resetRequests PasswordReset[]
   /// Коли ми підтвердили клуб після реєстрації. null = чекає на дзвінок/оплату.
   /// Впливає на віддачу даних для публічного віджета.
@@ -590,6 +592,8 @@ model Booking {
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
   cancelledAt DateTime?
+  /// Snapshot автора отмены: роль и email на момент действия.
+  cancelledBy Json?
 
   @@index([clubId, startTime])
   @@index([courtId, startTime])
@@ -745,6 +749,7 @@ model Block {
 
 model User {
   id           String   @id @default(uuid()) @db.Uuid
+  name         String?
   clubId       String   @db.Uuid
   club         Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
   email        String   @unique
@@ -1024,4 +1029,107 @@ model CustomerReward {
   createdAt  DateTime @default(now())
 
   @@index([clubId, customerId, createdAt])
+}
+
+/// Коли саме діє акція.
+enum PromoKind {
+  /// Ті самі дні щотижня: «щасливі години» на будні до обіду.
+  WEEKLY
+  /// Проміжок дат: свята, відкриття сезону, тиждень після ремонту.
+  DATES
+  /// Вікно навколо дня народження гравця. Єдиний вид, якому потрібно
+  /// знати, ХТО бронює: без дати народження в картці не діє.
+  BIRTHDAY
+}
+
+/// Наскільки дешевше.
+enum PromoDiscount {
+  /// Відсоток від ціни корту. Клуб підніме тариф — акція не переписується.
+  PERCENT
+  /// Пряма ціна за годину, копійки. Рівна цифра для афіші.
+  PRICE
+}
+
+/// Акційна ціна на час корту.
+///
+/// Ціну броні рахує сервер (src/lib/promo.ts), а не віджет: те, що
+/// намальовано в браузері, — обіцянка на екрані, і касі її не пред'явиш.
+/// Правило-дзеркало живе у web/src/lib/promo.js, щоб кабінет показував
+/// гравцю те саме, що потім візьме з нього API.
+model Promo {
+  id     String @id @default(uuid()) @db.Uuid
+  clubId String @db.Uuid
+  club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+
+  /// Назва для афіші й для сітки у віджеті.
+  title String
+  kind  PromoKind @default(WEEKLY)
+
+  /// WEEKLY: дні тижня, 0 = неділя (як у Date.getDay).
+  weekdays Int[]
+  /// DATES: перший і останній день включно, локальна дата клубу.
+  dateFrom DateTime? @db.Date
+  dateTo   DateTime? @db.Date
+  /// BIRTHDAY: скільки днів до дня народження акція вже діє і скільки
+  /// після нього ще діє. 0/0 — рівно день народження, теж допустимо.
+  daysBefore Int @default(0)
+  daysAfter  Int @default(0)
+
+  /// Вікно часу всередині дня, хвилини від опівночі. Слот, що почався у
+  /// вікні, продається за акційною ціною цілком — інакше одна година
+  /// коштувала б двома цінами всередині себе.
+  startMinute Int @default(0)
+  endMinute   Int @default(1440)
+
+  discountType  PromoDiscount @default(PERCENT)
+  /// PERCENT: 1..90. PRICE: копійки за годину.
+  discountValue Int           @default(0)
+
+  /// Порожньо = весь клуб. Інакше тільки ці корти.
+  courtIds String[] @db.Uuid
+
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clubId, isActive])
+}
+
+/// Одиниця клубного інвентарю: ракетки, мʼячі, сітки, столи.
+///
+/// Досі це жило в голові адміністратора й у зошиті на ресепшені, а питання
+/// «скільки в нас цілих ракеток» виникає рівно тоді, коли відповідь потрібна
+/// негайно — перед турніром або коли гравець просить інвентар напрокат.
+///
+/// Категорія — рядок, а не enum. Перелік «ракетки / мʼячі / сітки / столи»
+/// покриває тенісний клуб і не покриває сусідній: там будуть рушники,
+/// лампи й дитячі ракетки на 23 дюйми. Enum довелося б розширювати
+/// міграцією на кожну нову річ у коморі.
+model InventoryItem {
+  id     String @id @default(uuid()) @db.Uuid
+  clubId String @db.Uuid
+  club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+
+  name String
+  /// Вільна назва групи: «Ракетки», «Мʼячі», «Сітки». Порожньо = без групи.
+  category String?
+  /// Скільки одиниць зараз у клубі.
+  quantity Int     @default(0)
+  /// Одиниця виміру: шт, пар, упаковок. Мʼячі рахують коробками, ракетки — штуками.
+  unit     String?
+  /// Що знати персоналу: де лежить, що зламане, коли купували.
+  note     String?
+
+  /// Фото речі — байтами в базі, як і логотип клубу: у Render файлова
+  /// система ефемерна, і після деплою всі картинки зникли б. Дрібні
+  /// зображення на кількасот кілобайт того не варті, щоб заводити S3.
+  photoData      Bytes?
+  photoMime      String?
+  photoUpdatedAt DateTime?
+
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([clubId, sortOrder])
 }

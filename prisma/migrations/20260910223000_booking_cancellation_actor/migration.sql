@@ -1,0 +1,2 @@
+ALTER TABLE "Booking" ADD COLUMN "cancelledBy" JSONB;
+ALTER TABLE "User" ADD COLUMN "name" TEXT;

@@ -16,6 +16,8 @@ import { isTrainerAvailable } from '../lib/trainerAvailability';
 import { signCustomerToken, verifyCustomerToken } from '../lib/customerAuth';
 import { birthDateText, birthDateValue, dateOnly } from '../lib/birthday';
 import { isRegistrationOpen, registrationClosesAt } from '../lib/registrationCutoff';
+import { resolveJoinPayment, tournamentPayMode } from '../lib/tournamentPay';
+import { courtPriceWithPromos, bestPromo, promoPrice } from '../lib/promo';
 
 export const publicRouter = Router();
 
@@ -43,6 +45,9 @@ async function loadClub(slug: string) {
     include: {
       hours: true,
       courts: { where: { isActive: true }, orderBy: { sortOrder: 'asc' } },
+      /* Тільки увімкнені: правило, яке клуб вимкнув, не має ні рахувати
+         ціну, ні їхати в кожну відповідь віджета. Рядків одиниці. */
+      promos: { where: { isActive: true } },
       trainers: {
         where: { isActive: true },
         orderBy: { sortOrder: 'asc' },
@@ -146,6 +151,25 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     // true+false — гравець сам обирає «зараз» чи «на місці».
     prepayEnabled: club.prepayEnabled,
     prepayRequired: club.prepayRequired,
+    /* Акції клубу — для повідомлення у віджеті: «у нас дешевший ранок»
+       гравець має побачити до того, як почне шукати вільну годину. Це
+       правила, а не ціни: скільки коштуватиме конкретна година, віджет
+       бере зі слоту, а остаточну суму все одно рахує сервер при броні. */
+    promos: club.promos.map((p) => ({
+      id: p.id,
+      title: p.title,
+      kind: p.kind,
+      weekdays: p.weekdays,
+      dateFrom: dateOnly(p.dateFrom),
+      dateTo: dateOnly(p.dateTo),
+      daysBefore: p.daysBefore,
+      daysAfter: p.daysAfter,
+      startMinute: p.startMinute,
+      endMinute: p.endMinute,
+      discountType: p.discountType,
+      discountValue: p.discountValue,
+      courtIds: p.courtIds,
+    })),
   });
 });
 
@@ -184,6 +208,40 @@ publicRouter.get('/clubs/:slug/logo', async (req, res) => {
   }
 
   res.send(club.logoData);
+});
+
+/**
+ * GET /api/public/inventory/:id/photo — фото речі з комори клубу.
+ *
+ * Публічний з тієї ж причини, що й логотип: <img src> не вміє слати
+ * заголовок авторизації, а тягнути кожну картку через fetch з токеном і
+ * blob-адресами — це три екрани коду заради знімка ракетки. Адреса — це
+ * випадковий uuid: вгадати його не можна, а хто має посилання, той уже має
+ * і доступ до кабінету. Таємниці у фотографії кошика з мʼячами рівно
+ * стільки ж, скільки в логотипі на дверях.
+ *
+ * Нічого, крім самих байтів, роут не віддає: ні назви речі, ні клубу.
+ */
+publicRouter.get('/inventory/:id/photo', async (req, res) => {
+  const id = z.string().uuid().safeParse(req.params.id);
+  if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const item = await prisma.inventoryItem.findUnique({
+    where: { id: id.data },
+    select: { photoData: true, photoMime: true, photoUpdatedAt: true },
+  });
+
+  if (!item?.photoData || !item.photoMime) {
+    return res.status(404).json({ error: 'NO_PHOTO' });
+  }
+
+  res.setHeader('Content-Type', item.photoMime);
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', 'inline');
+  if (item.photoUpdatedAt) res.setHeader('ETag', `"${item.photoUpdatedAt.getTime()}"`);
+
+  res.send(item.photoData);
 });
 
 /**
@@ -292,6 +350,7 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
         capacity: true,
         title: true,
         pricePerSeat: true,
+        paymentPlan: true,
         trainer: { select: { name: true } },
         /* PENDING рахується зайнятим нарівні з BOOKED: місце під оплатою
            вже не вільне, і показувати його як вільне означало б вести
@@ -306,6 +365,22 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
   ]);
 
   const now = new Date();
+
+  /* Кого ми обслуговуємо. Акція на день народження діє не «в такі дні», а
+     «в такі дні ЦЬОГО гравця», тож гостю її в сітці показати нема з чого:
+     він побачить звичайну ціну, а не чужу знижку. Токен тут
+     необовʼязковий — без нього сітка працює рівно як раніше. */
+  const header = req.headers.authorization;
+  const viewer = header?.startsWith('Bearer ')
+    ? verifyCustomerToken(header.slice(7))
+    : null;
+  const me = viewer && viewer.clubId === club.id
+    ? await prisma.customer.findFirst({
+        where: { id: viewer.customerId, clubId: club.id },
+        select: { birthDate: true },
+      })
+    : null;
+
   const result = courts.map((court) => {
     const busy: Interval[] = [
       ...bookings.filter((b) => b.courtId === court.id),
@@ -336,6 +411,36 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
       (b) => b.courtId === court.id && b.capacity != null,
     );
 
+    /* Акційна ціна цієї години. Рахуємо по ПОЧАТКУ слоту — тим самим
+       правилом, що й ціну броні: година, яка почалась у вікні акції,
+       продається за акційною ціною цілком. */
+    const promoFor = (startIso: string) => {
+      if (club.promos.length === 0) return null;
+      const at = DateTime.fromISO(startIso).setZone(club.timezone);
+      const promo = bestPromo(
+        club.promos,
+        {
+          date: at.toFormat('yyyy-MM-dd'),
+          startMinute: at.hour * 60 + at.minute,
+          courtId: court.id,
+          birthDate: me?.birthDate ?? null,
+        },
+        court.pricePerHour,
+      );
+      if (!promo) return null;
+
+      return {
+        id: promo.id,
+        title: promo.title,
+        kind: promo.kind,
+        discountType: promo.discountType,
+        discountValue: promo.discountValue,
+        /* Ціна години зі знижкою, копійки. Віджет не перераховує її сам:
+           два округлення в різних місцях — два різні числа на екрані. */
+        price: promoPrice(court.pricePerHour, promo),
+      };
+    };
+
     return {
       courtId: court.id,
       courtName: court.name,
@@ -358,6 +463,10 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
             taken,
             free: Math.max(0, (g.capacity ?? 0) - taken),
             pricePerSeat: g.pricePerSeat ?? 0,
+            /* Не весь paymentPlan, а тільки режим: у плані лежить ще й
+               хто та коли його записав — це кухня клубу, а не діло
+               гравця. 'CLUB' означає «за загальними правилами клубу». */
+            payMode: tournamentPayMode(g),
             trainerName: g.trainer?.name ?? null,
             start: g.startTime.toISOString(),
             end: g.endTime.toISOString(),
@@ -373,6 +482,9 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
             registrationClosesAt: registrationClosesAt(g.startTime).toISOString(),
           },
         };
+      }).map((s) => {
+        const promo = promoFor(s.start);
+        return promo ? { ...s, promo } : s;
       }),
     };
   });
@@ -496,7 +608,22 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     : undefined;
 
   const minutes = (end.getTime() - start.getTime()) / 60_000;
-  const courtPrice = Math.round((court.pricePerHour * minutes) / 60);
+
+  /* Акційна ціна корту. Правило клубу може бути на час («щасливі години»),
+     на дати або на день народження — останньому потрібно знати, хто
+     бронює, тому дата народження їде в розрахунок. Вона вже звірена з
+     карткою вище (BIRTH_DATE_MISMATCH), тож підставити чужий день
+     народження заради знижки не вийде. */
+  const { price: courtPrice } = courtPriceWithPromos({
+    pricePerHour: court.pricePerHour,
+    start,
+    end,
+    timezone: club.timezone,
+    slotMinutes,
+    courtId: court.id,
+    promos: club.promos,
+    birthDate: body.birthDate,
+  });
 
   // Тренер: перевіряємо, що він цього клубу, активний і не зайнятий.
   // Констрейнта в базі на тренера немає — тому теоретично двоє можуть
@@ -740,13 +867,11 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
   });
   if (customer?.isBlocked) return res.status(403).json({ error: 'CUSTOMER_BLOCKED' });
 
-  /* Ті самі три стани клуба, що й у броні корту. Вибір обов'язковий, коли
-     клуб його лишив: без нього незрозуміло, чи тримати місце під оплату. */
-  if (club.prepayEnabled && !club.prepayRequired && !body.payChoice) {
-    return res.status(400).json({ error: 'PAY_CHOICE_REQUIRED' });
-  }
-  const wantsOnlinePay = club.prepayRequired || body.payChoice === 'online';
-  const provider = club.prepayEnabled && wantsOnlinePay ? providerFor(club) : null;
+  /* Провайдер платежів вибирається вже всередині транзакції: для турніру
+     відповідь залежить від самої події, а не тільки від клубу, і прочитати
+     її можна лише під замком рядка. Рахунок виставляємо після транзакції,
+     тому змінна живе тут. */
+  let provider: ReturnType<typeof providerFor> = null;
 
   let made;
   try {
@@ -756,9 +881,9 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
       const rows = await tx.$queryRaw<
         {
           id: string; clubId: string; capacity: number | null; pricePerSeat: number | null;
-          status: string; title: string | null; startTime: Date; endTime: Date;
+          status: string; title: string | null; startTime: Date; endTime: Date; paymentPlan: { method?: string };
         }[]
-      >`SELECT "id", "clubId", "capacity", "pricePerSeat", "status"::text, "title", "startTime", "endTime"
+      >`SELECT "id", "clubId", "capacity", "pricePerSeat", "status"::text, "title", "startTime", "endTime", "paymentPlan"
           FROM "Booking" WHERE "id" = ${bookingId.data}::uuid FOR UPDATE`;
 
       const b = rows[0];
@@ -788,6 +913,27 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
       if (already) throw new HttpError(409, 'ALREADY_JOINED');
 
       const price = Math.round((b.pricePerSeat ?? 0) * (100 - (customer?.discountPercent ?? 0)) / 100);
+
+      /* Чим платить учасник. У турніру своє правило, у решти груп — клубне
+         (див. lib/tournamentPay.ts). Рахуємо всередині транзакції, бо
+         тільки тут ми вже прочитали саму подію під замком. */
+      const pay = resolveJoinPayment({
+        mode: tournamentPayMode(b),
+        price,
+        prepayEnabled: club.prepayEnabled,
+        prepayRequired: club.prepayRequired,
+        payChoice: body.payChoice,
+      });
+      if (pay.error) {
+        throw new HttpError(pay.error === 'PAY_CHOICE_REQUIRED' ? 400 : 409, pay.error);
+      }
+
+      /* Еквайринг увімкнено, але ключі не заведені — платіжки не буде.
+         Для турніру «тільки онлайн» це відмова: пустити без оплати
+         означало б зламати саме те правило, заради якого його ставили. */
+      provider = pay.online ? providerFor(club) : null;
+      if (pay.online && !provider) throw new HttpError(409, 'ONLINE_PAYMENT_UNAVAILABLE');
+
       const needsPay = Boolean(provider) && price > 0;
 
       const created = await tx.bookingSeat.create({
