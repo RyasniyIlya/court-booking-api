@@ -32,13 +32,62 @@ export const analyticsRouter = Router();
  */
 analyticsRouter.use(requireAuth, requireRole('OWNER', 'ADMIN'), requireFeature('analytics'));
 
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+
+/**
+ * Період звіту: готовий (тиждень/місяць) або заданий руками.
+ *
+ * `custom` зʼявився тому, що готових двох не вистачає рівно там, де звіт
+ * найпотрібніший: «покажи за час, поки йшла акція», «зведи травневий
+ * турнірний тиждень». Дати приходять як YYYY-MM-DD — без часу: години в
+ * такому запиті нічого не уточнюють, а плутанину з таймзонами дають.
+ */
 const periodQuery = z.object({
-  period: z.enum(['week', 'month']).default('week'),
+  period: z.enum(['week', 'month', 'custom']).default('week'),
+  from: z.string().regex(DATE_ONLY).optional(),
+  to: z.string().regex(DATE_ONLY).optional(),
 });
 
-/** Межі періоду в таймзоні клубу, повернуті як UTC-момент для запиту в базу. */
-function periodBounds(period: 'week' | 'month', tz: string, anchor: DateTime) {
-  const unit = period === 'week' ? 'week' : 'month';
+type PeriodQuery = z.infer<typeof periodQuery>;
+
+/**
+ * Скільки максимум можна замовити одним запитом.
+ *
+ * Межа не формальна: без неї «з 2000-01-01 по сьогодні» перетворюється на
+ * скан усієї таблиці броней клубу заради одного числа, і кабінет висне на
+ * запиті, який ніхто не мав на увазі.
+ */
+const MAX_CUSTOM_DAYS = 366;
+
+/**
+ * Межі періоду в таймзоні клубу, повернуті як UTC-момент для запиту в базу.
+ *
+ * null означає «такий період прочитати не можна» — викликач віддає 400.
+ * Порівняння з попереднім періодом для власного діапазону рахується тією
+ * самою тривалістю, що стоїть безпосередньо перед ним: інакше «−12%» було
+ * б відсотком від невідомо чого.
+ */
+export function periodBounds(q: PeriodQuery, tz: string, anchor: DateTime) {
+  if (q.period === 'custom') {
+    if (!q.from || !q.to) return null;
+
+    const start = DateTime.fromISO(q.from, { zone: tz }).startOf('day');
+    const end = DateTime.fromISO(q.to, { zone: tz }).endOf('day');
+    if (!start.isValid || !end.isValid || end < start) return null;
+
+    const span = end.toMillis() - start.toMillis();
+    if (span > MAX_CUSTOM_DAYS * 86_400_000) return null;
+
+    return {
+      current: { start: start.toJSDate(), end: end.toJSDate() },
+      previous: {
+        start: new Date(start.toMillis() - span - 1),
+        end: new Date(start.toMillis() - 1),
+      },
+    };
+  }
+
+  const unit = q.period === 'week' ? 'week' : 'month';
   const currentStart = anchor.setZone(tz).startOf(unit);
   const currentEnd = anchor.setZone(tz).endOf(unit);
   const previousStart = currentStart.minus({ [unit]: 1 } as Record<string, number>);
@@ -88,7 +137,11 @@ analyticsRouter.get('/summary', async (req, res) => {
   });
   if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
 
-  const { current, previous } = periodBounds(parsed.data.period, club.timezone, DateTime.now());
+    const bounds = periodBounds(parsed.data, club.timezone, DateTime.now());
+  /* Власний діапазон приходить від клієнта: перевернутий, задовгий або
+     неповний читати нема як. */
+  if (!bounds) return res.status(400).json({ error: 'BAD_PERIOD' });
+  const { current, previous } = bounds;
 
   const [now, prev] = await Promise.all([
     periodStats(req.auth!.clubId, current.start, current.end),
@@ -126,7 +179,11 @@ analyticsRouter.get('/customers/top', async (req, res) => {
   });
   if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
 
-  const { current } = periodBounds(parsed.data.period, club.timezone, DateTime.now());
+    const bounds = periodBounds(parsed.data, club.timezone, DateTime.now());
+  /* Власний діапазон приходить від клієнта: перевернутий, задовгий або
+     неповний читати нема як. */
+  if (!bounds) return res.status(400).json({ error: 'BAD_PERIOD' });
+  const { current } = bounds;
 
   const bookings = await prisma.booking.findMany({
     where: {
@@ -184,7 +241,11 @@ analyticsRouter.get('/trainers/load', async (req, res) => {
   });
   if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
 
-  const { current } = periodBounds(parsed.data.period, club.timezone, DateTime.now());
+    const bounds = periodBounds(parsed.data, club.timezone, DateTime.now());
+  /* Власний діапазон приходить від клієнта: перевернутий, задовгий або
+     неповний читати нема як. */
+  if (!bounds) return res.status(400).json({ error: 'BAD_PERIOD' });
+  const { current } = bounds;
 
   const bookings = await prisma.booking.findMany({
     where: {
@@ -590,6 +651,12 @@ const monthQuery = z.object({
   month: z.string().regex(/^\d{4}-\d{2}$/).optional(),
 });
 
+/** Те саме плюс власний діапазон: from/to сильніші за month, якщо задані. */
+const expensesQuery = monthQuery.extend({
+  from: z.string().regex(DATE_ONLY).optional(),
+  to: z.string().regex(DATE_ONLY).optional(),
+});
+
 /** 'YYYY-MM' (або порожньо — тоді поточний місяць у таймзоні клуба) -> межі місяця. */
 function monthBounds(monthStr: string | undefined, tz: string) {
   const anchor = monthStr
@@ -611,7 +678,7 @@ function monthBounds(monthStr: string | undefined, tz: string) {
  * запитом — власнику потрібне готове число, а не сирі дані для підрахунку.
  */
 analyticsRouter.get('/expenses', async (req, res) => {
-  const parsed = monthQuery.safeParse(req.query);
+  const parsed = expensesQuery.safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
   const club = await prisma.club.findUnique({
@@ -620,20 +687,70 @@ analyticsRouter.get('/expenses', async (req, res) => {
   });
   if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
 
-  const { monthKey, monthDate, start, end } = monthBounds(parsed.data.month, club.timezone);
+  const tz = club.timezone;
+  const clubId = req.auth!.clubId;
+
+  /* Власний діапазон. Витрата в базі привʼязана до МІСЯЦЯ, а не до дня:
+     оренда й зарплата так і платяться, дробити їх по днях ми не вміємо і
+     вигадувати не будемо. Тому для довільного періоду беремо витрати всіх
+     місяців, яких він торкається, а виручку — точно за вибрані дні, і
+     чесно кажемо клієнту прапорцем wholeMonths, чи можна вважати різницю
+     чистим прибутком. */
+  if (parsed.data.from && parsed.data.to) {
+    const start = DateTime.fromISO(parsed.data.from, { zone: tz }).startOf('day');
+    const end = DateTime.fromISO(parsed.data.to, { zone: tz }).endOf('day');
+    if (!start.isValid || !end.isValid || end < start) {
+      return res.status(400).json({ error: 'BAD_PERIOD' });
+    }
+
+    const months: Date[] = [];
+    for (let m = start.startOf('month'); m <= end; m = m.plus({ months: 1 })) {
+      months.push(m.toJSDate());
+    }
+
+    const [expenses, stats] = await Promise.all([
+      prisma.clubExpense.findMany({
+        where: { clubId, month: { in: months } },
+        orderBy: [{ month: 'asc' }, { createdAt: 'asc' }],
+      }),
+      periodStats(clubId, start.toJSDate(), end.toJSDate()),
+    ]);
+
+    const totalExpenses = expenses.reduce((s, e) => s + e.amount, 0);
+
+    res.json({
+      from: start.toFormat('yyyy-MM-dd'),
+      to: end.toFormat('yyyy-MM-dd'),
+      months: months.map((m) => DateTime.fromJSDate(m).setZone(tz).toFormat('yyyy-MM')),
+      /* Період збігається з межами місяців — отже, витрати й виручка
+         міряні по одній лінійці, і чистий прибуток можна називати чистим
+         прибутком. Інакше кабінет мусить це застерегти. */
+      wholeMonths: start.hasSame(start.startOf('month'), 'day')
+        && end.hasSame(end.endOf('month'), 'day'),
+      expenses,
+      totalExpenses,
+      revenue: stats.revenue,
+      netProfit: stats.revenue - totalExpenses,
+    });
+    return;
+  }
+
+  const { monthKey, monthDate, start, end } = monthBounds(parsed.data.month, tz);
 
   const [expenses, stats] = await Promise.all([
     prisma.clubExpense.findMany({
-      where: { clubId: req.auth!.clubId, month: monthDate },
+      where: { clubId, month: monthDate },
       orderBy: { createdAt: 'asc' },
     }),
-    periodStats(req.auth!.clubId, start, end),
+    periodStats(clubId, start, end),
   ]);
 
   const totalExpenses = expenses.reduce((s, e) => s + e.amount, 0);
 
   res.json({
     month: monthKey,
+    months: [monthKey],
+    wholeMonths: true,
     expenses,
     totalExpenses,
     revenue: stats.revenue,

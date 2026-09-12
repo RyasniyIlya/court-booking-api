@@ -2,7 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 import rateLimit from 'express-rate-limit';
 import { DateTime } from 'luxon';
-import { prisma, isSlotTakenError, notifyClub } from '../lib/db';
+import { prisma, isSlotTakenError } from '../lib/db';
 import { buildSlots, isAlignedToGrid, type Interval } from '../lib/slots';
 import { normalizePhone } from '../lib/phone';
 import { findOrCreateCustomer, getActivePass } from '../lib/customers';
@@ -11,7 +11,7 @@ import { clubBilling } from '../lib/billing';
 import { playerStats } from '../lib/playerStats';
 import { playerLevel } from '../lib/playerLevel';
 import { clubLadder, ladderWithMe } from '../lib/clubLadder';
-import { notifyTrainerBooked } from '../lib/notifyTrainer';
+import { notifyBooking } from '../lib/notifyBooking';
 import { isTrainerAvailable } from '../lib/trainerAvailability';
 import { signCustomerToken, verifyCustomerToken } from '../lib/customerAuth';
 import { birthDateText, birthDateValue, dateOnly } from '../lib/birthday';
@@ -751,29 +751,13 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     }
   }
 
-  // Без передоплати повідомляємо клуб одразу. З передоплатою — після оплати
-  // (див. lib/payments/apply.ts), інакше адміну падатимуть покинуті кошики.
-  void notifyClub(
-    club.telegramChatId,
-    `<b>Нова бронь</b>\n${court.name}\n${when}\n` +
-    (trainer ? `Тренер: ${trainer.name}\n` : '') +
-    `${body.customerName}, ${body.customerPhone}\n` +
-    `${(priceTotal / 100).toFixed(2)} грн`,
-  );
+  /* Без передоплати повідомляємо одразу. З передоплатою — після оплати
+     (див. lib/payments/apply.ts), інакше адміну падатимуть покинуті кошики.
 
-  /* Тренеру — в особистий чат, і тільки якщо його справді викликали.
-     Окремим повідомленням, а не рядком у клубній групі: там він побачив би
-     чужі броні, а головне — сам би нічого не помітив серед потоку. */
-  if (trainer) {
-    void notifyTrainerBooked({
-      trainerId: trainer.id,
-      startTime: start,
-      endTime: end,
-      courtName: court.name,
-      customerName: body.customerName,
-      customerPhone: body.customerPhone,
-    });
-  }
+     Кому саме піде повідомлення — клубній групі, власнику, модератору,
+     тренеру — вирішує notifyBooking. Тут ми знаємо лише те, що бронь
+     зʼявилась. */
+  void notifyBooking({ bookingId: booking.id, event: 'created' });
 
   res.status(201).json({
     id: booking.id,
@@ -971,6 +955,12 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
   const { seat, group, price, needsPay } = made;
 
   if (!needsPay) {
+    /* Те саме правило, що й у броні корту: без передоплати місце продане
+       вже зараз, з передоплатою про нього скаже вебхук. Раніше запис у
+       групу не бачив узагалі ніхто — ні клуб, ні тренер, який цю групу
+       веде. */
+    void notifyBooking({ bookingId: group.id, seatId: seat.id, event: 'created' });
+
     return res.status(201).json({
       id: seat.id,
       cancelToken: seat.cancelToken,
@@ -1125,6 +1115,13 @@ publicRouter.post('/bookings/:id/cancel', async (req, res) => {
     where: { id: booking.id },
     data: { status: 'CANCELLED', cancelledAt: new Date() },
   });
+
+  /* Найважливіше сповіщення з усіх. Гравець знімає бронь сам, за годину
+     чи за три дні, і без цього рядка клуб дізнавався про це, лише
+     відкривши сітку, а викликаний тренер — приїхавши на заняття,
+     якого вже немає. */
+  void notifyBooking({ bookingId: booking.id, event: 'cancelled' });
+
   res.json({ ok: true });
 });
 
@@ -1437,7 +1434,10 @@ publicRouter.post('/seats/:id/cancel', async (req, res) => {
     : null;
 
   try {
-    await prisma.$transaction(async (tx) => {
+    /* Транзакція каже, чи справді щось знято: повторний виклик і місце під
+       оплатою виходять із неї через `return null` і сповіщення не варті —
+       нічого не сталось. */
+    const cancelled = await prisma.$transaction(async (tx) => {
       const seat = await tx.bookingSeat.findUnique({
         where: { id: id.data },
         include: {
@@ -1465,7 +1465,7 @@ publicRouter.post('/seats/:id/cancel', async (req, res) => {
          не має бути помилкою (гравець міг двічі тицьнути), а місце під
          оплатою чи вже протухле знімати немає з чого: перше відпустить
          вебхук або прибирання, друге вже відпущене. */
-      if (seat.status !== 'BOOKED') return;
+      if (seat.status !== 'BOOKED') return null;
 
       const cutoff = seat.booking.club.cancelCutoffMinutes;
       if (!canCancelNow(seat.booking.startTime, cutoff)) {
@@ -1483,7 +1483,16 @@ publicRouter.post('/seats/:id/cancel', async (req, res) => {
         where: { id: seat.booking.id },
         data: { priceTotal: { decrement: seat.price } },
       });
+
+      return { bookingId: seat.booking.id, seatId: seat.id };
     });
+
+    /* Після коміту, а не всередині: транзакція може відкотитись, і
+       повідомлення про зняте місце пішло б у чат раніше, ніж стало
+       правдою — а забрати його звідти вже не можна. */
+    if (cancelled) {
+      void notifyBooking({ ...cancelled, event: 'cancelled' });
+    }
 
     res.json({ ok: true });
   } catch (e) {

@@ -9,7 +9,7 @@ import { prisma, isSlotTakenError } from '../../lib/db';
 import { normalizePhone } from '../../lib/phone';
 import { getActivePasses, findOrCreateCustomer } from '../../lib/customers';
 import { requireAuth, requireStaff, hasFeature, param } from './shared';
-import { notifyTrainerBooked } from '../../lib/notifyTrainer';
+import { notifyBooking, notifySeriesCancelled } from '../../lib/notifyBooking';
 import { isRegistrationOpen } from '../../lib/registrationCutoff';
 
 export const bookingsRouter = Router();
@@ -521,21 +521,21 @@ bookingsRouter.post(
           },
         });
 
-      /* Тренера повідомляємо і тут, а не тільки при бронюванні з віджета:
+      /* Повідомляємо і тут, а не тільки при бронюванні з віджета:
          адміністратор ставить заняття на тренера з кабінету так само часто,
          як гравець сам, — а для тренера це рівно та сама подія «мене
-         викликали». Клуб при цьому нічого не отримує: він сам щойно це
-         й зробив, повідомляти його про власну дію — шум. */
-      if (trainer) {
-        void notifyTrainerBooked({
-          trainerId: trainer.id,
-          startTime: start,
-          endTime: end,
-          courtName: court.name,
-          customerName: booking.customerName,
-          customerPhone: booking.customerPhone,
-        });
-      }
+         викликали».
+
+         skipClubChat: у спільну групу нічого не йде. Клуб щойно зробив це
+         сам, і повідомляти його про власну дію — шум. З тієї ж причини
+         actorUserId прибирає з розсилки того, хто натиснув: решта
+         персоналу бронь побачить, автор — ні. */
+      void notifyBooking({
+        bookingId: booking.id,
+        event: 'created',
+        actorUserId: req.auth!.userId,
+        skipClubChat: true,
+      });
 
       res.status(201).json(
         booking,
@@ -909,6 +909,20 @@ bookingsRouter.patch(
           } : {}),
         },
       });
+
+      /* Скасування руками з кабінету. Тренер має дізнатись про це так
+         само, як дізнався про сам виклик: він планує день по цих
+         повідомленнях, і мовчазне зникнення заняття — гірше за його
+         відсутність. Умова саме на ПЕРЕХІД: повторний PATCH тим самим
+         статусом не має слати друге повідомлення. */
+      if (data.status === 'CANCELLED' && booking.status !== 'CANCELLED') {
+        void notifyBooking({
+          bookingId: booking.id,
+          event: 'cancelled',
+          actorUserId: req.auth!.userId,
+          skipClubChat: true,
+        });
+      }
 
       res.json({
         ok: true,
@@ -1351,6 +1365,24 @@ bookingsRouter.post(
       select: { email: true, name: true, role: true },
     });
 
+    /* Читаємо ДО updateMany: після нього ці заняття вже CANCELLED, і за
+       тим самим where не знайдеться жодного. Без списку сповіщати нема
+       про що — updateMany віддає лише кількість, а тренеру треба знати,
+       які саме заняття зняли. */
+    const doomed = await prisma.booking.findMany({
+      where: {
+        seriesId: parsed.data,
+        clubId: req.auth!.clubId,
+        status: { in: [...BUSY] },
+        startTime: { gte: new Date() },
+      },
+      select: {
+        trainerId: true,
+        startTime: true,
+        court: { select: { name: true } },
+      },
+    });
+
     const result =
       await prisma.booking.updateMany({
         where: {
@@ -1375,6 +1407,19 @@ bookingsRouter.post(
             : { role: actor.role, name: actor.name, email: actor.email },
         },
       });
+
+    /* Одне повідомлення на всю серію, а не на кожне заняття: тренеру з
+       дванадцятьма щотижневими тренуваннями дванадцять однакових рядків
+       поспіль сказали б менше, ніж один рядок із числом. */
+    void notifySeriesCancelled({
+      clubId: req.auth!.clubId,
+      actorUserId: req.auth!.userId,
+      bookings: doomed.map((b) => ({
+        trainerId: b.trainerId,
+        startTime: b.startTime,
+        courtName: b.court.name,
+      })),
+    });
 
     res.json({
       ok: true,
@@ -1482,6 +1527,16 @@ bookingsRouter.post(
         return created;
       });
 
+      /* Половина записів у групу приходить телефоном, і тренер має знати
+         про них так само, як про тих, хто записався сам у віджеті. */
+      void notifyBooking({
+        bookingId: seat.bookingId,
+        seatId: seat.id,
+        event: 'created',
+        actorUserId: req.auth!.userId,
+        skipClubChat: true,
+      });
+
       res.status(201).json(seat);
     } catch (e) {
       if (e instanceof SeatError) return res.status(e.status).json({ error: e.code });
@@ -1508,7 +1563,10 @@ bookingsRouter.post(
     if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
     try {
-      await prisma.$transaction(async (tx) => {
+      /* Транзакція каже, чи справді щось знято: вже скасоване або протухле
+         місце виходить через `return null`, і сповіщати про нього нема про
+         що — нічого не змінилось. */
+      const cancelled = await prisma.$transaction(async (tx) => {
         const seat = await tx.bookingSeat.findUnique({
           where: { id: id.data },
           include: { booking: { select: { id: true, clubId: true } } },
@@ -1516,7 +1574,7 @@ bookingsRouter.post(
         if (!seat || seat.booking.clubId !== req.auth!.clubId) {
           throw new SeatError(404, 'NOT_FOUND');
         }
-        if (seat.status === 'CANCELLED' || seat.status === 'EXPIRED') return;
+        if (seat.status === 'CANCELLED' || seat.status === 'EXPIRED') return null;
 
         /* Місце під оплатою знімається так само (клуб має право), але
            виручку чіпати нічим: неоплачене місце в priceTotal не входило
@@ -1533,7 +1591,21 @@ bookingsRouter.post(
             data: { priceTotal: { decrement: seat.price } },
           });
         }
+
+        return { bookingId: seat.booking.id, seatId: seat.id };
       });
+
+      /* Після коміту, а не всередині: транзакція може відкотитись, і
+         повідомлення про зняте місце пішло б у чат раніше, ніж стало
+         правдою — а забрати його звідти вже не можна. */
+      if (cancelled) {
+        void notifyBooking({
+          ...cancelled,
+          event: 'cancelled',
+          actorUserId: req.auth!.userId,
+          skipClubChat: true,
+        });
+      }
 
       res.json({ ok: true });
     } catch (e) {

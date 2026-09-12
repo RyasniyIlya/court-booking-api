@@ -9,6 +9,7 @@ import { payRouter } from './routes/pay';
 import { startExpirySweeper } from './lib/expire';
 import { startBot, telegramWebhookSecret } from './lib/botRunner';
 import { startDigestScheduler } from './lib/digestScheduler';
+import { startReminderScheduler } from './lib/remind';
 import { handleUpdate } from './lib/botHandlers';
 import { paymentsSecretReady } from './lib/crypto';
 
@@ -130,4 +131,9 @@ app.listen(port, () => {
   // бота відправка нікуди не піде, але й не завадить — sendMessage без
   // TELEGRAM_BOT_TOKEN мовчки нічого не робить.
   startDigestScheduler();
+
+  // Нагадування перед заняттям. Свій планувальник, а не гілка в зведенні:
+  // те раз на добу о заданій годині, це — щохвилини з інтервалом у кожного
+  // свій (див. lib/remind.ts).
+  startReminderScheduler();
 });

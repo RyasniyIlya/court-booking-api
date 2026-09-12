@@ -27,6 +27,13 @@ const isSlotTakenError = vi.fn(() => false);
 
 vi.mock('../db', () => ({ prisma, notifyClub, isSlotTakenError }));
 
+/* Сповіщення — окрема відповідальність із власними тестами
+   (notifyBooking.test.ts). Тут важливо лише те, що apply їх кличе: сам
+   notifyBooking ходить у базу за клубом і тренером, і без мока тягнув би
+   у ці тести половину схеми заради перевірки зовсім іншого. */
+const notifyBooking = vi.fn();
+vi.mock('../notifyBooking', () => ({ notifyBooking }));
+
 const { applyPayEvent } = await import('./apply');
 
 const BOOKING_ID = 'booking-1';
@@ -101,15 +108,16 @@ describe('оплата броні пройшла', () => {
     });
   });
 
-  it('клуб дізнається про оплату', async () => {
+  /* Раніше тут перевірявся текст, який apply збирав сам, і слав його
+     рівно в клубну групу. Тепер збирає notifyBooking — разом із чатами
+     власника, модератора й ВИКЛИКАНОГО ТРЕНЕРА, який при передоплаті не
+     отримував нічого взагалі. Тому перевіряємо не рядок, а те, що подія
+     про потрібну бронь пішла в маршрутизацію. */
+  it('про оплачену бронь дізнаються всі, кого вона стосується', async () => {
     await applyPayEvent('mono', paid);
 
-    expect(notifyClub).toHaveBeenCalledTimes(1);
-    const [chat, text] = notifyClub.mock.calls[0] as unknown as [string, string];
-    expect(chat).toBe('chat-1');
-    expect(text).toContain('Оплачено');
-    expect(text).toContain('Петро');
-    expect(text).toContain('450.00 грн');
+    expect(notifyBooking).toHaveBeenCalledTimes(1);
+    expect(notifyBooking).toHaveBeenCalledWith({ bookingId: BOOKING_ID, event: 'paid' });
   });
 
   it('повтор по вже оплаченій броні нічого не змінює', async () => {

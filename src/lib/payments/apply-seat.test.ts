@@ -36,6 +36,13 @@ vi.mock('../db', () => ({
   isSlotTakenError: () => false,
 }));
 
+/* Сповіщення — окрема відповідальність із власними тестами
+   (notifyBooking.test.ts). Тут важливо лише те, що apply їх кличе: сам
+   notifyBooking ходить у базу за клубом і тренером, і без мока тягнув би
+   у ці тести половину схеми заради перевірки зовсім іншого. */
+const notifyBooking = vi.fn();
+vi.mock('../notifyBooking', () => ({ notifyBooking }));
+
 const { applyPayEvent } = await import('./apply');
 
 const GROUP_ID = 'group-1';
@@ -157,7 +164,11 @@ describe('гроші прийшли, а місця вже немає', () => {
 
     await applyPayEvent('mock', paid);
     expect(tx.bookingSeat.update).toHaveBeenCalled();
-    expect(notifyClub).toHaveBeenCalledWith('chat-1', expect.stringContaining('Оплачено місце'));
+    /* Текст збирає notifyBooking — тут перевіряємо, що подія пішла саме
+       про це місце в цьому занятті. */
+    expect(notifyBooking).toHaveBeenCalledWith({
+      bookingId: GROUP_ID, seatId: SEAT_ID, event: 'paid',
+    });
   });
 
   it('гравець устиг зняти запис сам — клуб дізнається про це', async () => {

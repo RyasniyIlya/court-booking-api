@@ -1,5 +1,6 @@
 import { prisma, notifyClub, isSlotTakenError } from '../db';
 import { bookingWho } from '../bookingLabel';
+import { notifyBooking } from '../notifyBooking';
 import type { WebhookEvent } from './types';
 
 /**
@@ -163,10 +164,12 @@ async function applyToBooking(
       return 'applied';
     }
 
-    void notifyClub(
-      payment.club.telegramChatId,
-      `<b>Оплачено</b>\n${fmt(b.startTime)}\n${bookingWho(b)}\n${hrn(payment.amount)}`,
-    );
+    /* Тут і тільки тут дізнається про передоплачену бронь той, кого вона
+       стосується. Раніше це повідомлення йшло рівно в клубну групу, а
+       тренер не отримував нічого: гілка з платіжкою в public.ts робить
+       return до блоку сповіщень, тож викликаного тренера не повідомляв
+       НІХТО — ні при створенні, ні при оплаті. */
+    void notifyBooking({ bookingId: b.id, event: 'paid' });
     return 'applied';
   }
 
@@ -287,10 +290,7 @@ async function applyToSeat(
       return 'applied';
     }
 
-    void notifyClub(
-      payment.club.telegramChatId,
-      `<b>Оплачено місце</b>\n${what}\n${fmt(g.startTime)}\n${who}\n${hrn(payment.amount)}`,
-    );
+    void notifyBooking({ bookingId: g.id, seatId: seat.id, event: 'paid' });
     return 'applied';
   }
 

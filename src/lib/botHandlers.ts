@@ -27,6 +27,12 @@ import {
 import { revenueBreakdown, revenueText, staffReport, staffText } from './sections';
 import { botAnalytics } from './botAnalytics';
 import {
+  canToggle,
+  parseSettingsAction,
+  settingsKeyboard,
+  settingsText,
+} from './botSettings';
+import {
   clubChoiceKeyboard,
   openBookingKeyboard,
   slugFromStartPayload,
@@ -112,7 +118,28 @@ async function userByChat(chatId: string) {
       id: true,
       role: true,
       trainerId: true,
+      tgNotifyBookings: true,
       club: { select: { id: true, name: true, timezone: true, plan: true } },
+    },
+  });
+}
+
+/**
+ * Поточні налаштування сповіщень людини.
+ *
+ * Окремим запитом, а не полями в userByChat: їх пʼять, і тягнути їх на
+ * КОЖНЕ повідомлення заради екрана, який відкривають раз на місяць, —
+ * марна робота на кожному /today.
+ */
+async function notifySettings(userId: string) {
+  return prisma.user.findUniqueOrThrow({
+    where: { id: userId },
+    select: {
+      tgNotifyBookings: true,
+      tgNotifyTournaments: true,
+      tgNotifyGroups: true,
+      tgNotifySessions: true,
+      tgRemindMinutes: true,
     },
   });
 }
@@ -305,6 +332,45 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
     return;
   }
 
+  /* Налаштування розбираємо ДО перевірки ролі нижче: екран доступний і
+     тренеру, а та перевірка відсікає його від звітів. */
+  const setting = parseSettingsAction(q.data);
+  if (setting) {
+    if (setting.kind === 'toggle' && !canToggle(me.role, setting.key)) {
+      /* Кнопка зі старого повідомлення, надісланого до зміни ролі. */
+      await answerCallback(q.id, 'Цей перемикач вам не доступний');
+      return;
+    }
+
+    const current = await notifySettings(me.id);
+    const data = setting.kind === 'lead'
+      ? { tgRemindMinutes: setting.minutes }
+      : { [setting.key]: !current[setting.key] };
+
+    const next = await prisma.user.update({
+      where: { id: me.id },
+      data,
+      select: {
+        tgNotifyBookings: true,
+        tgNotifyTournaments: true,
+        tgNotifyGroups: true,
+        tgNotifySessions: true,
+        tgRemindMinutes: true,
+      },
+    });
+
+    /* Перемальовуємо на місці: десять натискань не мають лишити десять
+       однакових екранів у стрічці. */
+    if (q.message) {
+      await editMessageText(
+        chatId, q.message.message_id,
+        settingsText(me.role, next), settingsKeyboard(me.role, next),
+      );
+    }
+    await answerCallback(q.id);
+    return;
+  }
+
   const action = parseAction(q.data);
   if (!action) {
     /* Кнопка зі старого повідомлення або чужі дані. Мовчки гасимо
@@ -476,6 +542,15 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
     }
     const messages = await botAnalytics(me.club.id, args.join(' '));
     for (const text of messages) await sendMessage(chatId, text, keyboard);
+    return;
+  }
+
+  /* Доступний усім ролям, включно з тренером: це налаштування власного
+     чату, а не доступ до чогось клубного. Набір рядків у ньому все одно
+     залежить від ролі — див. botSettings.rowsFor. */
+  if (cmd === '/settings') {
+    const s = await notifySettings(me.id);
+    await sendMessage(chatId, settingsText(me.role, s), settingsKeyboard(me.role, s));
     return;
   }
 

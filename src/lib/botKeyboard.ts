@@ -29,6 +29,7 @@ const BTN_STAFF = '👥 Персонал';
 const BTN_SESSIONS = '📋 Мої заняття';
 const BTN_HELP = '❓ Довідка';
 const BTN_ANALYTICS = '🔎 Аналітика';
+const BTN_SETTINGS = '⚙️ Сповіщення';
 
 /**
  * Підпис кнопки -> команда.
@@ -47,6 +48,7 @@ const BY_LABEL: Record<string, string> = {
   [BTN_SESSIONS]: '/today',
   [BTN_HELP]: '/help',
   [BTN_ANALYTICS]: '/analytics',
+  [BTN_SETTINGS]: '/settings',
 };
 
 /** Команда за натиснутою кнопкою, або null, якщо це звичайний текст */
@@ -63,8 +65,13 @@ export function commandForLabel(text: string): string | null {
  */
 export function replyKeyboard(role: Role) {
   const rows = isTrainer(role)
-    ? [[BTN_SESSIONS], [BTN_HELP]]
-    : [[BTN_TODAY, BTN_YESTERDAY], [BTN_WEEK, BTN_REVENUE], [BTN_STAFF, BTN_ANALYTICS], [BTN_HELP]];
+    ? [[BTN_SESSIONS], [BTN_SETTINGS, BTN_HELP]]
+    : [
+      [BTN_TODAY, BTN_YESTERDAY],
+      [BTN_WEEK, BTN_REVENUE],
+      [BTN_STAFF, BTN_ANALYTICS],
+      [BTN_SETTINGS, BTN_HELP],
+    ];
 
   return {
     keyboard: rows.map((row) => row.map((text) => ({ text }))),
@@ -179,6 +186,7 @@ const COMMANDS_OWNER = [
   { command: 'revenue', description: 'Звідки беруться гроші' },
   { command: 'staff', description: 'Тренери: заняття і гроші' },
   { command: 'help', description: 'Що я вмію' },
+  { command: 'settings', description: 'Сповіщення: що приходить і за скільки хвилин' },
   { command: 'newpassword', description: 'Змінити пароль кабінету' },
   { command: 'logout', description: 'Відключити цей чат' },
 ];
@@ -186,6 +194,7 @@ const COMMANDS_OWNER = [
 const COMMANDS_TRAINER = [
   { command: 'today', description: 'Ваші заняття на сьогодні' },
   { command: 'help', description: 'Що я вмію' },
+  { command: 'settings', description: 'Сповіщення: що приходить і за скільки хвилин' },
   { command: 'newpassword', description: 'Змінити пароль кабінету' },
   { command: 'logout', description: 'Відключити цей чат' },
 ];
