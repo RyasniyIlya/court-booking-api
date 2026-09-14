@@ -8,6 +8,20 @@ import { normalizePhone } from './phone';
  * Гонку двох одночасних броней з одного номера ловить @@unique([clubId, phone]):
  * якщо другий запит не встиг, upsert просто оновить наявну картку.
  */
+/**
+ * Імʼя гравця з форми: 2–60 символів, хоч одна літера, без розмітки.
+ *
+ * Розмітку вирізаємо, а не відхиляємо: імʼя потрапляє в HTML-повідомлення
+ * бота й у кабінет, а людина, яка вставила «<b>Ілля</b>» з буфера, не має
+ * отримати помилку, в якій нічого не зрозуміє.
+ */
+export function cleanCustomerName(raw: string): string | null {
+  const name = raw.replace(/<[^>]*>/g, '').replace(/[<>]/g, '').replace(/\s+/g, ' ').trim();
+  if (name.length < 2 || name.length > 60) return null;
+  if (!/\p{L}/u.test(name)) return null;
+  return name;
+}
+
 export async function findOrCreateCustomer(params: {
   clubId: string;
   name: string;

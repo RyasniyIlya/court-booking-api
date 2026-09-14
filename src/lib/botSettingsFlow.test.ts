@@ -25,6 +25,8 @@ vi.mock('./db', () => ({
       update: mocks.update,
     },
     booking: { findMany: vi.fn() },
+    /* Покрокова реєстрація гравця: активного діалогу в цих чатах немає. */
+    tgDialog: { findUnique: async () => null },
   },
 }));
 vi.mock('./telegram', () => ({

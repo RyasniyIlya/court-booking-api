@@ -147,6 +147,10 @@ bookingsRouter.get(
             customerPhone: true,
             status: true,
             price: true,
+            /* Нагадування в Telegram і «Прийду» — панель показує їх біля
+               кожного учасника, як і біля броні корту. */
+            playerRemindedAt: true,
+            playerConfirmedAt: true,
             ledgerEntries: req.auth!.role !== 'TRAINER'
               ? {
                 select: {
@@ -190,12 +194,28 @@ bookingsRouter.get(
 
     const passes = await getActivePasses(ids);
 
+    /* Хто чекає на цей час у черзі. Одним запитом на весь діапазон, а
+       розкладаємо по бронях у памʼяті: черг на день одиниці. */
+    const queued = await prisma.waitlistEntry.findMany({
+      where: {
+        clubId: req.auth!.clubId,
+        status: { in: ['WAITING', 'OFFERED'] },
+        startTime: { lt: new Date(parsed.data.to) },
+        endTime: { gt: new Date(parsed.data.from) },
+      },
+      select: { courtId: true, startTime: true, endTime: true },
+    });
+    const waitlistFor = (b: { courtId: string; startTime: Date; endTime: Date; capacity: number | null }) =>
+      b.capacity != null ? 0 : queued.filter((w) => w.courtId === b.courtId
+        && w.startTime < b.endTime && w.endTime > b.startTime).length;
+
     res.json(
       bookings.map((b) => ({
         ...b,
         pass: b.customerId
           ? passes.get(b.customerId) ?? null
           : null,
+        waitlistCount: waitlistFor(b),
         reminderReachable: Boolean(
           b.customer?.telegramChatId,
         ),

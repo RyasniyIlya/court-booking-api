@@ -202,6 +202,8 @@ const COMMANDS_TRAINER = [
 /** Що показує меню незнайомому чату — тільки вхід, більше йому нічого не можна */
 export const COMMANDS_GUEST = [
   { command: 'book', description: 'Забронювати корт' },
+  { command: 'my', description: 'Мої записи' },
+  { command: 'profile', description: 'Увійти в профіль гравця' },
   { command: 'login', description: 'Увійти: /login пошта пароль' },
   { command: 'help', description: 'Що я вмію' },
 ];

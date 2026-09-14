@@ -10,6 +10,7 @@ import { startExpirySweeper } from './lib/expire';
 import { startBot, telegramWebhookSecret } from './lib/botRunner';
 import { startDigestScheduler } from './lib/digestScheduler';
 import { startReminderScheduler } from './lib/remind';
+import { startPlayerScheduler } from './lib/playerRemind';
 import { handleUpdate } from './lib/botHandlers';
 import { paymentsSecretReady } from './lib/crypto';
 
@@ -136,4 +137,8 @@ app.listen(port, () => {
   // те раз на добу о заданій годині, це — щохвилини з інтервалом у кожного
   // свій (див. lib/remind.ts).
   startReminderScheduler();
+
+  // Гравцям: нагадування за 3 години з «Прийду / Скасувати» і черга на
+  // зайнятий час (lib/playerRemind.ts, lib/waitlist.ts).
+  startPlayerScheduler();
 });

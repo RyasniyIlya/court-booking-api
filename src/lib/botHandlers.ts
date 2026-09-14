@@ -37,6 +37,15 @@ import {
   openBookingKeyboard,
   slugFromStartPayload,
 } from './botBooking';
+import { codeFromStartPayload, handlePlayerCallback, handlePlayerCommand } from './playerBot';
+import {
+  handlePlayerLoginMessage,
+  loginSlugFromStartPayload,
+  playerLoginButtonFor,
+  playerLoginClubChoice,
+  startLinkByCode,
+  startPlayerLogin,
+} from './playerLogin';
 
 /**
  * Що бот відповідає на команди.
@@ -59,6 +68,9 @@ const HELP = [
   '<b>Для гравця</b>',
   'Натисніть /book, оберіть клуб і відкрийте його розклад.',
   'Якщо клуб надіслав своє посилання на бота — вибирати клуб повторно не потрібно.',
+  'Профіль гравця створюється на сайті клубу, а сюди входите командою /profile — номером, підтвердженим Telegram.',
+  'Нагадування про ігри: профіль гравця на сторінці клубу → «Підключити Telegram».',
+  '/my — ваші записи, /stop — вимкнути сповіщення гравця.',
   '',
   '<b>Для команди клубу</b>',
   'Після входу бот показує броні, виручку та робочі звіти.',
@@ -92,7 +104,18 @@ async function showBookingClub(chatId: string, slug: string): Promise<boolean> {
   const setup = markup
     ? 'Натисніть кнопку нижче — розклад відкриється прямо в Telegram.'
     : 'Адреса онлайн-бронювання ще не налаштована. Попросіть клуб надіслати посилання.';
-  await sendMessage(chatId, `🎾 <b>${html(club.name)}</b>\n\n${setup}`, markup);
+
+  /* Вхід у профіль гравця — поруч із бронюванням, а не окремою командою,
+     яку треба знати: людина, що відкрила клуб у боті, саме тут і вирішує. */
+  const login = await playerLoginButtonFor(chatId, club.slug);
+  const rows = [...(markup?.inline_keyboard ?? []), ...(login ? [[login]] : [])];
+  const hint = login ? '\n\nМаєте профіль гравця на сайті клубу? Увійдіть — і я нагадуватиму про ігри.' : '';
+
+  await sendMessage(
+    chatId,
+    `🎾 <b>${html(club.name)}</b>\n\n${setup}${hint}`,
+    rows.length ? { inline_keyboard: rows } : undefined,
+  );
   return true;
 }
 
@@ -313,6 +336,17 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
   const chatId = String(q.message?.chat.id ?? q.from?.id ?? '');
   if (!chatId) return;
 
+  /* Кнопки гравця (нагадування, черга) — першими: гравцем буває і той, хто
+     в клубі працює, і його «Прийду» не має впиратись у перевірку ролі. */
+  if (await handlePlayerCallback(q)) return;
+
+  if (q.data?.startsWith('plogin:')) {
+    const slug = q.data.slice('plogin:'.length);
+    await answerCallback(q.id);
+    if (/^[a-z0-9][a-z0-9-]{1,47}$/.test(slug)) await startPlayerLogin(chatId, slug);
+    return;
+  }
+
   if (q.data?.startsWith('bookclub:')) {
     const slug = q.data.slice('bookclub:'.length);
     const shown = /^[a-z0-9][a-z0-9-]{1,47}$/.test(slug) && await showBookingClub(chatId, slug);
@@ -408,10 +442,16 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
   }
 
   const msg = u.message;
-  const raw = msg?.text?.trim();
-  if (!msg || !raw) return;
+  if (!msg) return;
 
   const chatId = String(msg.chat.id);
+
+  /* Покроковий вхід гравця в профіль. До перевірки тексту: номер телефону
+     приходить контактом, у якого тексту немає зовсім. */
+  if (msg.chat.type === 'private' && await handlePlayerLoginMessage(msg)) return;
+
+  const raw = msg.text?.trim();
+  if (!raw) return;
 
   /* Кнопка постійної клавіатури приходить звичайним текстом — переводимо
      її в команду до розбору, щоб далі шлях був рівно один. */
@@ -483,6 +523,38 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
       : [from?.first_name, from?.last_name].filter(Boolean).join(' ') || null;
 
     await sendMessage(chatId, await requestReset(chatId, args[0], tgName));
+    return;
+  }
+
+  /* Гравець: /start p_<код> з профілю у віджеті. Раніше за /start із кодом
+     персоналу — інакше код гравця пішов би шукатись серед кодів кабінету й
+     повернувся б «Такого коду немає». Сам код чат не привʼязує: далі бот
+     просить підтвердити номер кнопкою Telegram (lib/playerLogin.ts). */
+  const linkCode = cmd === '/start' ? codeFromStartPayload(args[0]) : null;
+  if (linkCode) {
+    if (msg.chat.type !== 'private') {
+      await sendMessage(chatId, 'Підключення гравця працює тільки в особистому чаті з ботом.');
+      return;
+    }
+    await startLinkByCode(chatId, linkCode);
+    return;
+  }
+
+  /* /my і /stop гравця. */
+  if (await handlePlayerCommand(chatId, cmd, args)) return;
+
+  /* Вхід гравця в профіль, створений на сайті клубу: /profile або пряме
+     посилання клубу t.me/<бот>?start=login_<slug>. Тільки в особистому
+     чаті — ділитись номером у груповому чаті клубу ніхто не має. */
+  const loginSlug = cmd === '/start' ? loginSlugFromStartPayload(args[0]) : null;
+  if (loginSlug || cmd === '/profile') {
+    if (msg.chat.type !== 'private') {
+      await sendMessage(chatId, 'Вхід гравця працює тільки в особистому чаті з ботом.');
+      return;
+    }
+    const slug = loginSlug ?? (args[0] && /^[a-z0-9][a-z0-9-]{1,47}$/.test(args[0]) ? args[0] : null);
+    if (slug) await startPlayerLogin(chatId, slug);
+    else await playerLoginClubChoice(chatId);
     return;
   }
 

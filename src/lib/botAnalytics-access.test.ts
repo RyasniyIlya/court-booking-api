@@ -1,6 +1,6 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 const mocks = vi.hoisted(() => ({ findUnique: vi.fn(), sendMessage: vi.fn(), report: vi.fn(), answerCallback: vi.fn(), bookings: vi.fn(), day: vi.fn() }));
-vi.mock('./db', () => ({ prisma: { user: { findUnique: mocks.findUnique }, booking: { findMany: mocks.bookings } } }));
+vi.mock('./db', () => ({ prisma: { user: { findUnique: mocks.findUnique }, booking: { findMany: mocks.bookings }, tgDialog: { findUnique: async () => null } } }));
 vi.mock('./telegram', () => ({ sendMessage: mocks.sendMessage, answerCallback: mocks.answerCallback, deleteMessage: vi.fn(), editMessageText: vi.fn(), setMyCommands: vi.fn() }));
 vi.mock('./botAnalytics', () => ({ botAnalytics: mocks.report }));
 vi.mock('./botAuth', () => ({ loginByPassword: vi.fn(), logout: vi.fn(), menuFor: () => 'menu' }));

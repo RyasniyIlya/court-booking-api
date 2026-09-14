@@ -2,10 +2,14 @@ import { Router } from 'express';
 
 import { authRouter } from './auth';
 import { bookingsRouter } from './bookings';
+import { attendanceRouter } from './attendance';
+import { bookingSearchRouter } from './bookingSearch';
+import { shiftRouter } from './shift';
 import { refundsRouter } from './refunds';
 import { settlementsRouter } from './settlements';
 import { trainersRouter } from './trainers';
 import { courtsRouter } from './courts';
+import { orderingRouter } from './ordering';
 import { hoursRouter } from './hours';
 import { clubRouter } from './club';
 import { logoRouter } from './logo';
@@ -29,9 +33,14 @@ import { inventoryRouter } from './inventory';
 export const adminRouter = Router();
 
 adminRouter.use(authRouter);
+/* Пошук перед bookingsRouter: /bookings/search не має впасти в /bookings/:id. */
+adminRouter.use(bookingSearchRouter);
 adminRouter.use(bookingsRouter);
+adminRouter.use(attendanceRouter);
 adminRouter.use(refundsRouter);
 adminRouter.use(settlementsRouter);
+adminRouter.use(shiftRouter);
+adminRouter.use(orderingRouter);
 adminRouter.use(trainersRouter);
 adminRouter.use(courtsRouter);
 adminRouter.use(hoursRouter);

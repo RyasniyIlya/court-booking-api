@@ -136,6 +136,12 @@ export type TgUpdate = {
     text?: string;
     chat: { id: number; type: string };
     from?: { id: number; first_name?: string; last_name?: string; username?: string };
+    /**
+     * Контакт, надісланий кнопкою request_contact. user_id збігається з
+     * from.id, лише коли людина поділилась СВОЇМ номером — пересланий
+     * чужий контакт має інший user_id або не має його зовсім.
+     */
+    contact?: { phone_number: string; first_name?: string; last_name?: string; user_id?: number };
   };
   /** Натиснута кнопка під повідомленням */
   callback_query?: {

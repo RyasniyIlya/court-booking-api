@@ -86,6 +86,10 @@ model Club {
   /// у клубу з вишневим «Підтверджено» злилося б зі «Скасувати».
   /// null = кортовий зелений за замовчуванням (web/src/lib/brand.js).
   brandColor          String?
+  /// Що грає фоном у кабінеті. TABLE_TENNIS — те, що було до вибору.
+  cabinetBackdrop     BackdropStyle @default(TABLE_TENNIS)
+  /// Що грає фоном під віджетом на /c/{slug}. GRADIENT — те, що було до вибору.
+  pageBackdrop        BackdropStyle @default(GRADIENT)
   /// Крок сітки за замовчуванням, хв
   slotMinutes         Int       @default(60)
   /// За скільки хвилин до старту ще можна забронювати онлайн
@@ -191,7 +195,9 @@ model Club {
   expenses      ClubExpense[]
   promos        Promo[]
   inventory     InventoryItem[]
+  waitlist      WaitlistEntry[]
   resetRequests PasswordReset[]
+  shiftCloses   ShiftClose[]
   /// Коли ми підтвердили клуб після реєстрації. null = чекає на дзвінок/оплату.
   /// Впливає на віддачу даних для публічного віджета.
   approvedAt    DateTime?
@@ -249,6 +255,26 @@ model ClubExpense {
 enum LogoMode {
   MONOGRAM
   IMAGE
+}
+
+/// Третя стадія броні — чи прийшов клієнт. Окремо від BookingStatus
+/// навмисно: статус відповідає «чи тримаємо корт», а це — «що сталося
+/// на корті». Підтверджена й оплачена бронь може бути і ARRIVED, і NO_SHOW.
+enum Attendance {
+  /// Ще не відмічено (і всі броні до появи відмітки)
+  UNKNOWN
+  ARRIVED
+  NO_SHOW
+}
+
+/// Фон під кабінетом і під сторінкою клубу. Enum, а не вільний рядок: значення
+/// потрапляє у верстку, і база сама не прийме нічого поза білим списком.
+enum BackdropStyle {
+  GRADIENT
+  TABLE_TENNIS
+  PADEL
+  TENNIS
+  PLAIN
 }
 
 /// План обслуговування — каталог, який веде оператор платформи.
@@ -505,6 +531,7 @@ model Court {
   bookings Booking[]
   blocks   Block[]
   notes    Note[]
+  waitlist WaitlistEntry[]
 
   @@index([clubId, isActive])
 }
@@ -566,6 +593,16 @@ model Booking {
   endTime   DateTime @db.Timestamptz(3)
 
   status      BookingStatus @default(CONFIRMED)
+  /// Стадія 3: клієнт прийшов / не прийшов. Хто й коли відмітив — поруч.
+  attendance   Attendance @default(UNKNOWN)
+  attendanceAt DateTime?
+  attendanceBy String?
+  /// Гравцю пішло нагадування в Telegram (lib/playerRemind.ts). Мітка в
+  /// базі, а не в памʼяті процесу: повтор після рестарту гравець побачив
+  /// би як спам, і саме це відрізняє його від нагадувань персоналу.
+  playerRemindedAt  DateTime?
+  /// Гравець натиснув «Прийду» під нагадуванням.
+  playerConfirmedAt DateTime?
   source      BookingSource @default(WIDGET)
   /// Зафіксована ціна на момент броні, копійки
   priceTotal  Int           @default(0)
@@ -658,6 +695,10 @@ model BookingSeat {
   /// Оплата саме за це місце. Не плутати з оплатою самого заняття:
   /// контейнер групи корт нікому не продає, платять учасники поштучно.
   payment Payment?
+
+  /// Те саме, що в Booking: нагадування гравцю і його «Прийду».
+  playerRemindedAt  DateTime?
+  playerConfirmedAt DateTime?
 
   createdAt   DateTime  @default(now())
   cancelledAt DateTime?
@@ -855,7 +896,20 @@ model Customer {
   /// Останні 7 цифр — пошук на ресепшені за 4+ цифрами
   phoneTail String
 
+  /// Особистий чат гравця з ботом. Заповнює /start p_<код> (lib/playerBot.ts).
   telegramChatId String?
+  /// Одноразовий код привʼязки з профілю у віджеті, живе 15 хвилин.
+  tgLinkCode     String?   @unique
+  tgLinkUntil    DateTime?
+
+  /// Пароль профілю гравця на сайті клубу, bcrypt. null — картка без
+  /// акаунта: заведена адміністратором, бронню гостя або до появи паролів.
+  /// Увійти в таку картку на сайті не можна, поки людина не задасть пароль.
+  passwordHash        String?
+  /// Захист від перебору — як у персоналу (User.pinFails).
+  passwordFails       Int       @default(0)
+  passwordLockedUntil DateTime?
+
   note           String?
   /// Чорний список: не пускати онлайн-бронювання
   isBlocked      Boolean @default(false)
@@ -879,12 +933,54 @@ model Customer {
   /// Місця в групових заняттях — окремо від bookings: там бронь корту,
   /// тут запис у чужу бронь.
   seats    BookingSeat[]
+  waitlist WaitlistEntry[]
 
   /// Телефон унікальний у межах клубу, а не глобально:
   /// одна людина може ходити у два клуби — це різні картки.
   @@unique([clubId, phone])
   @@index([clubId, phoneTail])
   @@index([clubId, email])
+  @@index([telegramChatId])
+}
+
+enum WaitlistStatus {
+  /// Стоїть у черзі
+  WAITING
+  /// Час звільнився, гравцю написали — у нього пріоритетні 15 хвилин
+  OFFERED
+  /// Гравець забронював цей час
+  DONE
+  /// Сам вийшов із черги
+  CANCELLED
+  /// Час настав або пріоритет згорів
+  EXPIRED
+}
+
+/// Черга на зайнятий слот корту: «напишіть мені, якщо звільниться».
+///
+/// Окрема таблиця, а не прапорець на броні: людина чекає на ЧАС на корті,
+/// а не на чужу бронь — та могла бути скасована й перебронена двічі, поки
+/// гравець стоїть у черзі.
+model WaitlistEntry {
+  id         String         @id @default(uuid()) @db.Uuid
+  clubId     String         @db.Uuid
+  club       Club           @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  courtId    String         @db.Uuid
+  court      Court          @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  customerId String         @db.Uuid
+  customer   Customer       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  startTime  DateTime       @db.Timestamptz(3)
+  endTime    DateTime       @db.Timestamptz(3)
+  status     WaitlistStatus @default(WAITING)
+  /// Коли написали, що час вільний, і до коли діє пріоритет
+  offeredAt  DateTime?
+  offerUntil DateTime?
+  createdAt  DateTime       @default(now())
+  updatedAt  DateTime       @updatedAt
+
+  @@index([status, startTime])
+  @@index([courtId, startTime])
+  @@index([customerId, status])
 }
 
 /// Тариф абонемента: те, що власник виставляє в кабінеті, а модератор
@@ -1169,4 +1265,59 @@ model InventoryItem {
   updatedAt DateTime @updatedAt
 
   @@index([clubId, sortOrder])
+}
+
+/// Покроковий діалог гравця з ботом — зараз це реєстрація: телефон → імʼя →
+/// дата народження. Один активний діалог на чат.
+///
+/// У базі, а не в памʼяті процесу: webhook може прийти в процес, який щойно
+/// перезапустився після деплою, і людина на другому кроці не має починати
+/// все спочатку без жодного пояснення.
+model TgDialog {
+  chatId    String   @id
+  /// Який сценарій: "register"
+  flow      String
+  /// Поточний крок сценарію: "phone" | "name" | "birth"
+  step      String
+  /// Зібране на попередніх кроках: clubId, phone, name, customerId
+  data      Json     @default("{}")
+  /// Недописаний діалог згорає — через тиждень «як вас звати?» без контексту
+  /// збиває з толку більше, ніж новий старт.
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+/// Закрита зміна: звірка каси ресепшену з журналом розрахунків.
+///
+/// Знімок, а не підсумок «на льоту»: «очікувалось» фіксується в момент
+/// закриття. Пізніше повернення за вчорашню бронь не має переписувати
+/// вчорашню звірку, яку власник уже прочитав.
+model ShiftClose {
+  id           String   @id @default(uuid()) @db.Uuid
+  clubId       String   @db.Uuid
+  club         Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  /// Повтор після втрати мережі не створює другу зміну.
+  requestId    String   @db.Uuid
+  /// Від якого моменту рахувався журнал (попереднє закриття або початок дня).
+  openedAt     DateTime @db.Timestamptz(3)
+  closedAt     DateTime @default(now()) @db.Timestamptz(3)
+  /// Копійки. Очікувалось за журналом / пораховано людиною.
+  expectedCash Int
+  countedCash  Int
+  expectedCard Int
+  countedCard  Int
+  /// Для довідки: перекази й бонуси в шухляді не перерахуєш.
+  transferNet  Int      @default(0)
+  bonusNet     Int      @default(0)
+  entriesCount Int      @default(0)
+  /// Пояснення розбіжності й записка наступній зміні.
+  note         String   @default("")
+  actorId      String   @db.Uuid
+  actorEmail   String
+  actorName    String?
+  actorRole    String
+
+  @@unique([clubId, requestId])
+  @@index([clubId, closedAt])
 }

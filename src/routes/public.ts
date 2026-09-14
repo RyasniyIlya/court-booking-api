@@ -5,7 +5,7 @@ import { DateTime } from 'luxon';
 import { prisma, isSlotTakenError } from '../lib/db';
 import { buildSlots, isAlignedToGrid, type Interval } from '../lib/slots';
 import { normalizePhone } from '../lib/phone';
-import { findOrCreateCustomer, getActivePass } from '../lib/customers';
+import { cleanCustomerName, findOrCreateCustomer, getActivePass } from '../lib/customers';
 import { providerFor, publicBase } from '../lib/payments';
 import { clubBilling } from '../lib/billing';
 import { playerStats } from '../lib/playerStats';
@@ -14,10 +14,20 @@ import { clubLadder, ladderWithMe } from '../lib/clubLadder';
 import { notifyBooking } from '../lib/notifyBooking';
 import { isTrainerAvailable } from '../lib/trainerAvailability';
 import { signCustomerToken, verifyCustomerToken } from '../lib/customerAuth';
+import { hashCustomerPassword, passwordText, verifyCustomerPassword } from '../lib/customerPassword';
 import { birthDateText, birthDateValue, dateOnly } from '../lib/birthday';
 import { isRegistrationOpen, registrationClosesAt } from '../lib/registrationCutoff';
 import { resolveJoinPayment, tournamentPayMode } from '../lib/tournamentPay';
 import { courtPriceWithPromos, bestPromo, promoPrice } from '../lib/promo';
+import { canCancelNow, cancelBookingByCustomer, cancelSeatByCustomer } from '../lib/customerCancel';
+import { botReady } from '../lib/telegram';
+import { planFeatures } from '../lib/plans';
+import { createPlayerLinkCode, PLAYER_LINK_MINUTES, playerStartPayload, unlinkPlayers } from '../lib/playerBot';
+import { joinWaitlist, type JoinError } from '../lib/waitlist';
+
+/** Бот налаштований і план клубу дозволяє Telegram */
+const playerTelegramReady = (plan: Parameters<typeof planFeatures>[0]) =>
+  botReady() && Boolean(process.env.TELEGRAM_BOT_USERNAME) && planFeatures(plan).telegram;
 
 export const publicRouter = Router();
 
@@ -44,13 +54,16 @@ async function loadClub(slug: string) {
     omit: { logoData: true },
     include: {
       hours: true,
-      courts: { where: { isActive: true }, orderBy: { sortOrder: 'asc' } },
+      /* Тільки заради «чи шле клуб гравцям у Telegram» — рядок плану крихітний. */
+      plan: true,
+      courts: { where: { isActive: true }, orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }] },
       /* Тільки увімкнені: правило, яке клуб вимкнув, не має ні рахувати
          ціну, ні їхати в кожну відповідь віджета. Рядків одиниці. */
       promos: { where: { isActive: true } },
       trainers: {
         where: { isActive: true },
-        orderBy: { sortOrder: 'asc' },
+        /* name — щоб рівні номери (старі записи з 0) не йшли у випадковому порядку */
+        orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
         include: { hours: true, exceptions: { where: { date: { gte: new Date(Date.now() - 86_400_000) } } } },
       },
     },
@@ -109,6 +122,7 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
       address: club.address,
       logoUrl: logoSrcOf(club),
       brandColor: club.brandColor,
+      pageBackdrop: club.pageBackdrop,
       online: false,
     });
   }
@@ -126,6 +140,7 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     address: club.address,
     logoUrl: logoSrcOf(club),
     brandColor: club.brandColor,
+    pageBackdrop: club.pageBackdrop,
     // Розклад тижня — щоб віджет показав «Відчинено до 22:00» без окремого
     // запиту. Хвилини від опівночі за таймзоною клубу, як у базі.
     hours: [...club.hours]
@@ -145,6 +160,9 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     // Чи є сенс показувати вибір тренера. Сам список тягнемо окремо —
     // він залежить від обраної години.
     hasTrainers: club.trainers.length > 0,
+    /* Черга на зайнятий час і нагадування працюють тільки через Telegram.
+       Віджет за цим прапорцем вирішує, чи зайнята година клікабельна. */
+    playerTelegram: playerTelegramReady(club.plan),
     // Разом визначають, чи взагалі бачить гравець оплату і чи це вибір,
     // а чи обов'язок: prepayEnabled=false — оплати немає зовсім;
     // true+true (типово) — оплата обов'язкова, як і раніше;
@@ -588,6 +606,12 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
   const phone = normalizePhone(body.customerPhone);
   if (!phone) return res.status(400).json({ error: 'BAD_PHONE' });
 
+  /* Номер належить акаунту — бронювати на нього можна тільки увійшовши.
+     Перевіряємо ДО findOrCreateCustomer: той оновлює пошту картки, і без
+     входу її не має права міняти ніхто. */
+  const guard = await accountGuard(req, club.id, phone.e164);
+  if (guard.blocked) return res.status(401).json({ error: 'LOGIN_REQUIRED' });
+
   const customer = await findOrCreateCustomer({
     clubId: club.id,
     name: body.customerName,
@@ -596,14 +620,13 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     birthDate: body.birthDate ? birthDateValue(body.birthDate) : undefined,
   });
   if (customer?.isBlocked) return res.status(403).json({ error: 'CUSTOMER_BLOCKED' });
-  if (customer && dateOnly(customer.birthDate) !== body.birthDate) {
+  if (customer && !guard.signedIn && dateOnly(customer.birthDate) !== body.birthDate) {
     return res.status(403).json({ error: 'BIRTH_DATE_MISMATCH' });
   }
 
-  // Після першої броні кабінет відкривається одразу. Для наявної картки
-  // токен видаємо лише коли дата збігається: одного номера телефону для
-  // доступу до історії та бонусів недостатньо.
-  const customerToken = customer
+  /* Токен профілю бронь більше не видає: профіль відчиняє тільки пароль.
+     Хто увійшов — той і так із токеном, повертаємо його ж для сумісності. */
+  const customerToken = customer && guard.signedIn
     ? signCustomerToken({ customerId: customer.id, clubId: club.id })
     : undefined;
 
@@ -792,19 +815,10 @@ class HttpError extends Error {
   }
 }
 
-/**
- * Чи гравець ще може зняти запис сам.
- *
- * Одне правило на дві сутності — бронь корту й місце в груповому занятті:
- * для гравця це та сама дія «я не прийду», і різні строки в них він читав
- * би як помилку. cutoff = 0 означає «до самого початку».
- *
- * Адміністратора це не стосується: клуб домовляється голосом і має могти
- * зняти запис навіть за хвилину до початку.
- */
-export function canCancelNow(startTime: Date, cutoffMinutes: number): boolean {
-  return Date.now() < startTime.getTime() - cutoffMinutes * 60_000;
-}
+/* Правило «чи гравець ще може зняти запис сам» живе в lib/customerCancel —
+   ним же користується кнопка «Скасувати» в Telegram. Реекспорт лишає
+   старий імпорт робочим. */
+export { canCancelNow };
 
 /**
  * POST /api/public/clubs/:slug/bookings/:id/join — записатись у групове заняття.
@@ -843,6 +857,11 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
 
   const phone = normalizePhone(body.customerPhone);
   if (!phone) return res.status(400).json({ error: 'BAD_PHONE' });
+
+  /* Те саме правило, що й у броні корту: місце на номер акаунта — тільки
+     після входу, інакше чужа знижка й чуже місце в турнірі. */
+  const guard = await accountGuard(req, club.id, phone.e164);
+  if (guard.blocked) return res.status(401).json({ error: 'LOGIN_REQUIRED' });
 
   const customer = await findOrCreateCustomer({
     clubId: club.id,
@@ -1097,30 +1116,18 @@ publicRouter.post('/bookings/:id/cancel', async (req, res) => {
   const parsed = z.object({ token: z.string().uuid() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
-  const booking = await prisma.booking.findUnique({
+  /* Токен перевіряємо тут, до спільної функції: без нього будь-хто, хто
+     знає id броні, скасував би чужу гру. */
+  const owned = await prisma.booking.findUnique({
     where: { id: req.params.id },
-    include: { club: { select: { cancelCutoffMinutes: true } } },
+    select: { cancelToken: true },
   });
-  if (!booking || booking.cancelToken !== parsed.data.token) {
+  if (!owned || owned.cancelToken !== parsed.data.token) {
     return res.status(404).json({ error: 'NOT_FOUND' });
   }
-  if (booking.status === 'CANCELLED') return res.json({ ok: true });
 
-  const cutoff = booking.club.cancelCutoffMinutes;
-  if (!canCancelNow(booking.startTime, cutoff)) {
-    return res.status(400).json({ error: cutoff > 0 ? 'CANCEL_CLOSED' : 'ALREADY_STARTED' });
-  }
-
-  await prisma.booking.update({
-    where: { id: booking.id },
-    data: { status: 'CANCELLED', cancelledAt: new Date() },
-  });
-
-  /* Найважливіше сповіщення з усіх. Гравець знімає бронь сам, за годину
-     чи за три дні, і без цього рядка клуб дізнавався про це, лише
-     відкривши сітку, а викликаний тренер — приїхавши на заняття,
-     якого вже немає. */
-  void notifyBooking({ bookingId: booking.id, event: 'cancelled' });
+  const result = await cancelBookingByCustomer(req.params.id);
+  if (!result.ok) return res.status(result.status).json({ error: result.code });
 
   res.json({ ok: true });
 });
@@ -1138,13 +1145,33 @@ const customerLoginLimiter = rateLimit({
 });
 
 /**
- * POST /api/public/clubs/:slug/customer/login
+ * Чи можна діяти від імені картки з цим телефоном.
  *
- * Телефон + дата народження з картки клієнта.
+ * Картка з паролем — це акаунт: бронювати чи записуватись на її номер можна
+ * тільки з її ж токеном. Інакше форма броні лишалась би обхідними дверима
+ * в чужий профіль — зі знижкою власника, його бонусами і правом змінити
+ * пошту картки. Гість і картка без пароля бронюють як і раніше.
+ */
+async function accountGuard(req: import('express').Request, clubId: string, phone: string) {
+  const owner = await prisma.customer.findUnique({
+    where: { clubId_phone: { clubId, phone } },
+    select: { id: true, passwordHash: true },
+  });
+  const header = req.headers.authorization;
+  const viewer = header?.startsWith('Bearer ') ? verifyCustomerToken(header.slice(7)) : null;
+  const signedIn = Boolean(owner && viewer && viewer.clubId === clubId && viewer.customerId === owner.id);
+  return { blocked: Boolean(owner?.passwordHash) && !signedIn, signedIn };
+}
+
+/**
+ * POST /api/public/clubs/:slug/customer/login  { phone, password }
+ *
+ * Телефон + пароль. Дата народження профіль більше не відчиняє — див.
+ * lib/customerPassword.ts.
  */
 publicRouter.post('/clubs/:slug/customer/login', customerLoginLimiter, async (req, res) => {
   const parsed = z
-    .object({ phone: z.string().trim(), birthDate: birthDateText })
+    .object({ phone: z.string().trim(), password: z.string().min(1).max(128) })
     .safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
@@ -1159,11 +1186,87 @@ publicRouter.post('/clubs/:slug/customer/login', customerLoginLimiter, async (re
     where: { clubId_phone: { clubId: club.id, phone: phone.e164 } },
   });
   if (!customer) return res.status(404).json({ error: 'CUSTOMER_NOT_FOUND' });
-  if (dateOnly(customer.birthDate) !== parsed.data.birthDate) {
+
+  const check = await verifyCustomerPassword(customer.id, parsed.data.password);
+  if (!check.ok) {
+    /* Картка є, а пароля в неї немає: заведена адміністратором, бронню
+       гостя або до появи паролів. Віджет пропонує створити акаунт на цей
+       номер — а не каже «невірний пароль», якого людина ніколи не мала. */
+    if (check.reason === 'NOT_SET') return res.status(409).json({ error: 'PASSWORD_NOT_SET' });
+    if (check.reason === 'LOCKED') return res.status(429).json({ error: 'ACCOUNT_LOCKED' });
     return res.status(403).json({ error: 'INVALID_CREDENTIALS' });
   }
 
   res.json({
+    token: signCustomerToken({ customerId: customer.id, clubId: club.id }),
+    name: customer.name,
+    phone: customer.phone,
+    email: customer.email,
+    birthDate: dateOnly(customer.birthDate),
+  });
+});
+
+/**
+ * POST /api/public/clubs/:slug/customer/register  { phone, name, birthDate, password }
+ *
+ * Акаунт гравця: створюється тільки разом із паролем.
+ *
+ * Номер, у якого акаунт уже є, — 409, а не тихий вхід: інакше форма
+ * реєстрації стала б другою формою входу без пароля.
+ *
+ * Картку без пароля (заведену адміністратором, бронню гостя чи до появи
+ * паролів) можна перетворити на акаунт. Якщо в картці вже є дата
+ * народження, вона мусить збігтися — хоч якийсь доказ, що картка твоя.
+ * Пароль ставиться умовним оновленням «де пароля ще немає»: двоє, що
+ * одночасно реєструють той самий номер, не перезапишуть одне одного.
+ */
+publicRouter.post('/clubs/:slug/customer/register', customerLoginLimiter, async (req, res) => {
+  const parsed = z
+    .object({ phone: z.string().trim(), name: z.string(), birthDate: birthDateText, password: passwordText })
+    .safeParse(req.body);
+  if (!parsed.success) {
+    const weak = parsed.error.issues.some((i) => i.path[0] === 'password');
+    return res.status(400).json({ error: weak ? 'WEAK_PASSWORD' : 'BAD_REQUEST' });
+  }
+
+  const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+  const club = await loadClub(slug);
+  if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
+
+  const name = cleanCustomerName(parsed.data.name);
+  if (!name) return res.status(400).json({ error: 'BAD_NAME' });
+
+  const phone = normalizePhone(parsed.data.phone);
+  if (!phone) return res.status(400).json({ error: 'BAD_PHONE' });
+
+  const existing = await prisma.customer.findUnique({
+    where: { clubId_phone: { clubId: club.id, phone: phone.e164 } },
+    select: { birthDate: true, passwordHash: true },
+  });
+  if (existing?.passwordHash) return res.status(409).json({ error: 'ALREADY_REGISTERED' });
+  if (existing?.birthDate && dateOnly(existing.birthDate) !== parsed.data.birthDate) {
+    return res.status(403).json({ error: 'BIRTH_DATE_MISMATCH' });
+  }
+
+  const customer = await findOrCreateCustomer({
+    clubId: club.id,
+    name,
+    rawPhone: phone.e164,
+    birthDate: birthDateValue(parsed.data.birthDate),
+  });
+  if (!customer) return res.status(400).json({ error: 'BAD_PHONE' });
+
+  const claimed = await prisma.customer.updateMany({
+    where: { id: customer.id, passwordHash: null },
+    data: {
+      passwordHash: await hashCustomerPassword(parsed.data.password),
+      passwordFails: 0,
+      passwordLockedUntil: null,
+    },
+  });
+  if (claimed.count !== 1) return res.status(409).json({ error: 'ALREADY_REGISTERED' });
+
+  res.status(201).json({
     token: signCustomerToken({ customerId: customer.id, clubId: club.id }),
     name: customer.name,
     phone: customer.phone,
@@ -1203,7 +1306,7 @@ publicRouter.get('/customer/me', async (req, res) => {
 
   const now = new Date();
 
-  const [upcoming, seats, club, pastBookings, pastSeats, pass] = await Promise.all([
+  const [upcoming, seats, club, pastBookings, pastSeats, pass, waitlist] = await Promise.all([
     prisma.booking.findMany({
       where: {
         customerId: customer.id,
@@ -1239,7 +1342,7 @@ publicRouter.get('/customer/me', async (req, res) => {
     }),
     prisma.club.findUnique({
       where: { id: customer.clubId },
-      select: { timezone: true, cancelCutoffMinutes: true, passesEnabled: true },
+      select: { timezone: true, cancelCutoffMinutes: true, passesEnabled: true, plan: true },
     }),
     /* Минулі відвідування — тільки для підсумку в картці гравця.
        Беремо обидва джерела й лише поля, потрібні для статистики:
@@ -1284,6 +1387,17 @@ publicRouter.get('/customer/me', async (req, res) => {
     /* Абонемент. Той самий getActivePass, що бачить ресепшен, — щоб
        гравець і адміністратор не сперечались про залишок біля стійки. */
     getActivePass(customer.id, now),
+    /* Черги гравця — щоб у профілі було видно, на що він чекає, і з
+       черги можна було вийти, не шукаючи повідомлення бота. */
+    prisma.waitlistEntry.findMany({
+      where: { customerId: customer.id, status: { in: ['WAITING', 'OFFERED'] }, startTime: { gt: now } },
+      select: {
+        id: true, courtId: true, startTime: true, endTime: true, status: true, offerUntil: true,
+        court: { select: { name: true } },
+      },
+      orderBy: { startTime: 'asc' },
+      take: 10,
+    }),
   ]);
 
   const tz = club?.timezone ?? 'Europe/Kyiv';
@@ -1363,6 +1477,21 @@ publicRouter.get('/customer/me', async (req, res) => {
     /* Правило клубу їде разом зі списком: віджет має пояснити гравцю, чому
        кнопки більше немає, а не мовчки її прибрати. */
     cancelCutoffMinutes: cutoff,
+    /* available — чи може клуб узагалі слати гравцю в Telegram (план і
+       бот). Без нього віджет показав би кнопку, яка нічого не підключить. */
+    telegram: {
+      available: playerTelegramReady(club?.plan),
+      connected: Boolean(customer.telegramChatId),
+    },
+    waitlist: waitlist.map((w) => ({
+      id: w.id,
+      courtId: w.courtId,
+      courtName: w.court.name,
+      start: w.startTime.toISOString(),
+      end: w.endTime.toISOString(),
+      status: w.status,
+      offerUntil: w.offerUntil?.toISOString() ?? null,
+    })),
     upcoming: upcoming.map((b) => ({
       id: b.id,
       courtName: b.court.name,
@@ -1421,6 +1550,127 @@ publicRouter.get('/customer/me', async (req, res) => {
  * Частковий унікальний індекс seat_one_per_phone рахує тільки BOOKED, тож
  * той самий гравець може записатись у це заняття знову.
  */
+/* -------------------------------------------------------------------------- */
+/* TELEGRAM І ЧЕРГА ГРАВЦЯ                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** Картка гравця разом із планом клубу — для перевірок нижче */
+async function customerWithClub(auth: { customerId: string; clubId: string }) {
+  const customer = await prisma.customer.findUnique({
+    where: { id: auth.customerId },
+    select: {
+      id: true,
+      clubId: true,
+      club: { select: { id: true, slug: true, name: true, timezone: true, leadTimeMinutes: true, plan: true } },
+    },
+  });
+  return customer && customer.clubId === auth.clubId ? customer : null;
+}
+
+/**
+ * POST /api/public/customer/telegram/link
+ *
+ * Посилання t.me/<бот>?start=p_<код>. Гравець відкриває його, Telegram сам
+ * надсилає боту /start з кодом — нічого переписувати не треба.
+ */
+publicRouter.post('/customer/telegram/link', async (req, res) => {
+  const auth = requireCustomerAuth(req, res);
+  if (!auth) return;
+
+  const customer = await customerWithClub(auth);
+  if (!customer) return res.status(404).json({ error: 'NOT_FOUND' });
+  if (!playerTelegramReady(customer.club.plan)) {
+    return res.status(503).json({ error: 'TELEGRAM_UNAVAILABLE' });
+  }
+
+  const code = await createPlayerLinkCode(customer.id);
+  res.json({
+    url: `https://t.me/${process.env.TELEGRAM_BOT_USERNAME}?start=${playerStartPayload(code)}`,
+    minutes: PLAYER_LINK_MINUTES,
+  });
+});
+
+/** DELETE /api/public/customer/telegram — відключити сповіщення гравця */
+publicRouter.delete('/customer/telegram', async (req, res) => {
+  const auth = requireCustomerAuth(req, res);
+  if (!auth) return;
+
+  const customer = await customerWithClub(auth);
+  if (!customer) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  await unlinkPlayers([customer.id]);
+  res.json({ ok: true });
+});
+
+const waitlistSchema = z.object({
+  courtId: z.string().uuid(),
+  start: z.string().datetime({ offset: true }),
+  end: z.string().datetime({ offset: true }),
+});
+
+const JOIN_STATUS: Record<JoinError, number> = {
+  COURT_NOT_FOUND: 404,
+  BAD_SLOT: 400,
+  TOO_LATE: 409,
+  SLOT_FREE: 409,
+  ALREADY_MINE: 409,
+  TELEGRAM_REQUIRED: 409,
+  TELEGRAM_UNAVAILABLE: 503,
+  TOO_MANY: 409,
+  CUSTOMER_BLOCKED: 403,
+};
+
+/**
+ * POST /api/public/clubs/:slug/waitlist  { courtId, start, end }
+ *
+ * Стати в чергу на зайнятий слот. Тільки з кабінету гравця й тільки з
+ * підключеним Telegram — див. lib/waitlist.ts.
+ */
+publicRouter.post('/clubs/:slug/waitlist', async (req, res) => {
+  const auth = requireCustomerAuth(req, res);
+  if (!auth) return;
+
+  const parsed = waitlistSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const customer = await customerWithClub(auth);
+  const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+  if (!customer || customer.club.slug !== slug) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const result = await joinWaitlist({
+    club: customer.club,
+    customerId: customer.id,
+    courtId: parsed.data.courtId,
+    start: new Date(parsed.data.start),
+    end: new Date(parsed.data.end),
+  });
+  if (!result.ok) return res.status(JOIN_STATUS[result.code]).json({ error: result.code });
+
+  res.status(201).json({ id: result.id });
+});
+
+/** DELETE /api/public/customer/waitlist/:id — вийти з черги */
+publicRouter.delete('/customer/waitlist/:id', async (req, res) => {
+  const auth = requireCustomerAuth(req, res);
+  if (!auth) return;
+
+  const id = z.string().uuid().safeParse(req.params.id);
+  if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  /* updateMany з власником у where: чужий id просто нічого не змінює, і
+     відповідь не підказує, що такий запис існує. */
+  await prisma.waitlistEntry.updateMany({
+    where: {
+      id: id.data,
+      customerId: auth.customerId,
+      clubId: auth.clubId,
+      status: { in: ['WAITING', 'OFFERED'] },
+    },
+    data: { status: 'CANCELLED' },
+  });
+  res.json({ ok: true });
+});
+
 publicRouter.post('/seats/:id/cancel', async (req, res) => {
   const id = z.string().uuid().safeParse(req.params.id);
   if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
@@ -1434,69 +1684,19 @@ publicRouter.post('/seats/:id/cancel', async (req, res) => {
     : null;
 
   try {
-    /* Транзакція каже, чи справді щось знято: повторний виклик і місце під
-       оплатою виходять із неї через `return null` і сповіщення не варті —
-       нічого не сталось. */
-    const cancelled = await prisma.$transaction(async (tx) => {
-      const seat = await tx.bookingSeat.findUnique({
-        where: { id: id.data },
-        include: {
-          booking: {
-            select: {
-              id: true,
-              startTime: true,
-              clubId: true,
-              club: { select: { cancelCutoffMinutes: true } },
-            },
-          },
-        },
-      });
-      if (!seat) throw new HttpError(404, 'NOT_FOUND');
-
-      /* Чиє це місце. Токен місця або кабінет того самого клієнта — інакше
-         сусід по групі зміг би зняти чужий запис, знаючи лише id. */
+    /* Чиє це місце: токен місця або кабінет того самого клієнта. Решта —
+       строк, виручка, сповіщення — спільна з кнопкою в Telegram. */
+    const result = await cancelSeatByCustomer(id.data, (seat) => {
       const byToken = Boolean(body.data.token) && seat.cancelToken === body.data.token;
       const byCabinet = Boolean(auth)
         && seat.customerId === auth!.customerId
-        && seat.booking.clubId === auth!.clubId;
-      if (!byToken && !byCabinet) throw new HttpError(404, 'NOT_FOUND');
-
-      /* Знімати можна тільки те, що справді за гравцем. Повторний виклик
-         не має бути помилкою (гравець міг двічі тицьнути), а місце під
-         оплатою чи вже протухле знімати немає з чого: перше відпустить
-         вебхук або прибирання, друге вже відпущене. */
-      if (seat.status !== 'BOOKED') return null;
-
-      const cutoff = seat.booking.club.cancelCutoffMinutes;
-      if (!canCancelNow(seat.booking.startTime, cutoff)) {
-        throw new HttpError(400, cutoff > 0 ? 'CANCEL_CLOSED' : 'ALREADY_STARTED');
-      }
-
-      await tx.bookingSeat.update({
-        where: { id: seat.id },
-        data: { status: 'CANCELLED', cancelledAt: new Date() },
-      });
-
-      /* Виручка йде разом із місцем — інакше скасовані записи назавжди
-         лишились би в підсумку дня. */
-      await tx.booking.update({
-        where: { id: seat.booking.id },
-        data: { priceTotal: { decrement: seat.price } },
-      });
-
-      return { bookingId: seat.booking.id, seatId: seat.id };
+        && seat.clubId === auth!.clubId;
+      return byToken || byCabinet;
     });
-
-    /* Після коміту, а не всередині: транзакція може відкотитись, і
-       повідомлення про зняте місце пішло б у чат раніше, ніж стало
-       правдою — а забрати його звідти вже не можна. */
-    if (cancelled) {
-      void notifyBooking({ ...cancelled, event: 'cancelled' });
-    }
+    if (!result.ok) return res.status(result.status).json({ error: result.code });
 
     res.json({ ok: true });
   } catch (e) {
-    if (e instanceof HttpError) return res.status(e.status).json({ error: e.code });
     console.error('[seat cancel] failed', e);
     res.status(500).json({ error: 'INTERNAL' });
   }

@@ -7,6 +7,7 @@ import { encryptSecret, paymentsSecretReady } from '../../lib/crypto';
 import { requireAuth, requireStaff, requireRole } from './shared';
 import { logoSrcOf } from '../public';
 import { liqPayKeys } from '../../lib/payments/liqpay';
+import { BACKDROP_STYLES } from '../../lib/backdrop';
 
 export const clubRouter = Router();
 
@@ -46,6 +47,8 @@ clubRouter.get(
       hasLogoFile: Boolean(club.logoMime),
       brandColor:
         club.brandColor,
+      cabinetBackdrop: club.cabinetBackdrop,
+      pageBackdrop: club.pageBackdrop,
       telegramChatId:
         club.telegramChatId,
       slotMinutes:
@@ -154,6 +157,15 @@ clubRouter.patch(
             )
             .nullable()
             .optional(),
+
+        /* Фон — тільки з білого списку (enum і в базі, і тут). Значення
+           потрапляє у верстку віджета й кабінету, тож довільний рядок
+           сюди не пройде навіть до бази. */
+        cabinetBackdrop:
+          z.enum(BACKDROP_STYLES).optional(),
+
+        pageBackdrop:
+          z.enum(BACKDROP_STYLES).optional(),
 
         timezone:
           z.string()
@@ -405,6 +417,8 @@ clubRouter.patch(
       hasLogoFile: Boolean(club.logoMime),
       brandColor:
         club.brandColor,
+      cabinetBackdrop: club.cabinetBackdrop,
+      pageBackdrop: club.pageBackdrop,
       telegramChatId:
         club.telegramChatId,
       prepayEnabled:
