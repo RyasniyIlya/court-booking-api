@@ -22,8 +22,11 @@ export const botReady = () => Boolean(botToken());
  * серед тисячі однакових рядків.
  */
 export class TelegramFatal extends Error {}
+export class TelegramDeliveryError extends Error {
+  constructor(public readonly retryable: boolean) { super('Telegram delivery failed'); }
+}
 
-async function call<T>(method: string, body: unknown): Promise<T | null> {
+async function call<T>(method: string, body: unknown, strict = false): Promise<T | null> {
   const token = botToken();
   if (!token) return null;
 
@@ -40,7 +43,8 @@ async function call<T>(method: string, body: unknown): Promise<T | null> {
     });
   } catch (e) {
     /* Мережа. Тимчасово — про це варто сказати й спробувати ще. */
-    console.error(`[telegram] ${method} threw`, e);
+    console.error(`[telegram] ${method} network error`);
+    if (strict) throw new TelegramDeliveryError(true);
     return null;
   }
 
@@ -49,6 +53,7 @@ async function call<T>(method: string, body: unknown): Promise<T | null> {
   };
 
   if (!data.ok) {
+    if (strict) throw new TelegramDeliveryError([200, 401, 404, 429].includes(r.status) || r.status >= 500);
     if (r.status === 401 || r.status === 404) {
       throw new TelegramFatal(
         `${method}: ${data.description ?? r.status}. Перевірте TELEGRAM_BOT_TOKEN.`,
@@ -76,6 +81,17 @@ export function sendMessage(chatId: string | number, text: string, markup?: unkn
     disable_web_page_preview: true,
     reply_markup: markup,
   });
+}
+
+export async function sendReminderMessage(chatId: string | number, text: string, markup?: unknown): Promise<'sent' | 'retry' | 'permanent'> {
+  try {
+    const result = await call<{ message_id: number }>('sendMessage', {
+      chat_id: chatId, text, parse_mode: 'HTML', disable_web_page_preview: true, reply_markup: markup,
+    }, true);
+    return result ? 'sent' : 'retry';
+  } catch (error) {
+    return error instanceof TelegramDeliveryError && !error.retryable ? 'permanent' : 'retry';
+  }
 }
 
 /**

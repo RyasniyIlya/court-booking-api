@@ -1,5 +1,6 @@
 import { planFeatures } from './plans';
 import bcrypt from 'bcryptjs';
+import { checkPassword } from './passwordCheck';
 
 import { prisma } from './db';
 
@@ -121,6 +122,7 @@ export async function loginByPassword(
   email: string,
   password: string,
 ): Promise<string> {
+  if (!/^[1-9]\d*$/.test(chatId)) return 'Відкрийте особистий чат із ботом.';
   const wait = lockRemaining(chatId);
   if (wait > 0) {
     return `Забагато невдалих спроб. Спробуйте через ${Math.ceil(wait / 60_000)} хв.`;
@@ -139,8 +141,9 @@ export async function loginByPassword(
   /* bcrypt.compare проти справжнього хеша навіть тоді, коли акаунта немає:
      інакше відповідь на неіснуючу пошту приходила б помітно швидше, і за
      часом відповіді можна було б перебрати список адрес клубу. */
-  const hash = user?.passwordHash ?? DUMMY_HASH;
-  const ok = await bcrypt.compare(password, hash).catch(() => false);
+  const check = user ? await checkPassword('user', user.id, password) : null;
+  if (!user) await bcrypt.compare(password.slice(0, 128), DUMMY_HASH);
+  const ok = check?.ok === true;
 
   if (!user || !ok) {
     const locked = noteFail(chatId);

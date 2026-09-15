@@ -25,6 +25,11 @@ export function bookingUrl(slug: string, env: NodeJS.ProcessEnv = process.env): 
   return base ? `${base}/c/${encodeURIComponent(slug)}` : null;
 }
 
+export function profileUrl(slug: string, env: NodeJS.ProcessEnv = process.env): string | null {
+  const base = bookingUrl(slug, env);
+  return base ? `${base}?cbProfile=1` : null;
+}
+
 export function clubChoiceKeyboard(clubs: BookingClub[]) {
   return {
     inline_keyboard: clubs.map((club) => [{
@@ -40,5 +45,14 @@ export function openBookingKeyboard(slug: string, env: NodeJS.ProcessEnv = proce
   const button = url.startsWith('https://')
     ? { text: 'Обрати час і забронювати', web_app: { url } }
     : { text: 'Обрати час і забронювати', url };
+  return { inline_keyboard: [[button]] };
+}
+
+export function openProfileKeyboard(slug: string, env: NodeJS.ProcessEnv = process.env) {
+  const url = profileUrl(slug, env);
+  if (!url) return undefined;
+  const button = url.startsWith('https://')
+    ? { text: 'Відкрити мій профіль', web_app: { url } }
+    : { text: 'Відкрити мій профіль', url };
   return { inline_keyboard: [[button]] };
 }

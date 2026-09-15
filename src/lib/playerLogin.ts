@@ -1,21 +1,26 @@
 import { prisma } from './db';
 import { planFeatures } from './plans';
-import { sendMessage, type TgUpdate } from './telegram';
+import { sendMessage, deleteMessage, type TgUpdate } from './telegram';
+import { verifyCustomerPassword } from './customerPassword';
+import { playerKeyboard } from './botKeyboard';
 import { normalizePhone } from './phone';
-import { bookingUrl, openBookingKeyboard } from './botBooking';
+import { bookingUrl, openProfileKeyboard } from './botBooking';
 import { html, linkChatToCustomer, PLAYER_LINK_MINUTES } from './playerBot';
 
 /**
- * Вхід гравця в бота — тільки номером, який підтвердив Telegram.
+ * Основний вхід: телефон і пароль профілю, створеного на сайті клубу.
+ * Пароль перевіряє спільний із вебвходом сервіс із блокуванням спроб.
+ * Одноразове посилання з авторизованого вебпрофілю зберігає окремий
+ * шлях привʼязки через підтверджений Telegram-контакт.
  *
- * ── Чому саме так ───────────────────────────────────────────────────────
+ * ── Перевірка для одноразового посилання ────────────────────────────────
  *
  * Профіль гравця створюється на сайті клубу, і номер там ніхто не
  * перевіряє: будь-хто може зареєструвати чужий телефон зі своєю датою
  * народження. Сам по собі профіль на сайті мало що дає, але привʼязаний до
  * нього Telegram — дає: нагадування про чужі ігри з кнопкою «Скасувати».
  *
- * Тому чат привʼязується до картки лише тоді, коли людина поділилась
+ * За одноразовим посиланням чат привʼязується, коли людина поділилась
  * номером кнопкою request_contact і цей номер збігається з номером картки.
  * Telegram віддає номер, на який зареєстрований САМ акаунт, і
  * contact.user_id дорівнює автору повідомлення — підробити це з клієнта
@@ -25,7 +30,7 @@ import { html, linkChatToCustomer, PLAYER_LINK_MINUTES } from './playerBot';
  * ── Два входи, одна перевірка ───────────────────────────────────────────
  *
  *   • /profile, кнопка під карткою клубу, t.me/<бот>?start=login_<slug> —
- *     шукаємо картку клубу за підтвердженим номером;
+ *     перевіряємо телефон і пароль наявного акаунта;
  *   • «Підключити Telegram» у профілі на сайті (start=p_<код>) — картка вже
  *     відома з коду, і номер Telegram має збігтися саме з нею.
  */
@@ -38,6 +43,7 @@ type LoginData = {
   clubId: string;
   /** Прийшли за кодом із профілю — номер має збігтися саме з цією карткою */
   customerId?: string;
+  phone?: string;
 };
 
 type Msg = NonNullable<TgUpdate['message']>;
@@ -60,12 +66,12 @@ async function loginClub(where: { slug: string } | { id: string }) {
   return club && planFeatures(club.plan).telegram ? club : null;
 }
 
-async function saveDialog(chatId: string, data: LoginData) {
+async function saveDialog(chatId: string, data: LoginData, step = 'phone') {
   const expiresAt = new Date(Date.now() + LOGIN_TTL_MINUTES * 60_000);
   await prisma.tgDialog.upsert({
     where: { chatId },
-    create: { chatId, flow: FLOW, step: 'phone', data, expiresAt },
-    update: { flow: FLOW, step: 'phone', data, expiresAt },
+    create: { chatId, flow: FLOW, step, data, expiresAt },
+    update: { flow: FLOW, step, data, expiresAt },
   });
 }
 
@@ -114,13 +120,18 @@ export async function startPlayerLogin(chatId: string, slug: string): Promise<vo
     await sendMessage(
       chatId,
       `Ви вже увійшли в клубі <b>${html(club.name)}</b> як <b>${html(existing.name)}</b>.\n\n/my — ваші записи · /stop — вийти`,
-      openBookingKeyboard(club.slug),
+      playerKeyboard(),
     );
+    const profile = openProfileKeyboard(club.slug);
+    if (profile) await sendMessage(chatId, 'Відкрити особистий кабінет без повторного входу:', profile);
     return;
   }
 
-  await saveDialog(chatId, { clubId: club.id });
-  await askPhone(chatId, `👤 <b>Вхід у профіль гравця · ${html(club.name)}</b>`);
+  await saveDialog(chatId, { clubId: club.id }, 'account-phone');
+  await sendMessage(chatId,
+    `👤 <b>${html(club.name)} · Вхід</b>\n\nКрок 1 з 2 — телефон.\nВведіть номер із профілю на сайті. Далі введіть пароль цього профілю. Номер Telegram може відрізнятися.`,
+    { keyboard: [[{ text: BTN_CANCEL }]], resize_keyboard: true });
+  await sendMessage(chatId, 'Ще немає профілю? Спочатку зареєструйтеся на сайті клубу.', siteKeyboard(club.slug, 'Створити профіль на сайті'));
 }
 
 /**
@@ -167,13 +178,21 @@ export async function startLinkByCode(chatId: string, code: string): Promise<voi
  * розбирає звичайний обробник.
  */
 export async function handlePlayerLoginMessage(msg: Msg): Promise<boolean> {
+  if (msg.chat.type !== 'private') return false;
   const chatId = String(msg.chat.id);
   const dialog = await prisma.tgDialog.findUnique({ where: { chatId } });
   if (!dialog || dialog.flow !== FLOW) return false;
 
+  // Пароль не зберігаємо ні в діалозі, ні в історії чату.
+  if (dialog.step === 'account-password' && msg.text) {
+    const deleted = await deleteMessage(chatId, msg.message_id);
+    if (!deleted) await sendMessage(chatId, 'Не вдалося видалити повідомлення. Видаліть його вручну, якщо воно містить пароль.');
+  }
+
   if (dialog.expiresAt < new Date()) {
     await dropDialog(chatId);
-    return false;
+    await sendMessage(chatId, 'Час входу минув. Почніть знову командою /profile.', removeKeyboard);
+    return true;
   }
 
   const text = msg.text?.trim() ?? '';
@@ -186,9 +205,50 @@ export async function handlePlayerLoginMessage(msg: Msg): Promise<boolean> {
 
   /* Інша команда посеред входу — людина передумала. Закриваємо діалог і
      віддаємо команду звичайному обробнику. */
-  if (text.startsWith('/')) {
+  if (text.startsWith('/') && dialog.step !== 'account-password') {
     await dropDialog(chatId);
     return false;
+  }
+
+  if (dialog.step === 'account-phone' || dialog.step === 'account-password') {
+    const data = dialog.data as LoginData;
+    const club = await loginClub({ id: data.clubId });
+    if (!club) {
+      await dropDialog(chatId);
+      await sendMessage(chatId, 'Вхід у цьому клубі зараз недоступний.', removeKeyboard);
+      return true;
+    }
+    if (dialog.step === 'account-phone') {
+      const phone = normalizePhone(text);
+      if (!phone) {
+        await sendMessage(chatId, 'Введіть телефон профілю, наприклад +380671112233.');
+        return true;
+      }
+      await saveDialog(chatId, { clubId: club.id, phone: phone.e164 }, 'account-password');
+      await sendMessage(chatId, '🔐 <b>Крок 2 з 2 — пароль</b>\n\nНадішліть пароль профілю із сайту окремим повідомленням. Я спробую одразу видалити його з чату.');
+      return true;
+    }
+    const password = msg.text ?? '';
+    if (!password || password.length > 128) {
+      await sendMessage(chatId, 'Надішліть пароль текстом (до 128 символів).');
+      return true;
+    }
+    const customer = data.phone ? await prisma.customer.findUnique({
+      where: { clubId_phone: { clubId: club.id, phone: data.phone } },
+      select: { id: true, name: true },
+    }) : null;
+    const check = customer ? await verifyCustomerPassword(customer.id, password) : null;
+    if (!customer || !check?.ok) {
+      await dropDialog(chatId);
+      await sendMessage(chatId,
+        check && !check.ok && check.reason === 'LOCKED'
+          ? 'Забагато спроб. Спробуйте через 15 хвилин.'
+          : 'Не вдалося увійти. Перевірте телефон і пароль профілю на сайті.',
+        { inline_keyboard: [[{ text: 'Спробувати ще раз', callback_data: `plogin:${club.slug}` }]] });
+      return true;
+    }
+    await finish(chatId, club, customer.id, customer.name);
+    return true;
   }
 
   const contact = msg.contact;
@@ -292,15 +352,15 @@ async function finish(chatId: string, club: Club, customerId: string, name: stri
       '⏰ нагадування за 3 години до гри — з кнопками «Прийду» і «Скасувати»;',
       '🔔 повідомлення, коли звільниться час, на який ви чекаєте в черзі.',
       '',
-      '/my — ваші записи · /stop — вийти',
+      'Ваші записи та профіль — у кнопках меню нижче.',
     ].join('\n'),
-    removeKeyboard,
+    playerKeyboard(),
   );
 
   /* Inline-кнопка окремим повідомленням: Telegram не дозволяє в одному
      повідомленні і прибрати клавіатуру під полем вводу, і дати кнопку. */
-  const markup = openBookingKeyboard(club.slug);
-  if (markup) await sendMessage(chatId, 'Можна одразу обрати час:', markup);
+  const markup = openProfileKeyboard(club.slug);
+  if (markup) await sendMessage(chatId, 'Відкрити особистий кабінет без повторного входу:', markup);
 }
 
 /* ── Точки входу з обробника ───────────────────────────────────────────── */
@@ -321,7 +381,7 @@ export async function playerLoginButtonFor(chatId: string, slug: string) {
     where: { clubId: club.id, telegramChatId: chatId },
     select: { id: true },
   });
-  return linked ? null : { text: '👤 Увійти в профіль гравця', callback_data: `plogin:${slug}` };
+  return { text: linked ? '👤 Мій профіль' : '👤 Увійти в профіль гравця', callback_data: `plogin:${slug}` };
 }
 
 /** /profile без параметра: один клуб — одразу, кілька — вибір */

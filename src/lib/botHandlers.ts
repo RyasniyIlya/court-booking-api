@@ -68,7 +68,7 @@ const HELP = [
   '<b>Для гравця</b>',
   'Натисніть /book, оберіть клуб і відкрийте його розклад.',
   'Якщо клуб надіслав своє посилання на бота — вибирати клуб повторно не потрібно.',
-  'Профіль гравця створюється на сайті клубу, а сюди входите командою /profile — номером, підтвердженим Telegram.',
+  'Створіть профіль на сайті клубу. Тут натисніть «Увійти в профіль» — введіть телефон і пароль із сайту.',
   'Нагадування про ігри: профіль гравця на сторінці клубу → «Підключити Telegram».',
   '/my — ваші записи, /stop — вимкнути сповіщення гравця.',
   '',
@@ -341,6 +341,10 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
   if (await handlePlayerCallback(q)) return;
 
   if (q.data?.startsWith('plogin:')) {
+    if (!q.from || String(q.from.id) !== chatId) {
+      await answerCallback(q.id, 'Відкрийте особистий чат із ботом');
+      return;
+    }
     const slug = q.data.slice('plogin:'.length);
     await answerCallback(q.id);
     if (/^[a-z0-9][a-z0-9-]{1,47}$/.test(slug)) await startPlayerLogin(chatId, slug);
@@ -436,6 +440,15 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
  * саме тому вона тут, а не всередині транспорту.
  */
 export async function handleUpdate(u: TgUpdate): Promise<void> {
+  // Group chats receive notifications only; a group id is never a staff identity.
+  if (u.callback_query?.message && String(u.callback_query.message.chat.id) !== String(u.callback_query.from?.id)) return;
+  if (u.message && (u.message.chat.type !== 'private' || u.message.chat.id !== u.message.from?.id)) {
+    if (/^\/(login|newpassword|start)(@\w+)?\b/i.test(u.message.text ?? '')) {
+      await deleteMessage(String(u.message.chat.id), u.message.message_id);
+      await sendMessage(String(u.message.chat.id), 'Вхід і керування акаунтом доступні лише в особистому чаті з ботом.');
+    }
+    return;
+  }
   if (u.callback_query) {
     await handleCallback(u.callback_query);
     return;
@@ -596,6 +609,11 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
       return;
     }
     await sendMessage(chatId, HELP);
+    return;
+  }
+
+  if (cmd === '/book') {
+    await showClubChoice(chatId);
     return;
   }
 

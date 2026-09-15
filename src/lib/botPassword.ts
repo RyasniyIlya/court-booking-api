@@ -1,4 +1,4 @@
-import bcrypt from 'bcryptjs';
+import { hashPassword } from './passwordHash';
 
 import { prisma } from './db';
 
@@ -52,6 +52,7 @@ export function passwordProblem(password: string): string | null {
  * про кожну причину відмови окремо.
  */
 export async function changePassword(chatId: string, password: string): Promise<string> {
+  if (!/^[1-9]\d*$/.test(chatId)) return 'Відкрийте особистий чат із ботом.';
   const user = await prisma.user.findUnique({
     where: { tgChatId: chatId },
     select: { id: true, email: true },
@@ -74,8 +75,8 @@ export async function changePassword(chatId: string, password: string): Promise<
   /* Вартість 12 — як у реєстрації (routes/admin/auth.ts). Саме нею
      створюється пароль, який людина вводить руками, і здешевлювати його
      тут не можна: хеш той самий, вхід той самий. */
-  const passwordHash = await bcrypt.hash(password, 12);
-  await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
+  const passwordHash = await hashPassword(password, 12);
+  await prisma.user.update({ where: { id: user.id }, data: { passwordHash, pinFails: 0, pinLockedUntil: null } });
 
   return [
     '✅ Пароль змінено',

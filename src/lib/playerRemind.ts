@@ -1,6 +1,6 @@
 import { prisma } from './db';
 import { planFeatures } from './plans';
-import { botReady, sendMessage } from './telegram';
+import { botReady, sendReminderMessage } from './telegram';
 import { runWaitlistTick } from './waitlist';
 import { loadPlayerItem, playerCardKeyboard, playerCardText, type PlayerItemKind } from './playerBot';
 
@@ -18,8 +18,9 @@ import { loadPlayerItem, playerCardKeyboard, playerCardText, type PlayerItemKind
  *
  * Нагадування персоналу тримає «вже надіслано» в Map і погоджується на
  * рідкий дубль після рестарту. Гравцю дубль — це спам від клубу, тому тут
- * `playerRemindedAt`, і його ставить умовний updateMany ДО відправки: два
- * процеси, що одночасно взяли ту саму бронь, не надішлють двічі.
+ * коротка оренда спроби, а playerRemindedAt ставиться після відправки.
+ * Зависла спроба звільняється через дві хвилини. Після невизначеного
+ * мережевого результату можливий повтор: абсолютної exactly-once доставки немає.
  */
 
 export const PLAYER_REMIND_MINUTES = 180;
@@ -75,9 +76,11 @@ export async function runPlayerReminderTick(now: Date = new Date()): Promise<num
   let delivered = 0;
 
   for (const { kind, id } of queue) {
+    const leaseUntil = new Date(now.getTime() + 120_000);
+    const where = { id, playerRemindedAt: null, OR: [{ playerReminderLeaseUntil: null }, { playerReminderLeaseUntil: { lt: now } }] };
     const claim = kind === 'b'
-      ? await prisma.booking.updateMany({ where: { id, playerRemindedAt: null }, data: { playerRemindedAt: now } })
-      : await prisma.bookingSeat.updateMany({ where: { id, playerRemindedAt: null }, data: { playerRemindedAt: now } });
+      ? await prisma.booking.updateMany({ where, data: { playerReminderLeaseUntil: leaseUntil } })
+      : await prisma.bookingSeat.updateMany({ where, data: { playerReminderLeaseUntil: leaseUntil } });
     if (claim.count === 0) continue;
 
     const item = await loadPlayerItem(kind, id);
@@ -88,12 +91,17 @@ export async function runPlayerReminderTick(now: Date = new Date()): Promise<num
     const state = item.confirmedAt ? 'confirmed' : 'remind';
 
     try {
-      await sendMessage(item.chatId, playerCardText(item, state, now), playerCardKeyboard(item, state));
-      delivered += 1;
+      const result = await sendReminderMessage(item.chatId, playerCardText(item, state, now), playerCardKeyboard(item, state));
+      const finish = { where: { id, playerReminderLeaseUntil: leaseUntil }, data: {
+        playerReminderLeaseUntil: null, ...(result === 'retry' ? {} : { playerRemindedAt: now }),
+      } };
+      if (kind === 'b') await prisma.booking.updateMany(finish);
+      else await prisma.bookingSeat.updateMany(finish);
+      if (result === 'sent') delivered += 1;
+      if (result === 'permanent') console.warn('[player-remind] delivery unavailable', kind, id);
     } catch (e) {
-      /* Мітка лишається: гравець міг заблокувати бота, і повторювати
-         щохвилини до самої гри означало б сотню однакових помилок. */
-      console.error('[player-remind] не вдалось надіслати', kind, id, e);
+      /* A crashed attempt is retried once its short lease expires. */
+      console.error('[player-remind] failed; lease will expire', kind, id);
     }
   }
 

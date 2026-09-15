@@ -1,4 +1,4 @@
-import bcrypt from 'bcryptjs';
+import { hashPassword } from './passwordHash';
 import { prisma } from './db';
 
 /**
@@ -65,7 +65,7 @@ export async function createClub(input: NewClubInput) {
     throw new EmailTakenError(email);
   }
 
-  const passwordHash = await bcrypt.hash(input.ownerPassword, 10);
+  const passwordHash = await hashPassword(input.ownerPassword, 10);
 
   // Клуб, години, корти і власник — однією транзакцією: напівзаведений клуб
   // гірший за незаведений, бо виглядає робочим.

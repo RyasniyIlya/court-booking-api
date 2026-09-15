@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { canReschedule } from '../lib/reschedule';
 import { z } from 'zod';
 import rateLimit from 'express-rate-limit';
 import { DateTime } from 'luxon';
@@ -24,12 +25,86 @@ import { botReady } from '../lib/telegram';
 import { planFeatures } from '../lib/plans';
 import { createPlayerLinkCode, PLAYER_LINK_MINUTES, playerStartPayload, unlinkPlayers } from '../lib/playerBot';
 import { joinWaitlist, type JoinError } from '../lib/waitlist';
+import { TelegramMiniAppDataError, verifyTelegramMiniAppData } from '../lib/telegramMiniApp';
 
 /** Бот налаштований і план клубу дозволяє Telegram */
 const playerTelegramReady = (plan: Parameters<typeof planFeatures>[0]) =>
   botReady() && Boolean(process.env.TELEGRAM_BOT_USERNAME) && planFeatures(plan).telegram;
 
 export const publicRouter = Router();
+
+// Попередній розрахунок та остаточний перенос використовують одну перевірку.
+publicRouter.post('/customer/bookings/:id/reschedule', async (req, res) => {
+  const auth = requireCustomerAuth(req, res);
+  if (!auth) return;
+  const parsed = z.object({
+    start: z.string().datetime(), end: z.string().datetime(), courtId: z.string().uuid(),
+    preview: z.boolean().default(false), version: z.string().datetime(),
+    expectedPrice: z.number().int().nonnegative().optional(),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const d = parsed.data;
+  const start = new Date(d.start), end = new Date(d.end);
+  const fail = (code: string): never => { throw new Error(`RESCHEDULE:${code}`); };
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const b = await tx.booking.findFirst({
+        where: { id: String(req.params.id), customerId: auth.customerId, clubId: auth.clubId },
+        include: { customer: true, payment: true, club: { include: { hours: true, promos: true, plan: true } },
+          trainer: { include: { hours: true, exceptions: true } } },
+      });
+      if (!b) return fail('NOT_FOUND');
+      if (b.capacity !== null || !['PENDING', 'CONFIRMED'].includes(b.status)) return fail('NOT_AVAILABLE');
+      if (!canReschedule(b.startTime)) return fail('CLOSED');
+      if (b.updatedAt.toISOString() !== d.version) return fail('CHANGED');
+      if (b.customer?.isBlocked || !clubBilling(b.club).online) return fail('NOT_AVAILABLE');
+      if (end <= start || end.getTime() - start.getTime() !== b.endTime.getTime() - b.startTime.getTime()) return fail('DURATION');
+      if (start.getTime() <= Date.now() || start.getTime() < Date.now() + b.club.leadTimeMinutes * 60_000) return fail('TOO_LATE');
+      const court = await tx.court.findFirst({ where: { id: d.courtId, clubId: auth.clubId, isActive: true } });
+      if (!court) return fail('NOT_AVAILABLE');
+      const hours = b.club.hours.find(h => h.weekday === DateTime.fromJSDate(start).setZone(b.club.timezone).weekday % 7);
+      const slotMinutes = court.slotMinutes ?? b.club.slotMinutes;
+      if (!hours || hours.isClosed || !isAlignedToGrid({ start, end, timezone: b.club.timezone,
+        openMinute: hours.openMinute, closeMinute: hours.closeMinute, slotMinutes })) return fail('OUT_OF_GRID');
+      const blocked = await tx.block.findFirst({ where: { clubId: auth.clubId,
+        OR: [{ courtId: null }, { courtId: court.id }], startTime: { lt: end }, endTime: { gt: start } } });
+      const occupied = await tx.booking.findFirst({ where: { id: { not: b.id }, clubId: auth.clubId,
+        status: { in: ['PENDING', 'CONFIRMED'] }, startTime: { lt: end }, endTime: { gt: start },
+        OR: [{ courtId: court.id }, ...(b.trainerId ? [{ trainerId: b.trainerId }] : [])] } });
+      if (blocked || occupied) return fail('SLOT_TAKEN');
+      if (b.trainer && (!b.trainer.isActive || !isTrainerAvailable(b.trainer.hours, start, end, b.club.timezone, b.trainer.exceptions))) return fail('TRAINER_UNAVAILABLE');
+      const trainerPrice = b.trainer ? Math.round(b.trainer.pricePerHour * (end.getTime() - start.getTime()) / 3600_000) : 0;
+      const usage = await tx.passUsage.findUnique({ where: { bookingId: b.id }, include: { pass: true } });
+      if (usage && !usage.revertedAt && (start < usage.pass.validFrom || end > usage.pass.validUntil)) return fail('PASS_EXPIRED');
+      const courtPrice = courtPriceWithPromos({ pricePerHour: court.pricePerHour, start, end,
+        timezone: b.club.timezone, courtId: court.id, slotMinutes, promos: b.club.promos, birthDate: b.customer?.birthDate }).price;
+      const price = Math.round((courtPrice + trainerPrice) * (100 - (b.customer?.discountPercent ?? 0)) / 100);
+      // Зміна суми потребує окремої платіжної операції. До її реалізації
+      // не змінюємо ні бронь, ні наявні списання/платежі.
+      const reason = b.expiresAt || b.payment?.status === 'PENDING' || b.payment?.refundRequestedAt ? 'PAYMENT_PENDING'
+        : price !== b.priceTotal ? 'PRICE_DIFFERENCE' : null;
+      if (d.preview) return { price, oldPrice: b.priceTotal, reason, start: d.start, end: d.end, courtName: court.name };
+      if (reason) return fail(reason);
+      if (d.expectedPrice !== price) return fail('CHANGED');
+      if (!canReschedule(b.startTime)) return fail('CLOSED');
+      const changed = await tx.booking.updateMany({ where: { id: b.id, updatedAt: b.updatedAt, status: b.status }, data: {
+        courtId: court.id, startTime: start, endTime: end, trainerPrice,
+        playerRemindedAt: null, playerConfirmedAt: null, playerReminderLeaseUntil: null,
+      } });
+      if (changed.count !== 1) return fail('CHANGED');
+      await tx.bookingReschedule.create({ data: { bookingId: b.id, customerId: auth.customerId,
+        fromCourtId: b.courtId, toCourtId: court.id, fromStart: b.startTime, fromEnd: b.endTime,
+        toStart: start, toEnd: end, price } });
+      return { price, oldPrice: b.priceTotal, reason: null, start: d.start, end: d.end, courtName: court.name };
+    }, { isolationLevel: 'Serializable' });
+    if (!d.preview) void notifyBooking({ bookingId: String(req.params.id), event: 'updated' }).catch(() => console.error('[reschedule] notification failed'));
+    return res.json({ ok: true, ...result });
+  } catch (e) {
+    if (isSlotTakenError(e) || (e as { code?: string }).code === 'P2034') return res.status(409).json({ error: 'SLOT_TAKEN' });
+    if (e instanceof Error && e.message.startsWith('RESCHEDULE:')) return res.status(409).json({ error: e.message.slice(11) });
+    throw e;
+  }
+});
 
 const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'date must be YYYY-MM-DD');
 
@@ -649,9 +724,7 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
   });
 
   // Тренер: перевіряємо, що він цього клубу, активний і не зайнятий.
-  // Констрейнта в базі на тренера немає — тому теоретично двоє можуть
-  // проскочити в одну мілісекунду. Живемо з цим свідомо; повний EXCLUDE
-  // по trainerId додається однією міграцією, якщо стане проблемою.
+  // Friendly pre-check; trainer_no_overlap is the final concurrent-write guard.
   let trainer = null;
   let trainerPrice = 0;
 
@@ -1144,6 +1217,16 @@ const customerLoginLimiter = rateLimit({
   message: { error: 'TOO_MANY_ATTEMPTS' },
 });
 
+// Signed Telegram launches do not consume the password-attempt allowance.
+// Separate buckets prevent Mini App opens from locking ordinary web login.
+const telegramSessionLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'TOO_MANY_ATTEMPTS' },
+});
+
 /**
  * Чи можна діяти від імені картки з цим телефоном.
  *
@@ -1295,6 +1378,65 @@ function requireCustomerAuth(req: import('express').Request, res: import('expres
  * Профіль + майбутні броні гравця в цьому клубі — щоб побачив, що вже
  * записаний, а не тільки щоб не передруковувати ім'я вкотре.
  */
+publicRouter.get('/customer/records/:kind/:id/payment', async (req, res) => {
+  const auth = requireCustomerAuth(req, res);
+  if (!auth) return;
+  const id = z.string().uuid().safeParse(req.params.id);
+  if (!id.success || !['court', 'seat'].includes(String(req.params.kind))) return res.sendStatus(400);
+  const item = req.params.kind === 'seat'
+    ? await prisma.bookingSeat.findFirst({ where: { id: id.data, customerId: auth.customerId, booking: { clubId: auth.clubId, status: { in: ['PENDING', 'CONFIRMED'] } } }, include: { payment: true } })
+    : await prisma.booking.findFirst({ where: { id: id.data, customerId: auth.customerId, clubId: auth.clubId }, include: { payment: true } });
+  if (!item) return res.sendStatus(404);
+  if (item.status !== 'PENDING' || !item.expiresAt || item.expiresAt <= new Date() || item.payment?.status !== 'PENDING' || !item.payment.pageUrl) {
+    return res.status(409).json({ error: 'PAYMENT_NOT_PENDING' });
+  }
+  res.set('Cache-Control', 'no-store').json({ url: item.payment.pageUrl });
+});
+
+/**
+ * POST /api/public/clubs/:slug/customer/telegram-session { initData }
+ *
+ * Seamless Mini App login for a profile that was already linked in the
+ * bot. The browser never sends a Telegram user id by itself: the id is
+ * accepted only from fresh, HMAC-verified Telegram.WebApp.initData.
+ * Customer.telegramChatId was written from a private bot chat, whose chat
+ * id is the same Telegram user id, so it is the existing database link.
+ */
+publicRouter.post('/clubs/:slug/customer/telegram-session', telegramSessionLimiter, async (req, res) => {
+  const parsed = z.object({ initData: z.string().min(1).max(8192) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  let identity;
+  try {
+    identity = verifyTelegramMiniAppData(parsed.data.initData);
+  } catch (error) {
+    if (error instanceof TelegramMiniAppDataError && error.code === 'UNAVAILABLE') {
+      return res.status(503).json({ error: 'TELEGRAM_UNAVAILABLE' });
+    }
+    return res.status(401).json({ error: 'INVALID_TELEGRAM_DATA' });
+  }
+
+  const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
+  const club = await loadClub(slug);
+  if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
+  if (!club.isActive || !club.approvedAt || !planFeatures(club.plan).telegram) {
+    return res.status(503).json({ error: 'TELEGRAM_UNAVAILABLE' });
+  }
+
+  const customer = await prisma.customer.findFirst({
+    where: { clubId: club.id, telegramChatId: identity.userId },
+  });
+  if (!customer) return res.status(404).json({ error: 'TELEGRAM_ACCOUNT_NOT_LINKED' });
+
+  res.set('Cache-Control', 'no-store').json({
+    token: signCustomerToken({ customerId: customer.id, clubId: club.id }),
+    name: customer.name,
+    phone: customer.phone,
+    email: customer.email,
+    birthDate: dateOnly(customer.birthDate),
+  });
+});
+
 publicRouter.get('/customer/me', async (req, res) => {
   const auth = requireCustomerAuth(req, res);
   if (!auth) return;
@@ -1313,7 +1455,7 @@ publicRouter.get('/customer/me', async (req, res) => {
         status: { in: [...BUSY_STATUSES] },
         startTime: { gte: now },
       },
-      include: { court: { select: { name: true } } },
+      include: { court: { select: { name: true } }, payment: true },
       orderBy: { startTime: 'asc' },
       take: 20,
     }),
@@ -1323,13 +1465,14 @@ publicRouter.get('/customer/me', async (req, res) => {
     prisma.bookingSeat.findMany({
       where: {
         customerId: customer.id,
-        status: 'BOOKED',
+        status: { in: ['BOOKED', 'PENDING'] },
         booking: {
           status: { in: [...BUSY_STATUSES] },
           startTime: { gte: now },
         },
       },
       include: {
+        payment: true,
         booking: {
           include: {
             court: { select: { name: true } },
@@ -1498,14 +1641,24 @@ publicRouter.get('/customer/me', async (req, res) => {
       start: b.startTime.toISOString(),
       end: b.endTime.toISOString(),
       status: b.status,
+      expiresAt: b.expiresAt?.toISOString() ?? null,
+      paymentStatus: b.payment?.status ?? null,
+      canResumePayment: b.status === 'PENDING' && Boolean(b.expiresAt && b.expiresAt > now && b.payment?.status === 'PENDING' && b.payment.pageUrl),
       priceTotal: b.priceTotal,
       cancelToken: b.cancelToken,
+      courtId: b.courtId,
+      version: b.updatedAt.toISOString(),
+      canReschedule: b.capacity === null && canReschedule(b.startTime),
       canCancel: canCancelNow(b.startTime, cutoff),
     })),
     /* Окремим списком, а не впереміш із бронями: скасовується це іншим
        роутом (звільняється місце, а не корт), і кнопка має бути своя. */
     groups: seats.map((s) => ({
       seatId: s.id,
+      status: s.status,
+      expiresAt: s.expiresAt?.toISOString() ?? null,
+      paymentStatus: s.payment?.status ?? null,
+      canResumePayment: s.status === 'PENDING' && Boolean(s.expiresAt && s.expiresAt > now && s.payment?.status === 'PENDING' && s.payment.pageUrl),
       cancelToken: s.cancelToken,
       title: s.booking.title,
       courtName: s.booking.court.name,
@@ -1515,7 +1668,7 @@ publicRouter.get('/customer/me', async (req, res) => {
       startLabel: label(s.booking.startTime),
       endLabel: label(s.booking.endTime),
       price: s.price,
-      canCancel: canCancelNow(s.booking.startTime, cutoff),
+      canCancel: s.status === 'BOOKED' && canCancelNow(s.booking.startTime, cutoff),
     })),
     history: [
       ...pastBookings.map((b) => ({

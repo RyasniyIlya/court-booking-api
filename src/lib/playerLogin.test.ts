@@ -1,9 +1,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 /**
- * Вхід гравця в бота. Головне правило: чат привʼязується до картки тільки
- * номером, який підтвердив Telegram, і цей номер має збігтися з карткою.
- * Жоден набраний руками номер і жодна дата народження сюди не ведуть.
+ * Вхід телефоном і паролем сайту; сумісність одноразових посилань
+ * із перевіркою власного Telegram-контакту.
  */
 
 type Row = { chatId: string; flow: string; step: string; data: Record<string, unknown>; expiresAt: Date };
@@ -32,12 +31,16 @@ const prisma = {
   $transaction: vi.fn(async (ops: unknown[]) => ops),
 };
 const sendMessage = vi.fn();
+const deleteMessage = vi.fn(async () => true);
+const verifyCustomerPassword = vi.fn();
 
 vi.mock('./db', () => ({ prisma }));
-vi.mock('./telegram', () => ({ sendMessage, answerCallback: vi.fn(), editMessageText: vi.fn(), botReady: () => true }));
+vi.mock('./telegram', () => ({ sendMessage, deleteMessage, answerCallback: vi.fn(), editMessageText: vi.fn(), botReady: () => true }));
+vi.mock('./customerPassword', () => ({ verifyCustomerPassword }));
 vi.mock('./plans', () => ({ planFeatures: (plan: unknown) => ({ telegram: plan === 'max' }) }));
 vi.mock('./botBooking', () => ({
   openBookingKeyboard: () => ({ inline_keyboard: [[{ text: 'Обрати час', url: 'https://x' }]] }),
+  openProfileKeyboard: () => ({ inline_keyboard: [[{ text: 'Відкрити профіль', web_app: { url: 'https://club.example/c/squash?cbProfile=1' } }]] }),
   bookingUrl: () => 'https://club.example/c/squash',
 }));
 
@@ -70,44 +73,76 @@ beforeEach(() => {
   prisma.customer.findUnique.mockResolvedValue(null);
 });
 
-describe('/profile — вхід за номером Telegram', () => {
+describe('/profile — телефон і пароль із сайту', () => {
   beforeEach(async () => {
     await login.startPlayerLogin(CHAT, 'squash');
   });
 
-  it('просить номер кнопкою request_contact', () => {
-    expect(dialogs.get(CHAT)?.step).toBe('phone');
-    expect(JSON.stringify(sendMessage.mock.calls[0][2])).toContain('"request_contact":true');
+  it('просить телефон та дає кнопку реєстрації на сайті', () => {
+    expect(dialogs.get(CHAT)?.step).toBe('account-phone');
+    expect(JSON.stringify(sendMessage.mock.calls)).toContain('Створити профіль на сайті');
   });
 
-  it('набраний руками номер не приймає — навіть якщо профіль із ним є', async () => {
+  it('номер без пароля не привʼязує чат', async () => {
     prisma.customer.findUnique.mockResolvedValue(card);
     expect(await login.handlePlayerLoginMessage(msg({ text: '0671112233' }))).toBe(true);
     expect(linkedTo()).toEqual([]);
     expect(prisma.customer.findUnique).not.toHaveBeenCalled();
-    expect(dialogs.get(CHAT)?.step).toBe('phone');
+    expect(dialogs.get(CHAT)?.step).toBe('account-password');
   });
 
   it('чужий пересланий контакт не пускає', async () => {
     prisma.customer.findUnique.mockResolvedValue(card);
     await login.handlePlayerLoginMessage(msg({ contact: { phone_number: '380671112233', user_id: 999 } }));
     expect(linkedTo()).toEqual([]);
-    expect(texts()).toContain('чужий контакт');
+    expect(dialogs.get(CHAT)?.step).toBe('account-phone');
   });
 
-  it('свій контакт і профіль із цим номером — вхід', async () => {
+  it('перевірений пароль підключає наявний профіль і відкриває меню', async () => {
     prisma.customer.findUnique.mockResolvedValue(card);
-    await login.handlePlayerLoginMessage(ownContact());
+    verifyCustomerPassword.mockResolvedValue({ ok: true });
+    await login.handlePlayerLoginMessage(msg({ text: '0671112233' }));
+    await login.handlePlayerLoginMessage(msg({ text: ' password with spaces ' }));
+    expect(verifyCustomerPassword).toHaveBeenCalledWith(card.id, ' password with spaces ');
+    expect(deleteMessage).toHaveBeenCalledWith(CHAT, 1);
     expect(linkedTo()).toEqual(['cust-1']);
     expect(dialogs.has(CHAT)).toBe(false);
+    expect(JSON.stringify(sendMessage.mock.calls)).toContain('📋 Мої записи');
   });
 
   it('профілю з таким номером немає — на сайт, нічого не створює', async () => {
-    await login.handlePlayerLoginMessage(ownContact());
+    await login.handlePlayerLoginMessage(msg({ text: '0671112233' }));
+    await login.handlePlayerLoginMessage(msg({ text: 'wrong-password' }));
     expect(linkedTo()).toEqual([]);
     expect(prisma.customer.create).not.toHaveBeenCalled();
-    expect(texts()).toContain('ще немає');
-    expect(JSON.stringify(sendMessage.mock.calls.at(-1)?.[2])).toContain('https://club.example/c/squash');
+    expect(texts()).toContain('Не вдалося увійти');
+    expect(verifyCustomerPassword).not.toHaveBeenCalled();
+  });
+
+  it.each(['INVALID', 'LOCKED', 'NOT_SET'])('відхилений пароль %s не дає доступу', async (reason) => {
+    prisma.customer.findUnique.mockResolvedValue(card);
+    verifyCustomerPassword.mockResolvedValue({ ok: false, reason });
+    await login.handlePlayerLoginMessage(msg({ text: card.phone }));
+    await login.handlePlayerLoginMessage(msg({ text: 'wrong-password' }));
+    expect(linkedTo()).toEqual([]);
+    expect(dialogs.has(CHAT)).toBe(false);
+  });
+
+  it('прострочений діалог видаляє пароль, але не перевіряє його', async () => {
+    await login.handlePlayerLoginMessage(msg({ text: card.phone }));
+    dialogs.get(CHAT)!.expiresAt = new Date(0);
+    await login.handlePlayerLoginMessage(msg({ text: 'secret-password' }));
+    expect(deleteMessage).toHaveBeenCalled();
+    expect(verifyCustomerPassword).not.toHaveBeenCalled();
+    expect(linkedTo()).toEqual([]);
+  });
+
+  it('пароль зі слешем не стає командою персоналу', async () => {
+    prisma.customer.findUnique.mockResolvedValue(card);
+    verifyCustomerPassword.mockResolvedValue({ ok: true });
+    await login.handlePlayerLoginMessage(msg({ text: card.phone }));
+    await login.handlePlayerLoginMessage(msg({ text: '/login password' }));
+    expect(verifyCustomerPassword).toHaveBeenCalledWith(card.id, '/login password');
   });
 
   it('«Скасувати» закриває діалог', async () => {

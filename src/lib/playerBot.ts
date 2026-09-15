@@ -5,6 +5,7 @@ import { prisma } from './db';
 import { planFeatures } from './plans';
 import { answerCallback, editMessageText, sendMessage, type TgUpdate } from './telegram';
 import { bookingUrl } from './botBooking';
+import { canReschedule } from './reschedule';
 import {
   canCancelNow,
   cancelBookingByCustomer,
@@ -108,6 +109,7 @@ export type PlayerItem = {
   id: string;
   chatId: string | null;
   clubName: string;
+  clubSlug?: string;
   clubPhone: string | null;
   timezone: string;
   start: Date;
@@ -137,7 +139,7 @@ export async function loadPlayerItem(kind: PlayerItemKind, id: string): Promise<
         court: { select: { name: true } },
         trainer: { select: { name: true } },
         customer: { select: { telegramChatId: true } },
-        club: { select: { name: true, phone: true, timezone: true, cancelCutoffMinutes: true } },
+        club: { select: { slug: true, name: true, phone: true, timezone: true, cancelCutoffMinutes: true } },
       },
     });
     if (!b || b.capacity != null) return null;
@@ -145,6 +147,7 @@ export async function loadPlayerItem(kind: PlayerItemKind, id: string): Promise<
       kind, id: b.id,
       chatId: b.customer?.telegramChatId ?? null,
       clubName: b.club.name, clubPhone: b.club.phone, timezone: b.club.timezone,
+      clubSlug: b.club.slug,
       start: b.startTime, end: b.endTime,
       courtName: b.court.name, title: b.title, trainerName: b.trainer?.name ?? null,
       cutoffMinutes: b.club.cancelCutoffMinutes,
@@ -256,6 +259,11 @@ export function playerCardKeyboard(item: PlayerItem, state: CardState) {
     if (state === 'remind') row.push({ text: '✅ Прийду', callback_data: cb('ok', item) });
     if (canCancelNow(item.start, item.cutoffMinutes)) {
       row.push({ text: '❌ Скасувати', callback_data: cb('ask', item) });
+    }
+    const base = item.clubSlug ? bookingUrl(item.clubSlug) : null;
+    if (item.kind === 'b' && base && canReschedule(item.start)) {
+      const url = `${base}?cbMove=${encodeURIComponent(item.id)}`;
+      row.push({ text: '↪️ Перенести', ...(url.startsWith('https://') ? { web_app: { url } } : { url }) });
     }
     return row.length ? { inline_keyboard: [row] } : undefined;
   }
@@ -389,6 +397,7 @@ export async function handlePlayerCommand(chatId: string, cmd: string, args: str
     await sendMessage(
       chatId,
       'Готово — більше нічого не надсилатиму. Підключити знову можна в профілі гравця на сторінці клубу.',
+      { keyboard: [[{ text: '👤 Увійти в профіль' }, { text: '🎾 Забронювати' }]], resize_keyboard: true },
     );
     return true;
   }

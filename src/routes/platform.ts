@@ -1,6 +1,7 @@
 import { Router, type Request, type Response, type NextFunction } from 'express';
 import { z } from 'zod';
 import bcrypt from 'bcryptjs';
+import { hashPassword } from '../lib/passwordHash';
 import jwt from 'jsonwebtoken';
 import rateLimit from 'express-rate-limit';
 
@@ -496,7 +497,7 @@ platformRouter.post('/clubs/:id/owner-password', requirePlatformAuth, async (req
 
   if (!owner) return res.status(404).json({ error: 'NOT_FOUND' });
 
-  const passwordHash = await bcrypt.hash(parsed.data.password, 12);
+  const passwordHash = await hashPassword(parsed.data.password, 12);
 
   await prisma.$transaction(async (tx) => {
     await tx.user.update({ where: { id: owner.id }, data: { passwordHash } });

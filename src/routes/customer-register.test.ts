@@ -12,12 +12,13 @@ import request from 'supertest';
 
 const prisma = {
   club: { findFirst: vi.fn() },
-  customer: { findUnique: vi.fn(), updateMany: vi.fn() },
+  customer: { findUnique: vi.fn(), findFirst: vi.fn(), updateMany: vi.fn() },
 };
 const findOrCreateCustomer = vi.fn();
 const signCustomerToken = vi.fn(() => 'token-1');
 const verifyCustomerToken = vi.fn();
 const verifyCustomerPassword = vi.fn();
+const verifyTelegramMiniAppData = vi.fn();
 
 vi.mock('../lib/db', () => ({ prisma, isSlotTakenError: () => false }));
 vi.mock('../lib/customers', async (orig) => ({
@@ -32,6 +33,12 @@ vi.mock('../lib/customerPassword', async (orig) => ({
   hashCustomerPassword: vi.fn(async () => 'hash-1'),
   verifyCustomerPassword,
 }));
+vi.mock('../lib/telegramMiniApp', () => ({
+  TelegramMiniAppDataError: class TelegramMiniAppDataError extends Error {
+    constructor(public code: string) { super(code); }
+  },
+  verifyTelegramMiniAppData,
+}));
 
 const { publicRouter } = await import('./public');
 const app = express().use(express.json()).use('/api/public', publicRouter);
@@ -40,6 +47,8 @@ const register = (body: Record<string, unknown>) =>
   request(app).post('/api/public/clubs/squash/customer/register').send(body);
 const login = (body: Record<string, unknown>) =>
   request(app).post('/api/public/clubs/squash/customer/login').send(body);
+const telegramLogin = (body: Record<string, unknown>) =>
+  request(app).post('/api/public/clubs/squash/customer/telegram-session').send(body);
 
 const valid = { phone: '067 111 22 33', name: '  Ілля   Рясний ', birthDate: '1990-03-15', password: 'padel-2026' };
 const card = {
@@ -54,6 +63,50 @@ beforeEach(() => {
   prisma.customer.updateMany.mockResolvedValue({ count: 1 });
   findOrCreateCustomer.mockResolvedValue(card);
   verifyCustomerToken.mockReturnValue(null);
+});
+
+describe('POST /clubs/:slug/customer/telegram-session', () => {
+  beforeEach(() => {
+    prisma.club.findFirst.mockResolvedValue({
+      id: 'club-1', slug: 'squash', isActive: true, approvedAt: new Date(), plan: { tier: 3 },
+    });
+    verifyTelegramMiniAppData.mockReturnValue({ userId: '777000123', authDate: new Date(), queryId: 'query' });
+    prisma.customer.findFirst.mockResolvedValue(card);
+  });
+
+  it('opens only the linked profile in the selected club', async () => {
+    const res = await telegramLogin({ initData: 'signed-init-data' });
+    expect(res.status).toBe(200);
+    expect(res.body.token).toBe('token-1');
+    expect(res.headers['cache-control']).toBe('no-store');
+    expect(prisma.customer.findFirst).toHaveBeenCalledWith({
+      where: { clubId: 'club-1', telegramChatId: '777000123' },
+    });
+  });
+
+  it('does not issue a session for an unlinked Telegram account', async () => {
+    prisma.customer.findFirst.mockResolvedValue(null);
+    const res = await telegramLogin({ initData: 'signed-init-data' });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toBe('TELEGRAM_ACCOUNT_NOT_LINKED');
+    expect(signCustomerToken).not.toHaveBeenCalled();
+  });
+
+  it('rejects invalid Telegram proof before reading the profile', async () => {
+    verifyTelegramMiniAppData.mockImplementation(() => { throw new Error('bad signature'); });
+    const res = await telegramLogin({ initData: 'tampered' });
+    expect(res.status).toBe(401);
+    expect(res.body.error).toBe('INVALID_TELEGRAM_DATA');
+    expect(prisma.customer.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('does not cross club boundaries', async () => {
+    prisma.customer.findFirst.mockResolvedValue(null);
+    await telegramLogin({ initData: 'signed-init-data' });
+    expect(prisma.customer.findFirst).toHaveBeenCalledWith({
+      where: { clubId: 'club-1', telegramChatId: '777000123' },
+    });
+  });
 });
 
 describe('POST /clubs/:slug/customer/register', () => {

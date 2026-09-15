@@ -4,7 +4,8 @@ import {
   type NextFunction,
 } from 'express';
 
-import bcrypt from 'bcryptjs';
+import { createHmac } from 'node:crypto';
+import { checkPassword } from '../../lib/passwordCheck';
 import jwt from 'jsonwebtoken';
 
 import { JWT_SECRET } from '../../lib/authSecret';
@@ -48,13 +49,15 @@ export function param(req: Request, name: string): string {
     : (value ?? '');
 }
 
-export function signToken(auth: Auth, expiresIn: string) {
-  return jwt.sign(auth, SECRET, {
+const credentialVersion = (hash: string) => createHmac('sha256', SECRET).update(hash).digest('hex');
+
+export function signToken(auth: Auth, expiresIn: string, passwordHash: string) {
+  return jwt.sign({ ...auth, credentialVersion: credentialVersion(passwordHash) }, SECRET, {
     expiresIn: expiresIn as jwt.SignOptions['expiresIn'],
   });
 }
 
-export function requireAuth(
+export async function requireAuth(
   req: Request,
   res: Response,
   next: NextFunction,
@@ -71,7 +74,7 @@ export function requireAuth(
     const payload = jwt.verify(
       header.slice(7),
       SECRET,
-    ) as Partial<Auth>;
+    ) as Partial<Auth> & { credentialVersion?: string };
 
     if (
       typeof payload.userId !== 'string' ||
@@ -83,12 +86,13 @@ export function requireAuth(
       });
     }
 
-    req.auth = {
-      userId: payload.userId,
-      clubId: payload.clubId,
-      role: payload.role,
-      trainerId: payload.trainerId ?? null,
-    };
+    const user = await prisma.user.findUnique({ where: { id: payload.userId },
+      select: { id: true, clubId: true, role: true, trainerId: true, passwordHash: true } });
+    if (!user || user.clubId !== payload.clubId || !payload.credentialVersion ||
+        payload.credentialVersion !== credentialVersion(user.passwordHash)) {
+      return res.status(401).json({ error: 'SESSION_REVOKED' });
+    }
+    req.auth = { userId: user.id, clubId: user.clubId, role: user.role, trainerId: user.trainerId };
 
     next();
   } catch {
@@ -121,9 +125,6 @@ export function requireRole(...roles: string[]) {
   };
 }
 
-const MAX_PASSWORD_FAILS = 5;
-const PASSWORD_LOCK_MINUTES = 15;
-
 /**
  * Перевіряє єдиний пароль акаунта з блокуванням після невдалих спроб.
  */
@@ -134,50 +135,8 @@ export async function verifyAccountPassword(
   | { ok: true }
   | { ok: false; reason: 'LOCKED' | 'NOT_SET' | 'INVALID_PASSWORD' }
 > {
-  const user = await prisma.user.findUnique({
-    where: { id: userId },
-    select: {
-      passwordHash: true,
-      pinFails: true,
-      pinLockedUntil: true,
-    },
-  });
-
-  if (!user) {
-    return { ok: false, reason: 'NOT_SET' };
-  }
-
-  if (user.pinLockedUntil && user.pinLockedUntil > new Date()) {
-    return { ok: false, reason: 'LOCKED' };
-  }
-
-  const valid = await bcrypt.compare(password, user.passwordHash);
-
-  if (!valid) {
-    const fails = user.pinFails + 1;
-    const locked = fails >= MAX_PASSWORD_FAILS;
-
-    await prisma.user.update({
-      where: { id: userId },
-      data: {
-        pinFails: fails,
-        pinLockedUntil: locked
-          ? new Date(Date.now() + PASSWORD_LOCK_MINUTES * 60000)
-          : undefined,
-      },
-    });
-
-    return { ok: false, reason: 'INVALID_PASSWORD' };
-  }
-
-  if (user.pinFails > 0 || user.pinLockedUntil) {
-    await prisma.user.update({
-      where: { id: userId },
-      data: { pinFails: 0, pinLockedUntil: null },
-    });
-  }
-
-  return { ok: true };
+  const result = await checkPassword('user', userId, password);
+  return !result.ok && result.reason === 'INVALID' ? { ok: false, reason: 'INVALID_PASSWORD' } : result;
 }
 
 /**

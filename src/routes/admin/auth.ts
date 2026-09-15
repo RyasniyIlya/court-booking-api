@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import bcrypt from 'bcryptjs';
+import { hashPassword } from '../../lib/passwordHash';
 import rateLimit from 'express-rate-limit';
 
 import { prisma } from '../../lib/db';
@@ -123,7 +123,7 @@ authRouter.post('/register', registerLimiter, async (req, res) => {
     });
   }
 
-  const passwordHash = await bcrypt.hash(
+  const passwordHash = await hashPassword(
     data.password,
     12,
   );
@@ -178,6 +178,7 @@ authRouter.post('/register', registerLimiter, async (req, res) => {
         trainerId: null,
       },
       '7d',
+      result.user.passwordHash,
     );
 
     return res.status(201).json({
@@ -248,6 +249,7 @@ authRouter.post('/login', loginLimiter, async (req, res) => {
       trainerId: user.trainerId,
     },
     '7d',
+    user.passwordHash,
   );
 
   return res.json({
@@ -342,7 +344,7 @@ authRouter.post(
       });
     }
 
-    const passwordHash = await bcrypt.hash(parsed.data.password, 12);
+    const passwordHash = await hashPassword(parsed.data.password, 12);
 
     await prisma.user.update({
       where: {

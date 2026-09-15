@@ -42,19 +42,21 @@ const closed = (cutoff: number): 'CANCEL_CLOSED' | 'ALREADY_STARTED' =>
  * або за чатом гравця в боті.
  */
 export async function cancelBookingByCustomer(bookingId: string): Promise<CancelResult> {
-  const booking = await prisma.booking.findUnique({
+  const result: CancelResult = await prisma.$transaction(async tx => {
+  await tx.$queryRaw`SELECT "id" FROM "Booking" WHERE "id" = ${bookingId}::uuid FOR UPDATE`;
+  const booking = await tx.booking.findUnique({
     where: { id: bookingId },
     include: { club: { select: { cancelCutoffMinutes: true } } },
   });
-  if (!booking) return { ok: false, status: 404, code: 'NOT_FOUND' };
-  if (booking.status === 'CANCELLED') return { ok: true, changed: false };
+  if (!booking) return { ok: false, status: 404, code: 'NOT_FOUND' } as const;
+  if (['CANCELLED', 'EXPIRED'].includes(booking.status)) return { ok: true, changed: false } as const;
 
   const cutoff = booking.club.cancelCutoffMinutes;
   if (!canCancelNow(booking.startTime, cutoff)) {
-    return { ok: false, status: 400, code: closed(cutoff) };
+    return { ok: false, status: 400, code: closed(cutoff) } as const;
   }
 
-  await prisma.booking.update({
+  await tx.booking.update({
     where: { id: booking.id },
     data: { status: 'CANCELLED', cancelledAt: new Date() },
   });
@@ -63,9 +65,10 @@ export async function cancelBookingByCustomer(bookingId: string): Promise<Cancel
      чи за три дні, і без цього рядка клуб дізнавався про це, лише
      відкривши сітку, а викликаний тренер — приїхавши на заняття,
      якого вже немає. */
-  void notifyBooking({ bookingId: booking.id, event: 'cancelled' });
-
-  return { ok: true, changed: true };
+  return { ok: true, changed: true } as const;
+  });
+  if (result.ok && result.changed) void notifyBooking({ bookingId, event: 'cancelled' }).catch(() => console.error('[cancel] notification failed'));
+  return result;
 }
 
 /**
@@ -84,6 +87,9 @@ export async function cancelSeatByCustomer(
        оплатою виходять із неї через `return null` і сповіщення не варті —
        нічого не сталось. */
     const cancelled = await prisma.$transaction(async (tx) => {
+      const target = await tx.bookingSeat.findUnique({ where: { id: seatId }, select: { bookingId: true } });
+      if (!target) throw new CancelError(404, 'NOT_FOUND');
+      await tx.$queryRaw`SELECT "id" FROM "Booking" WHERE "id" = ${target.bookingId}::uuid FOR UPDATE`;
       const seat = await tx.bookingSeat.findUnique({
         where: { id: seatId },
         include: {
@@ -116,13 +122,14 @@ export async function cancelSeatByCustomer(
         throw new CancelError(400, closed(cutoff));
       }
 
-      await tx.bookingSeat.update({
-        where: { id: seat.id },
+      const changed = await tx.bookingSeat.updateMany({
+        where: { id: seat.id, status: 'BOOKED' },
         data: { status: 'CANCELLED', cancelledAt: new Date() },
       });
 
       /* Виручка йде разом із місцем — інакше скасовані записи назавжди
          лишились би в підсумку дня. */
+      if (changed.count !== 1) return null;
       await tx.booking.update({
         where: { id: seat.booking.id },
         data: { priceTotal: { decrement: seat.price } },
@@ -135,7 +142,7 @@ export async function cancelSeatByCustomer(
        повідомлення про зняте місце пішло б у чат раніше, ніж стало
        правдою — а забрати його звідти вже не можна. */
     if (cancelled) {
-      void notifyBooking({ ...cancelled, event: 'cancelled' });
+      void notifyBooking({ ...cancelled, event: 'cancelled' }).catch(() => console.error('[cancel] notification failed'));
     }
 
     return { ok: true, changed: Boolean(cancelled) };

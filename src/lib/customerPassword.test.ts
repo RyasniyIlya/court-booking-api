@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import bcrypt from 'bcryptjs';
 
-const prisma = { customer: { findUnique: vi.fn(), update: vi.fn() } };
+const prisma = { $transaction: vi.fn(), $queryRaw: vi.fn(), customer: { findUnique: vi.fn(), update: vi.fn() } };
 vi.mock('./db', () => ({ prisma }));
 
 const { verifyCustomerPassword, passwordText } = await import('./customerPassword');
@@ -10,6 +10,7 @@ const hash = bcrypt.hashSync('padel-2026', 4);
 
 beforeEach(() => {
   vi.clearAllMocks();
+  prisma.$transaction.mockImplementation(async fn => fn(prisma));
   prisma.customer.findUnique.mockResolvedValue({ passwordHash: hash, passwordFails: 0, passwordLockedUntil: null });
 });
 

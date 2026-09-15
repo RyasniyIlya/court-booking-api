@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import bcrypt from 'bcryptjs';
+import { hashPassword } from '../../lib/passwordHash';
 
 import { prisma } from '../../lib/db';
 import { hasFeature, requireAuth, requireRole, param } from './shared';
@@ -113,7 +113,7 @@ staffRouter.post(
       }
     }
 
-    const passwordHash = await bcrypt.hash(parsed.data.password, 12);
+    const passwordHash = await hashPassword(parsed.data.password, 12);
 
     const user = await prisma.user.create({
       data: {

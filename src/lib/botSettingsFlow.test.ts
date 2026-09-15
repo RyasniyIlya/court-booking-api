@@ -62,7 +62,7 @@ const me = (over: Record<string, unknown> = {}) => ({
 
 const command = (text = '/settings') => ({
   update_id: 1,
-  message: { message_id: 1, chat: { id: 123, type: 'private' }, text },
+  message: { message_id: 1, from: { id: 123 }, chat: { id: 123, type: 'private' }, text },
 });
 
 const tap = (data: string) => ({

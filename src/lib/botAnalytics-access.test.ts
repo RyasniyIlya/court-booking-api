@@ -8,7 +8,7 @@ vi.mock('./botPassword', () => ({ changePassword: vi.fn(), parseNewPassword: vi.
 vi.mock('./digest', () => ({ dayDigest: mocks.day, digestText: vi.fn(), WEEKDAY_FULL: [], weekReport: vi.fn(), weekText: vi.fn() }));
 vi.mock('./sections', () => ({ revenueBreakdown: vi.fn(), revenueText: vi.fn(), staffReport: vi.fn(), staffText: vi.fn() }));
 const { handleUpdate } = await import('./botHandlers');
-const update = (type = 'private') => ({ update_id: 1, message: { message_id: 1, chat: { id: 123, type }, text: '/analytics yesterday' } });
+const update = (type = 'private') => ({ update_id: 1, message: { message_id: 1, from: { id: 123 }, chat: { id: 123, type }, text: '/analytics yesterday' } });
 beforeEach(() => { vi.clearAllMocks(); mocks.report.mockResolvedValue(['page 1', 'page 2']); });
 it.each(['TRAINER', 'unknown'])('denies role %s before loading analytics', async role => {
   mocks.findUnique.mockResolvedValue({ role, club: { id: 'club', plan: { tier: 3 } } });

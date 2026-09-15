@@ -7,7 +7,7 @@ const prisma = {
   club: { findUniqueOrThrow: vi.fn(), update: vi.fn() },
   booking: { findFirst: vi.fn(), update: vi.fn() }, bookingSeat: { findFirst: vi.fn() },
   bookingLedgerEntry: { findUnique: vi.fn(), findMany: vi.fn(), create: vi.fn() },
-  customer: { updateMany: vi.fn() }, user: { findFirst: vi.fn() },
+  customer: { updateMany: vi.fn() }, user: { findFirst: vi.fn(), findUnique: vi.fn() },
 };
 vi.mock('../../lib/db', () => ({ prisma }));
 const { settlementsRouter } = await import('./settlements');
@@ -19,7 +19,10 @@ const customerId = '33333333-3333-4333-8333-333333333333';
 const userId = '44444444-4444-4444-8444-444444444444';
 const originalId = '55555555-5555-4555-8555-555555555555';
 const requestId = '66666666-6666-4666-8666-666666666666';
-const auth = (role = 'ADMIN') => `Bearer ${signToken({ userId, clubId, role, trainerId: null }, '1h')}`;
+const auth = (role = 'ADMIN') => {
+  prisma.user.findUnique.mockResolvedValue({ id: userId, clubId, role, trainerId: null, passwordHash: 'test-hash' });
+  return `Bearer ${signToken({ userId, clubId, role, trainerId: null }, '1h', 'test-hash')}`;
+};
 const payment = { requestId, kind: 'PAYMENT', method: 'CASH', amount: 15000, account: 'Каса' };
 const receipt = { ...payment, id: originalId, clubId, bookingId: id, seatId: null, customerId, originalId: null, note: '' };
 const refund = { ...payment, kind: 'REFUND', originalId, note: 'Клієнт скасував заняття' };

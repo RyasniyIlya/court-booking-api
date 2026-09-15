@@ -537,6 +537,7 @@ model Court {
 }
 
 model Booking {
+  reschedules BookingReschedule[]
   paymentPlan   Json                 @default("{}")
   createdBy     String?
   confirmedBy   String?
@@ -601,6 +602,7 @@ model Booking {
   /// базі, а не в памʼяті процесу: повтор після рестарту гравець побачив
   /// би як спам, і саме це відрізняє його від нагадувань персоналу.
   playerRemindedAt  DateTime?
+  playerReminderLeaseUntil DateTime?
   /// Гравець натиснув «Прийду» під нагадуванням.
   playerConfirmedAt DateTime?
   source      BookingSource @default(WIDGET)
@@ -637,6 +639,31 @@ model Booking {
   @@index([status, expiresAt])
   @@index([trainerId, startTime])
   @@index([seriesId])
+}
+
+/// Історія перенесень незалежна від редагованого плану оплати.
+model BookingReschedule {
+  id String @id @default(uuid()) @db.Uuid
+  bookingId String @db.Uuid
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  customerId String @db.Uuid
+  fromCourtId String @db.Uuid
+  toCourtId String @db.Uuid
+  fromStart DateTime @db.Timestamptz(3)
+  fromEnd DateTime @db.Timestamptz(3)
+  toStart DateTime @db.Timestamptz(3)
+  toEnd DateTime @db.Timestamptz(3)
+  price Int
+  createdAt DateTime @default(now())
+  @@index([bookingId, createdAt])
+}
+
+// Numeric Telegram delivery IDs only: no message text, contacts or passwords.
+model TelegramReceipt {
+  id         Int       @id
+  leaseUntil DateTime
+  doneAt     DateTime?
+  createdAt  DateTime  @default(now())
 }
 
 enum SeatStatus {
@@ -698,6 +725,7 @@ model BookingSeat {
 
   /// Те саме, що в Booking: нагадування гравцю і його «Прийду».
   playerRemindedAt  DateTime?
+  playerReminderLeaseUntil DateTime?
   playerConfirmedAt DateTime?
 
   createdAt   DateTime  @default(now())

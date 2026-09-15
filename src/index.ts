@@ -12,6 +12,7 @@ import { startDigestScheduler } from './lib/digestScheduler';
 import { startReminderScheduler } from './lib/remind';
 import { startPlayerScheduler } from './lib/playerRemind';
 import { handleUpdate } from './lib/botHandlers';
+import { processTelegramUpdate } from './lib/telegramReceipt';
 import { paymentsSecretReady } from './lib/crypto';
 
 const app = express();
@@ -83,22 +84,27 @@ app.use('/api/platform', platformRouter);
  * рано чи пізно потрапляє в логи проксі, і одного знання URL має бути
  * замало, щоб слати боту чужі оновлення.
  *
- * Відповідаємо 200 ОДРАЗУ, до обробки. Telegram чекає відповідь кілька
- * секунд і при таймауті шле те саме оновлення знову — а в нас усередині
- * похід у базу. Повільна відповідь означала б дублі повідомлень клубу.
+ * 200 лише після обробки. Повтори відсікаються за update_id у базі;
+ * незавершена обробка отримує 503, щоб Telegram повторив доставку.
+ * Текст повідомлення та пароль у журналі доставок не зберігаються.
  */
-app.post('/api/telegram/webhook', (req, res) => {
+app.post('/api/telegram/webhook', async (req, res) => {
   const secret = telegramWebhookSecret();
 
   if (!secret || req.get('X-Telegram-Bot-Api-Secret-Token') !== secret) {
     return res.status(401).json({ error: 'UNAUTHORIZED' });
   }
 
-  res.json({ ok: true });
-
-  void handleUpdate(req.body).catch((e) => {
-    console.error('[bot] webhook update failed', e);
-  });
+  if (!Number.isSafeInteger(req.body?.update_id) || req.body.update_id < 0 || req.body.update_id > 2147483647) {
+    return res.status(400).json({ error: 'BAD_UPDATE' });
+  }
+  try {
+    await processTelegramUpdate(req.body, handleUpdate);
+    return res.json({ ok: true });
+  } catch {
+    console.error('[bot] update processing failed');
+    return res.status(503).set('Retry-After', '5').json({ error: 'RETRY_UPDATE' });
+  }
 });
 
 app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
@@ -120,25 +126,27 @@ app.listen(port, () => {
     console.warn('[cors] ADMIN_ORIGINS порожній — кабінет з іншого домену не працюватиме');
   }
 
-  // Звільняє слоти під неоплаченими бронями. Страховка на випадок,
-  // коли гравець просто закрив вкладку і банк нічого не надішле.
-  startExpirySweeper();
+  if (process.env.BACKGROUND_JOBS === 'off') {
+    // Browser/integration checks may use a shared test database. In this
+    // mode the HTTP API works, but startup cannot expire bookings or send
+    // scheduled messages behind the test's back.
+    console.log('[jobs] фонові задачі вимкнені');
+  } else {
+    // Звільняє слоти під неоплаченими бронями. Страховка на випадок,
+    // коли гравець просто закрив вкладку і банк нічого не надішле.
+    startExpirySweeper();
 
-  // Бот приймає команди тільки через webhook. Без публічної адреси він
-  // лишається в режимі вихідних подієвих сповіщень і нічого не опитує.
-  void startBot();
+    // Бот приймає команди тільки через webhook. Без публічної адреси він
+    // лишається в режимі вихідних подієвих сповіщень і нічого не опитує.
+    void startBot();
 
-  // Щоденне зведення власнику о DIGEST_HOUR за часом клубу. Без токена
-  // бота відправка нікуди не піде, але й не завадить — sendMessage без
-  // TELEGRAM_BOT_TOKEN мовчки нічого не робить.
-  startDigestScheduler();
+    // Щоденне зведення власнику о DIGEST_HOUR за часом клубу.
+    startDigestScheduler();
 
-  // Нагадування перед заняттям. Свій планувальник, а не гілка в зведенні:
-  // те раз на добу о заданій годині, це — щохвилини з інтервалом у кожного
-  // свій (див. lib/remind.ts).
-  startReminderScheduler();
+    // Нагадування перед заняттям.
+    startReminderScheduler();
 
-  // Гравцям: нагадування за 3 години з «Прийду / Скасувати» і черга на
-  // зайнятий час (lib/playerRemind.ts, lib/waitlist.ts).
-  startPlayerScheduler();
+    // Гравцям: нагадування за 3 години з «Прийду / Скасувати» і черга.
+    startPlayerScheduler();
+  }
 });

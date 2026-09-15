@@ -17,7 +17,7 @@ const answerCallback = vi.fn();
 const cancelBookingByCustomer = vi.fn();
 
 vi.mock('./db', () => ({ prisma }));
-vi.mock('./telegram', () => ({ sendMessage, editMessageText, answerCallback, botReady: () => true }));
+vi.mock('./telegram', () => ({ sendMessage, sendReminderMessage: sendMessage, editMessageText, answerCallback, botReady: () => true }));
 vi.mock('./plans', () => ({ planFeatures: (plan: unknown) => ({ telegram: plan === 'max' }) }));
 vi.mock('./customerCancel', async (orig) => ({
   ...(await orig<typeof import('./customerCancel')>()),
@@ -47,6 +47,7 @@ const press = (data: string, chatId = 111) => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  sendMessage.mockResolvedValue('sent');
   prisma.customer.findMany.mockResolvedValue([]);
 });
 
@@ -103,7 +104,7 @@ describe('кнопки під нагадуванням', () => {
 });
 
 describe('нагадування за 3 години', () => {
-  it('ставить мітку до відправки й шле картку з кнопками', async () => {
+  it('claims a lease before sending and marks delivered only afterwards', async () => {
     prisma.booking.findMany.mockResolvedValue([{ id: BOOKING_ID, club: { plan: 'max' } }]);
     prisma.bookingSeat.findMany.mockResolvedValue([]);
     prisma.booking.updateMany.mockResolvedValue({ count: 1 });
@@ -113,6 +114,8 @@ describe('нагадування за 3 години', () => {
     expect(prisma.booking.updateMany.mock.invocationCallOrder[0])
       .toBeLessThan(sendMessage.mock.invocationCallOrder[0]);
     expect(JSON.stringify(sendMessage.mock.calls[0][2])).toContain('pl:ok');
+    expect(prisma.booking.updateMany.mock.calls[0][0].data).not.toHaveProperty('playerRemindedAt');
+    expect(prisma.booking.updateMany.mock.calls[1][0].data.playerRemindedAt).toBeInstanceOf(Date);
   });
 
   it('вже нагадане іншим процесом — не шле вдруге', async () => {
@@ -159,4 +162,16 @@ describe('привʼязка чату до картки', () => {
       where: { id: { in: ['old-card'] } }, data: { telegramChatId: null },
     });
   });
+});
+
+it.each(['retry', 'permanent'])('reminder handles %s without claiming delivery', async outcome => {
+  prisma.booking.findMany.mockResolvedValue([{ id: BOOKING_ID, club: { plan: 'max' } }]);
+  prisma.bookingSeat.findMany.mockResolvedValue([]);
+  prisma.booking.updateMany.mockResolvedValue({ count: 1 });
+  prisma.booking.findUnique.mockResolvedValue(bookingRow());
+  sendMessage.mockResolvedValue(outcome);
+  expect(await runPlayerReminderTick()).toBe(0);
+  const data = prisma.booking.updateMany.mock.calls[1][0].data;
+  expect(data.playerReminderLeaseUntil).toBeNull();
+  if (outcome === 'retry') expect(data).not.toHaveProperty('playerRemindedAt');
 });

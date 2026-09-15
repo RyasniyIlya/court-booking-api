@@ -37,7 +37,7 @@ import { sendMessage } from './telegram';
  * бачить на екрані.
  */
 
-export type BookingEvent = 'created' | 'paid' | 'cancelled';
+export type BookingEvent = 'created' | 'paid' | 'cancelled' | 'updated';
 
 type Params = {
   bookingId: string;
@@ -57,12 +57,14 @@ type Params = {
 };
 
 const HEAD: Record<BookingEvent, { club: string; trainer: string }> = {
+  updated: { club: '↪️ <b>Бронь перенесено</b>', trainer: '↪️ <b>Заняття перенесено</b>' },
   created: { club: '🆕 <b>Нова бронь</b>', trainer: '🆕 <b>Вас записали на заняття</b>' },
   paid: { club: '✅ <b>Оплачено бронь</b>', trainer: '🆕 <b>Вас записали на заняття</b>' },
   cancelled: { club: '❌ <b>Бронь скасовано</b>', trainer: '❌ <b>Заняття скасовано</b>' },
 };
 
 const SEAT_HEAD: Record<BookingEvent, { club: string; trainer: string }> = {
+  updated: { club: '↪️ <b>Запис перенесено</b>', trainer: '↪️ <b>Запис перенесено</b>' },
   created: { club: '🆕 <b>Новий запис у заняття</b>', trainer: '🆕 <b>Новий учасник</b>' },
   paid: { club: '✅ <b>Оплачено місце</b>', trainer: '🆕 <b>Новий учасник</b>' },
   cancelled: { club: '❌ <b>Запис знято</b>', trainer: '❌ <b>Учасник знявся</b>' },
@@ -92,6 +94,7 @@ export async function notifyBooking(params: Params): Promise<void> {
       priceTotal: true,
       customerName: true,
       customerPhone: true,
+      customer: { select: { telegramChatId: true } },
       trainerId: true,
       court: { select: { name: true } },
       trainer: { select: { name: true } },
@@ -105,6 +108,10 @@ export async function notifyBooking(params: Params): Promise<void> {
      повідомлення рівно з тих шляхів, де про неї забули. */
   const { club } = booking;
   if (!planFeatures(club.plan).telegram) return;
+  if (event === 'updated' && booking.customer?.telegramChatId) {
+    await sendMessage(booking.customer.telegramChatId,
+      `↪️ <b>Бронь перенесено</b>\n\n${when(booking.startTime, booking.endTime, club.timezone)}\n${html(booking.court.name)}\n/my — ваші записи`);
+  }
 
   const seat = seatId
     ? await prisma.bookingSeat.findUnique({

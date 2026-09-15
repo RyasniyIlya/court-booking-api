@@ -1,7 +1,7 @@
-import bcrypt from 'bcryptjs';
+import { hashPassword } from './passwordHash';
+import { checkPassword } from './passwordCheck';
 import { z } from 'zod';
 
-import { prisma } from './db';
 
 /**
  * Пароль профілю гравця.
@@ -16,13 +16,10 @@ import { prisma } from './db';
  * дверей у профіль більше не відчиняє.
  */
 
-/** 8 символів — нижня межа, яку ще реально запамʼятати; 128 — щоб bcrypt не різав мовчки. */
+/** Versioned SHA-256 prehash preserves the whole password, including Unicode. */
 export const passwordText = z.string().min(8).max(128);
 
-const MAX_FAILS = 5;
-const LOCK_MINUTES = 15;
-
-export const hashCustomerPassword = (password: string) => bcrypt.hash(password, 10);
+export const hashCustomerPassword = (password: string) => hashPassword(password, 10);
 
 export type CustomerPasswordCheck =
   | { ok: true }
@@ -34,31 +31,5 @@ export type CustomerPasswordCheck =
  * від перебору з багатьох адрес захищає саме лічильник на картці.
  */
 export async function verifyCustomerPassword(customerId: string, password: string): Promise<CustomerPasswordCheck> {
-  const c = await prisma.customer.findUnique({
-    where: { id: customerId },
-    select: { passwordHash: true, passwordFails: true, passwordLockedUntil: true },
-  });
-
-  if (!c?.passwordHash) return { ok: false, reason: 'NOT_SET' };
-  if (c.passwordLockedUntil && c.passwordLockedUntil > new Date()) return { ok: false, reason: 'LOCKED' };
-
-  if (!(await bcrypt.compare(password, c.passwordHash))) {
-    const fails = c.passwordFails + 1;
-    await prisma.customer.update({
-      where: { id: customerId },
-      data: {
-        passwordFails: fails >= MAX_FAILS ? 0 : fails,
-        passwordLockedUntil: fails >= MAX_FAILS ? new Date(Date.now() + LOCK_MINUTES * 60_000) : undefined,
-      },
-    });
-    return { ok: false, reason: 'INVALID' };
-  }
-
-  if (c.passwordFails > 0 || c.passwordLockedUntil) {
-    await prisma.customer.update({
-      where: { id: customerId },
-      data: { passwordFails: 0, passwordLockedUntil: null },
-    });
-  }
-  return { ok: true };
+  return checkPassword('customer', customerId, password);
 }

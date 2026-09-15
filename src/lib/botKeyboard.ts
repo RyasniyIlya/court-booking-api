@@ -40,6 +40,11 @@ const BTN_SETTINGS = '⚙️ Сповіщення';
  * підпис можна тільки разом із нею.
  */
 const BY_LABEL: Record<string, string> = {
+  '🎾 Забронювати': '/book',
+  '📋 Мої записи': '/my',
+  '👤 Мій профіль': '/profile',
+  '👤 Увійти в профіль': '/profile',
+  '🚪 Вийти з профілю': '/stop',
   [BTN_TODAY]: '/today',
   [BTN_YESTERDAY]: '/yesterday',
   [BTN_WEEK]: '/week',
@@ -54,6 +59,17 @@ const BY_LABEL: Record<string, string> = {
 /** Команда за натиснутою кнопкою, або null, якщо це звичайний текст */
 export function commandForLabel(text: string): string | null {
   return BY_LABEL[text.trim()] ?? null;
+}
+
+export function playerKeyboard() {
+  return {
+    keyboard: [
+      [{ text: '🎾 Забронювати' }, { text: '📋 Мої записи' }],
+      [{ text: '👤 Мій профіль' }, { text: '🚪 Вийти з профілю' }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
 }
 
 /**
