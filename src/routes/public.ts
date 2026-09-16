@@ -763,6 +763,9 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
 
   const wantsOnlinePay = club.prepayRequired || body.payChoice === 'online';
   const provider = club.prepayEnabled && wantsOnlinePay ? providerFor(club) : null;
+  if (club.prepayEnabled && wantsOnlinePay && priceTotal > 0 && !provider) {
+    return res.status(409).json({ error: 'ONLINE_PAYMENT_UNAVAILABLE' });
+  }
   const needsPay = Boolean(provider) && priceTotal > 0;
   const expiresAt = needsPay
     ? new Date(Date.now() + club.payHoldMinutes * 60_000)

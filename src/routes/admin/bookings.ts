@@ -850,9 +850,8 @@ bookingsRouter.patch(
       }
     }
 
-    /* Для платної приватної броні статус визначають гроші, а не ручний
-       перемикач. Це також захищає від випадку, коли після перенесення або
-       додавання тренера ціна зросла: бронь знову чекає доплати. */
+    /* Онлайн-холд підтверджує платіжний провайдер. Запис з оплатою на
+       місці адміністратор може прийняти до оплати; борг лишається в касі. */
     if (booking.capacity === null && p.status !== 'CANCELLED') {
       const finalPrice = (data.priceTotal as number | undefined) ?? booking.priceTotal;
       const paid = totals(
@@ -861,15 +860,18 @@ bookingsRouter.patch(
       ).net;
 
       if (finalPrice > 0) {
-        if (p.status === 'CONFIRMED' && paid < finalPrice) {
+        const awaitingOnlinePayment = Boolean(booking.expiresAt) || booking.payment?.status === 'PENDING';
+        if (p.status === 'CONFIRMED' && paid < finalPrice && awaitingOnlinePayment) {
           return res.status(409).json({ error: 'PAYMENT_REQUIRED' });
         }
 
         const paidInFull = paid >= finalPrice;
-        data.status = paidInFull ? 'CONFIRMED' : 'PENDING';
+        const manuallyAccepted = !awaitingOnlinePayment &&
+          (p.status === 'CONFIRMED' || (p.status !== 'PENDING' && booking.status === 'CONFIRMED'));
+        data.status = paidInFull || manuallyAccepted ? 'CONFIRMED' : 'PENDING';
         data.expiresAt = paidInFull ? null : booking.expiresAt;
 
-        if (!paidInFull) {
+        if (!paidInFull && !manuallyAccepted) {
           data.confirmedBy = null;
           data.confirmedAt = null;
         }

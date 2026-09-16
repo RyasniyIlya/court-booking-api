@@ -119,6 +119,8 @@ for (const kind of ['bookings', 'seats'] as const) {
           const before = totals(entries, online?.status === 'PAID' ? online.amount : 0).net;
           const net = before + (d.kind === 'PAYMENT' ? d.amount : -d.amount);
           const paidInFull = booking.priceTotal === 0 || net >= booking.priceTotal;
+          // A partial cash payment does not revoke an administrator's approval.
+          if (!paidInFull && d.kind === 'PAYMENT' && booking.status === 'CONFIRMED') return entry;
           await tx.booking.update({
             where: { id: booking.id },
             data: paidInFull

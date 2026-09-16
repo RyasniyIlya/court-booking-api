@@ -60,6 +60,12 @@ it('confirms a private booking as soon as the full amount is actually received',
     data: expect.objectContaining({ status: 'CONFIRMED', expiresAt: null, confirmedBy: 'moderator@club.test' }),
   });
 });
+it('keeps an accepted cash booking confirmed after a partial payment', async () => {
+  const res = await post(payment);
+  expect(res.status).toBe(200);
+  expect(prisma.bookingLedgerEntry.create).toHaveBeenCalled();
+  expect(prisma.booking.update).not.toHaveBeenCalled();
+});
 it('returns a private booking to pending after a refund leaves an unpaid balance', async () => {
   prisma.bookingLedgerEntry.findMany.mockResolvedValue([receipt]);
   const res = await post(refund, 'OWNER');
