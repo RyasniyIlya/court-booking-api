@@ -244,6 +244,9 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     // true+false — гравець сам обирає «зараз» чи «на місці».
     prepayEnabled: club.prepayEnabled,
     prepayRequired: club.prepayRequired,
+    // Не віддаємо реквізити назовні — лише можливість провести платіж.
+    // Віджет одразу запропонує оплату в клубі, якщо провайдер не готовий.
+    onlinePaymentAvailable: Boolean(club.prepayEnabled && providerFor(club)),
     /* Акції клубу — для повідомлення у віджеті: «у нас дешевший ранок»
        гравець має побачити до того, як почне шукати вільну годину. Це
        правила, а не ціни: скільки коштуватиме конкретна година, віджет
@@ -757,15 +760,19 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
   // (prepayRequired=true, типово) — і новий: гравець сам обирає при броні.
   // У третьому стані вибір обов'язковий — без нього незрозуміло, чи повертати
   // слот, тому просимо перепитати, а не тихо вгадувати «на місці».
-  if (club.prepayEnabled && !club.prepayRequired && !body.payChoice) {
+  const paymentProvider = club.prepayEnabled ? providerFor(club) : null;
+  const onlinePaymentAvailable = Boolean(paymentProvider);
+
+  if (onlinePaymentAvailable && !club.prepayRequired && !body.payChoice) {
     return res.status(400).json({ error: 'PAY_CHOICE_REQUIRED' });
   }
 
-  const wantsOnlinePay = club.prepayRequired || body.payChoice === 'online';
-  const provider = club.prepayEnabled && wantsOnlinePay ? providerFor(club) : null;
-  if (club.prepayEnabled && wantsOnlinePay && priceTotal > 0 && !provider) {
-    return res.status(409).json({ error: 'ONLINE_PAYMENT_UNAVAILABLE' });
-  }
+  /* Якщо платіжний провайдер тимчасово не налаштований, не блокуємо сам
+     запис: створюємо звичайну заявку з оплатою в клубі. Це також захищає
+     старі вкладки, які ще могли надіслати payChoice=online. */
+  const wantsOnlinePay = onlinePaymentAvailable
+    && (club.prepayRequired || body.payChoice === 'online');
+  const provider = wantsOnlinePay ? paymentProvider : null;
   const needsPay = Boolean(provider) && priceTotal > 0;
   const expiresAt = needsPay
     ? new Date(Date.now() + club.payHoldMinutes * 60_000)

@@ -29,13 +29,14 @@ it('holds a cash booking for administrator review even when online payments are 
   const res = await book('onsite');
   expect(res.status).toBe(201);
   expect(res.body.status).toBe('PENDING');
-  expect(providerFor).not.toHaveBeenCalled();
+  expect(providerFor).toHaveBeenCalledOnce();
   expect(prisma.booking.create).toHaveBeenCalledWith({ data: expect.objectContaining({ status: 'PENDING', expiresAt: null, courtId }) });
   expect(notifyBooking).toHaveBeenCalled();
 });
-it('reports unavailable online payment without pretending a booking was created', async () => {
+it('falls back to an onsite request when online payment is unavailable', async () => {
   const res = await book('online');
-  expect(res.status).toBe(409);
-  expect(res.body.error).toBe('ONLINE_PAYMENT_UNAVAILABLE');
-  expect(prisma.booking.create).not.toHaveBeenCalled();
+  expect(res.status).toBe(201);
+  expect(res.body.status).toBe('PENDING');
+  expect(prisma.booking.create).toHaveBeenCalledWith({ data: expect.objectContaining({ status: 'PENDING', expiresAt: null, courtId }) });
+  expect(notifyBooking).toHaveBeenCalled();
 });

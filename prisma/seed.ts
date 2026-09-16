@@ -29,7 +29,7 @@ async function main() {
     slug: SLUG,
     timezone: 'Europe/Kyiv',
     slotMinutes: 60,
-    leadTimeMinutes: 60,
+    leadTimeMinutes: 0,
     horizonDays: 14,
     autoConfirm: true,
     weekday: { openMinute: 8 * 60, closeMinute: 22 * 60 },
