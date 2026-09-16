@@ -4,6 +4,7 @@ import { providerFor, publicBase } from '../lib/payments';
 import { applyPayEvent } from '../lib/payments/apply';
 import { LiqPayProvider } from '../lib/payments/liqpay';
 import { randomUUID } from 'node:crypto';
+import { mockPaymentsEnabled } from '../lib/payments/demo';
 
 export const payRouter = Router();
 
@@ -216,18 +217,19 @@ payRouter.get('/done', async (req, res) => {
    тому перевіряється весь ланцюжок, а не лише редірект.
    На проді провайдер mock вимкнено (див. lib/payments/index.ts).       */
 
-payRouter.get('/mock/:ref', (req, res) => {
-  if (process.env.NODE_ENV === 'production') return res.status(404).end();
+payRouter.get('/mock/:ref', async (req, res) => {
+  if (!mockPaymentsEnabled()) return res.status(404).end();
 
   const { ref } = req.params;
-  const amount = Number(req.query.amount ?? 0);
-  const back = String(req.query.back ?? '');
-  const hook = String(req.query.hook ?? '');
-  const what = String(req.query.what ?? 'Бронювання');
+  const payment = await prisma.payment.findUnique({ where: { provider_providerRef: { provider: 'mock', providerRef: ref } } });
+  if (!payment?.pageUrl) return res.status(404).end();
+  const invoice = new URL(payment.pageUrl);
+  const amount = payment.amount;
+  const what = invoice.searchParams.get('what') || 'Бронювання';
 
   const link = (status: string) =>
     `${publicBase()}/api/pay/mock/${encodeURIComponent(ref)}/complete` +
-    `?status=${status}&back=${encodeURIComponent(back)}&hook=${encodeURIComponent(hook)}&amount=${amount}`;
+    `?status=${status}`;
 
   res.type('html').send(`<!doctype html>
 <html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -241,8 +243,8 @@ payRouter.get('/mock/:ref', (req, res) => {
  .t h1{margin:0;font-size:20px;font-weight:650}
  .b{padding:18px 20px 20px}
  .w{font-size:13px;color:#6E7671;margin:0 0 14px}
- a.btn{display:block;text-align:center;padding:12px;border-radius:10px;font-weight:600;
-       text-decoration:none;margin-bottom:8px}
+ button.btn{display:block;width:100%;font:inherit;cursor:pointer;text-align:center;padding:12px;border-radius:10px;font-weight:600;
+       text-decoration:none;margin-bottom:8px;border:0}
  .ok{background:#0F7A5A;color:#fff}
  .no{background:#FCF0ED;color:#8F3624;border:1px solid #F0D6CF}
  .n{font-size:12px;color:#6E7671;margin:12px 0 0}
@@ -251,38 +253,32 @@ payRouter.get('/mock/:ref', (req, res) => {
   <div class="t"><p>Тестова платіжка</p><h1>${(amount / 100).toFixed(2)} грн</h1></div>
   <div class="b">
     <p class="w">${esc(what)}</p>
-    <a class="btn ok" href="${esc(link('success'))}">Оплатити</a>
-    <a class="btn no" href="${esc(link('failure'))}">Відхилити оплату</a>
-    <p class="n">Це заглушка для розробки. Справжніх грошей тут немає.</p>
+    <form method="post" action="${esc(link('success'))}"><button class="btn ok" type="submit">Підтвердити тестову оплату</button></form>
+    <form method="post" action="${esc(link('failure'))}"><button class="btn no" type="submit">Відхилити оплату</button></form>
+    <p class="n">Демонстраційна оплата. Гроші не списуються. Дані картки не потрібні.</p>
   </div>
 </div></body></html>`);
 });
 
 /**
- * Завершення тестової оплати. GET зі спонукою — свідомо: це dev-заглушка,
- * форму заради двох кнопок городити немає сенсу.
+ * Завершення демонстраційної оплати тільки явним POST із форми.
+ * Сума, клуб і адреса повернення беруться зі збереженого mock-рахунку.
  */
-payRouter.get('/mock/:ref/complete', async (req, res) => {
-  if (process.env.NODE_ENV === 'production') return res.status(404).end();
+payRouter.post('/mock/:ref/complete', async (req, res) => {
+  if (!mockPaymentsEnabled()) return res.status(404).end();
 
   const { ref } = req.params;
   const status = String(req.query.status ?? 'failure');
-  const back = String(req.query.back ?? '');
-  const hook = String(req.query.hook ?? '');
-  const amount = Number(req.query.amount ?? 0);
-
-  if (hook) {
-    try {
-      await fetch(hook, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ invoiceId: ref, status, amount }),
-      });
-    } catch (e) {
-      console.error('[pay] mock hook failed', e);
-    }
+  if (!['success', 'failure'].includes(status)) return res.status(400).json({ error: 'BAD_STATUS' });
+  const payment = await prisma.payment.findUnique({ where: { provider_providerRef: { provider: 'mock', providerRef: ref } } });
+  if (!payment?.pageUrl) return res.status(404).end();
+  const back = new URL(payment.pageUrl).searchParams.get('back');
+  try {
+    await applyPayEvent('mock', { providerRef: ref, status: status === 'success' ? 'paid' : 'failed', amountKop: payment.amount, at: new Date() }, payment.clubId);
+  } catch (e) {
+    console.error('[pay] demo completion failed', e);
+    return res.status(500).send('Не вдалося завершити тестову оплату. Спробуйте ще раз.');
   }
-
-  if (back) return res.redirect(302, back);
+  if (back && /^https?:\/\//i.test(back)) return res.redirect(303, back);
   res.type('html').send('<p>Готово. Можна закрити вкладку.</p>');
 });

@@ -3,6 +3,7 @@ import { MonoProvider } from './mono';
 import { LiqPayProvider } from './liqpay';
 import { MockProvider } from './mock';
 import { decryptSecret } from '../crypto';
+import { mockPaymentsEnabled } from './demo';
 
 export * from './types';
 
@@ -36,7 +37,7 @@ export function providerFor(club: ClubPay): PayProvider | null {
 
   if (kind === 'mock') {
     // Заглушка приймає «оплату» одним кліком — на проді це діра.
-    if (process.env.NODE_ENV === 'production') {
+    if (!mockPaymentsEnabled()) {
       console.error('[pay] mock-провайдер вимкнено у production');
       return null;
     }
