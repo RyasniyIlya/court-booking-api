@@ -438,3 +438,64 @@ export function overbookings(stock: number, rentals: BookedRental[]): Array<{ bo
 
   return [...shortBy].map(([bookingId, by]) => ({ bookingId, shortBy: by }));
 }
+
+/** Урізаний рядок: чого й наскільки не дорахувались. */
+export type Cut = {
+  itemId: string;
+  itemName: string;
+  /** Скільки було в броні. */
+  from: number;
+  /** Скільки лишилось після урізання; 0 — рядок знімається зовсім. */
+  to: number;
+};
+
+export type TrimResult = {
+  /** Рядки після урізання. `quantity` 0 означає «рядок прибрати». */
+  lines: CurrentLine[];
+  /** Що саме довелось урізати. Порожньо — все на місці. */
+  cuts: Cut[];
+  rentalTotal: number;
+  /** Нова сума прокату мінус стара. Відʼємне — переплата, яку клуб повертає. */
+  delta: number;
+};
+
+/**
+ * Урізає прокат броні до того, що справді вільно.
+ *
+ * Потрібне одному місцю — оплаті, що прийшла ПІСЛЯ того, як холд протух
+ * (див. lib/payments/apply.ts). Поки гравець платив, ракетки могли піти
+ * іншим. Корт важливіший: бронь лишається, а інвентарю виписуємо стільки,
+ * скільки є, різницю клуб повертає грошима.
+ *
+ * Видане на руки сюди не потрапляє — його відсіює викликач
+ * (`trimRentalsToFree`): якщо річ уже в клієнта, урізати нічого.
+ * Ставка береться зі знімка рядка — подорожчання позиції після броні
+ * клієнта не стосується.
+ *
+ * `free` — вільно на інтервал броні без урахування самої цієї броні.
+ */
+export function trimToFree(
+  current: CurrentLine[],
+  free: Map<string, number>,
+  minutes: number,
+): TrimResult {
+  const lines: CurrentLine[] = [];
+  const cuts: Cut[] = [];
+
+  for (const line of current) {
+    const available = Math.max(0, free.get(line.itemId) ?? 0);
+    const quantity = Math.min(line.quantity, available);
+    if (quantity !== line.quantity) {
+      cuts.push({ itemId: line.itemId, itemName: line.itemName, from: line.quantity, to: quantity });
+    }
+    lines.push({
+      ...line,
+      quantity,
+      amount: lineAmount(line.mode, line.unitPrice, quantity, minutes),
+    });
+  }
+
+  const before = current.reduce((sum, l) => sum + l.amount, 0);
+  const rentalTotal = lines.reduce((sum, l) => sum + l.amount, 0);
+  return { lines, cuts, rentalTotal, delta: rentalTotal - before };
+}

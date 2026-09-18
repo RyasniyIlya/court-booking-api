@@ -20,8 +20,9 @@ import type { Prisma, PrismaClient } from '@prisma/client';
 
 import {
   bookingMinutes, findShortages, mergeLines, occupancyOf, priceLines, freeQuantity, rentalsForMove,
+  trimToFree,
   type CurrentLine, type MoveResult, type Occupancy, type PricedLine, type RentableItem,
-  type RentRequestLine, type Shortage,
+  type RentalStatus, type RentRequestLine, type Shortage, type TrimResult,
 } from './rentals';
 
 type Db = PrismaClient | Prisma.TransactionClient;
@@ -281,4 +282,57 @@ export async function listRentables(db: Db, clubId: string, start?: Date, end?: 
       : null,
     free: start && end ? freeQuantity(i.quantity, occupancy.get(i.id) ?? [], start, end) : null,
   }));
+}
+
+/**
+ * Урізає прокат броні до того, що справді вільно, і пише рядки.
+ *
+ * Оплата прийшла після того, як холд протух: корт бронь зберігає, а
+ * ракетки за цей час могли піти іншим. Правила урізання — `trimToFree`
+ * у lib/rentals.ts, тут — замок, читання зайнятості й запис.
+ *
+ * Рядок, від якого не лишилось нічого, видаляється: у BookingRental
+ * стоїть CHECK quantity > 0, нульового рядка база не тримає.
+ *
+ * Саму бронь (priceTotal, rentalTotal) НЕ чіпає — викликач пише її сам,
+ * різницю бере з `delta`. Викликати в транзакції.
+ */
+export async function trimRentalsToFree(
+  tx: Prisma.TransactionClient,
+  booking: { id: string; clubId: string },
+  current: Array<CurrentLine & { status: RentalStatus }>,
+  start: Date,
+  end: Date,
+): Promise<TrimResult> {
+  /* Видане на руки не урізається: річ уже в клієнта. Повернене не займає
+     нічого й ціни не змінює. */
+  const trimmable = current.filter((l) => l.status !== 'ISSUED' && l.status !== 'RETURNED');
+  if (trimmable.length === 0) {
+    return { lines: [], cuts: [], rentalTotal: current.reduce((sum, l) => sum + l.amount, 0), delta: 0 };
+  }
+
+  const ids = trimmable.map((l) => l.itemId);
+  const items = await lockRentableItems(tx, booking.clubId, ids);
+  const occupancy = await loadOccupancy(tx, booking.clubId, ids, start, end, booking.id);
+  const free = new Map(ids.map((id) => [
+    id,
+    freeQuantity(items.get(id)?.quantity ?? 0, occupancy.get(id) ?? [], start, end),
+  ]));
+
+  const trim = trimToFree(trimmable, free, bookingMinutes(start, end));
+
+  const gone = trim.lines.filter((l) => l.quantity === 0).map((l) => l.id);
+  if (gone.length) await tx.bookingRental.deleteMany({ where: { id: { in: gone } } });
+  for (const line of trim.lines) {
+    if (line.quantity === 0) continue;
+    const was = trimmable.find((c) => c.id === line.id);
+    if (was && was.quantity === line.quantity && was.amount === line.amount) continue;
+    await tx.bookingRental.update({ where: { id: line.id }, data: { quantity: line.quantity, amount: line.amount } });
+  }
+
+  /* rentalTotal броні — це всі рядки, а не тільки урізані. */
+  const untouched = current
+    .filter((l) => l.status === 'ISSUED' || l.status === 'RETURNED')
+    .reduce((sum, l) => sum + l.amount, 0);
+  return { ...trim, rentalTotal: trim.rentalTotal + untouched };
 }
