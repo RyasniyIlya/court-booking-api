@@ -79,7 +79,7 @@ model Club {
   /// Що показувати: монограму з назви чи завантажене зображення.
   /// Рішення власника, а не автоматика «є файл — показуй файл»: клуб може
   /// лишити файл на місці й тимчасово повернутись до літер.
-  logoMode            LogoMode  @default(MONOGRAM)
+  logoMode            LogoMode      @default(MONOGRAM)
   /// Акцентний колір клубу, #RRGGBB. Ним фарбуються кнопки, вибір у сітці
   /// й фокус — і у віджеті, і в кабінеті. Статусні кольори (підтверджено /
   /// чекає / скасовано) НЕ брендуються навмисно: якби вони бралися звідси,
@@ -91,9 +91,9 @@ model Club {
   /// Що грає фоном під віджетом на /c/{slug}. GRADIENT — те, що було до вибору.
   pageBackdrop        BackdropStyle @default(GRADIENT)
   /// Крок сітки за замовчуванням, хв
-  slotMinutes         Int       @default(60)
+  slotMinutes         Int           @default(60)
   /// За скільки хвилин до старту ще можна забронювати онлайн
-  leadTimeMinutes     Int       @default(0)
+  leadTimeMinutes     Int           @default(60)
   /// За скільки хвилин до старту закривається САМОСТІЙНЕ скасування
   /// гравцем — і броні корту, і місця в груповому занятті.
   ///
@@ -104,11 +104,11 @@ model Club {
   ///
   /// Скасування адміністратором цим не обмежується: клуб домовляється
   /// з гравцем голосом і має могти зняти запис будь-коли.
-  cancelCutoffMinutes Int       @default(0)
+  cancelCutoffMinutes Int           @default(0)
   /// На скільки днів уперед відкрита сітка
-  horizonDays         Int       @default(14)
+  horizonDays         Int           @default(14)
   /// Чи бронь одразу CONFIRMED, чи чекає підтвердження адміна
-  autoConfirm         Boolean   @default(true)
+  autoConfirm         Boolean       @default(true)
   /// Куди слати сповіщення про нову бронь
   telegramChatId      String?
 
@@ -195,12 +195,14 @@ model Club {
   expenses      ClubExpense[]
   promos        Promo[]
   inventory     InventoryItem[]
+  rentals       BookingRental[]
   waitlist      WaitlistEntry[]
   resetRequests PasswordReset[]
   shiftCloses   ShiftClose[]
   /// Коли ми підтвердили клуб після реєстрації. null = чекає на дзвінок/оплату.
   /// Впливає на віддачу даних для публічного віджета.
   approvedAt    DateTime?
+  changeLogs    ChangeLog[]
 
   @@index([groupId])
 }
@@ -431,17 +433,17 @@ model TrainerHours {
 /// Виняток на конкретну календарну дату: відпустка, вихідний або інші години.
 /// intervals — робочі або недоступні інтервали залежно від kind.
 model TrainerScheduleException {
-  id        String   @id @default(uuid()) @db.Uuid
-  trainerId String   @db.Uuid
-  trainer   Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
-  date      DateTime @db.Date
-  isClosed  Boolean  @default(false)
+  id        String                       @id @default(uuid()) @db.Uuid
+  trainerId String                       @db.Uuid
+  trainer   Trainer                      @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  date      DateTime                     @db.Date
+  isClosed  Boolean                      @default(false)
   kind      TrainerScheduleExceptionKind @default(WORKING)
-  intervals Json     @default("[]")
+  intervals Json                         @default("[]")
   note      String?
   updatedBy String
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime                     @default(now())
+  updatedAt DateTime                     @updatedAt
 
   @@unique([trainerId, date])
   @@index([trainerId, date])
@@ -452,6 +454,104 @@ enum TrainerScheduleExceptionKind {
   UNAVAILABLE
   DAY_OFF
   VACATION
+}
+
+/// Регулярний тижневий графік змін співробітника кабінету.
+///
+/// Окремо від TrainerHours, хоча форма та сама: там графік належить
+/// КАРТЦІ тренера (вона є і без акаунта — тренер може не заходити в
+/// кабінет взагалі), а тут — АКАУНТУ. Модератор картки не має, і вішати
+/// його зміни на неї означало б заводити фіктивних тренерів заради
+/// графіка адміністратора.
+///
+/// Один рядок на день тижня, як і в тренерів: унікальність не дає
+/// створити два суперечливі інтервали на ту саму суботу.
+model StaffHours {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  /// 0 = неділя … 6 = субота
+  weekday     Int
+  openMinute  Int
+  /// Може бути > 1440 для зміни після півночі.
+  closeMinute Int
+  isClosed    Boolean @default(false)
+
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, weekday])
+  @@index([userId])
+}
+
+/// Виняток на конкретну дату: підміна, відпустка, інші години.
+///
+/// Той самий enum, що й у тренерів: стани в підміни й відпустки однакові,
+/// а другий enum із тими самими чотирма значеннями довелось би тримати
+/// синхронним руками.
+model StaffShift {
+  id     String @id @default(uuid()) @db.Uuid
+  userId String @db.Uuid
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  date      DateTime                     @db.Date
+  isClosed  Boolean                      @default(false)
+  kind      TrainerScheduleExceptionKind @default(WORKING)
+  intervals Json                         @default("[]")
+  note      String?
+  /// Пошта того, хто поставив зміну. Завжди власник — але записуємо, бо
+  /// «хто це поставив» питають і тоді, коли власників у клубі змінилось
+  /// двоє за рік.
+  updatedBy String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, date])
+  @@index([userId, date])
+}
+
+/// Журнал змін: хто, коли і що саме переписав.
+///
+/// Заведений тому, що до нього історія броні складалась ТІЛЬКИ з подій,
+/// у яких є власна мітка часу: створення, оплати, підтвердження,
+/// скасування. Усе, що просто перезаписує колонку — тренер, замітка,
+/// назва турніру, ціна місця, перенесення, — не лишало по собі нічого.
+/// У картці було видно поточне значення й ніколи — хто і коли його
+/// поставив, а питають у клубі саме про це.
+///
+/// Рядок незмінний. Правити чи видаляти записи журналу нема кому й нема
+/// звідки: це єдине, що робить його вартим довіри.
+model ChangeLog {
+  id     String @id @default(uuid()) @db.Uuid
+  clubId String @db.Uuid
+  club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+
+  /// Рід сутності: 'BOOKING', 'TOURNAMENT'. Рядком, а не enum: додати
+  /// сюди корт чи тарифи має бути правкою одного виклику, а не міграцією.
+  entity   String
+  /// id самої сутності. Без FK навмисно — саме тому журнал і переживає
+  /// видалення того, про що він розповідає.
+  entityId String @db.Uuid
+
+  /// Що змінилось: 'comment', 'trainerId', 'title', 'pricePerSeat', 'time'.
+  field  String
+  /// Значення ДО і ПІСЛЯ. Json, бо поля різних типів, і зводити дату,
+  /// число й рядок до одного TEXT означало б втратити на читанні те, що
+  /// ми щойно зберегли.
+  before Json?
+  after  Json?
+
+  /// Хто. Пошта копією, як і в касових рядках: акаунт можуть прибрати, а
+  /// відповідь на «хто це зробив» має лишитись.
+  actorId    String? @db.Uuid
+  actorEmail String
+  actorRole  String
+
+  at DateTime @default(now())
+
+  @@index([clubId, entity, entityId, at])
+  @@index([clubId, at])
 }
 
 enum NoteSubject {
@@ -537,7 +637,7 @@ model Court {
 }
 
 model Booking {
-  reschedules BookingReschedule[]
+  reschedules   BookingReschedule[]
   paymentPlan   Json                 @default("{}")
   createdBy     String?
   confirmedBy   String?
@@ -589,28 +689,39 @@ model Booking {
   /// ставка тренера може змінитись, а сплачено було стільки.
   trainerPrice Int      @default(0)
 
+  /// Прокат на цю бронь. Лише приватні броні: у групового заняття рядків немає.
+  rentals     BookingRental[]
+  /// Скільки з priceTotal — прокат. Денормалізовано, як trainerPrice: звіт
+  /// по тренерах віднімає прокат із бази, не зʼєднуючи таблиці. Знижки й
+  /// акції на прокат не діють, тому це рівно сума рядків.
+  rentalTotal Int             @default(0)
+
   /// Завжди UTC
   startTime DateTime @db.Timestamptz(3)
   endTime   DateTime @db.Timestamptz(3)
 
-  status      BookingStatus @default(CONFIRMED)
+  status                   BookingStatus @default(CONFIRMED)
   /// Стадія 3: клієнт прийшов / не прийшов. Хто й коли відмітив — поруч.
-  attendance   Attendance @default(UNKNOWN)
-  attendanceAt DateTime?
-  attendanceBy String?
+  attendance               Attendance    @default(UNKNOWN)
+  attendanceAt             DateTime?
+  attendanceBy             String?
   /// Гравцю пішло нагадування в Telegram (lib/playerRemind.ts). Мітка в
   /// базі, а не в памʼяті процесу: повтор після рестарту гравець побачив
   /// би як спам, і саме це відрізняє його від нагадувань персоналу.
-  playerRemindedAt  DateTime?
+  playerRemindedAt         DateTime?
   playerReminderLeaseUntil DateTime?
   /// Гравець натиснув «Прийду» під нагадуванням.
-  playerConfirmedAt DateTime?
-  source      BookingSource @default(WIDGET)
+  playerConfirmedAt        DateTime?
+  source                   BookingSource @default(WIDGET)
   /// Зафіксована ціна на момент броні, копійки
-  priceTotal  Int           @default(0)
+  priceTotal               Int           @default(0)
+  /// Акції, що реально вплинули на ціну цієї броні.
+  promoNames               String[]      @default([])
+  /// Загальна економія від акцій клубу, копійки. Персональна знижка окремо.
+  promoDiscount            Int           @default(0)
   /// Токен для самостійного скасування клієнтом за посиланням.
   /// Ним же віджет питає статус оплати після повернення з платіжки.
-  cancelToken String        @unique @default(uuid())
+  cancelToken              String        @unique @default(uuid())
 
   /// Заповнено тільки для броні, що чекає оплати. Після цього моменту
   /// фонова задача переведе бронь у EXPIRED і слот звільниться.
@@ -643,18 +754,19 @@ model Booking {
 
 /// Історія перенесень незалежна від редагованого плану оплати.
 model BookingReschedule {
-  id String @id @default(uuid()) @db.Uuid
-  bookingId String @db.Uuid
-  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
-  customerId String @db.Uuid
-  fromCourtId String @db.Uuid
-  toCourtId String @db.Uuid
-  fromStart DateTime @db.Timestamptz(3)
-  fromEnd DateTime @db.Timestamptz(3)
-  toStart DateTime @db.Timestamptz(3)
-  toEnd DateTime @db.Timestamptz(3)
-  price Int
-  createdAt DateTime @default(now())
+  id          String   @id @default(uuid()) @db.Uuid
+  bookingId   String   @db.Uuid
+  booking     Booking  @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  customerId  String   @db.Uuid
+  fromCourtId String   @db.Uuid
+  toCourtId   String   @db.Uuid
+  fromStart   DateTime @db.Timestamptz(3)
+  fromEnd     DateTime @db.Timestamptz(3)
+  toStart     DateTime @db.Timestamptz(3)
+  toEnd       DateTime @db.Timestamptz(3)
+  price       Int
+  createdAt   DateTime @default(now())
+
   @@index([bookingId, createdAt])
 }
 
@@ -724,9 +836,9 @@ model BookingSeat {
   payment Payment?
 
   /// Те саме, що в Booking: нагадування гравцю і його «Прийду».
-  playerRemindedAt  DateTime?
+  playerRemindedAt         DateTime?
   playerReminderLeaseUntil DateTime?
-  playerConfirmedAt DateTime?
+  playerConfirmedAt        DateTime?
 
   createdAt   DateTime  @default(now())
   cancelledAt DateTime?
@@ -846,15 +958,15 @@ model User {
   //
   /// Чат людини з ботом. unique: один чат — одна людина, інакше двоє
   /// у клубі отримували б повідомлення одне одного.
-  tgChatId    String?   @unique
+  tgChatId            String?   @unique
   /// Одноразовий код прив'язки. Клуб бачить його в кабінеті, вводить у
   /// боті командою /start. Зберігається у відкритому вигляді свідомо:
   /// живе хвилини, дає тільки читання своїх же даних і гаситься одразу
   /// після використання.
-  tgLinkCode  String?   @unique
+  tgLinkCode          String?   @unique
   /// До якого моменту код дійсний. Прострочений не приймається — інакше
   /// забутий у листуванні код працював би вічно.
-  tgLinkUntil DateTime?
+  tgLinkUntil         DateTime?
   /// Чи слати в цей чат кожну нову бронь.
   ///
   /// Окремо від самої привʼязки: звіти і сповіщення — різні речі. Власник
@@ -864,7 +976,7 @@ model User {
   ///
   /// true типово: людина, яка щойно підключила бота, має побачити, що він
   /// працює, а не шукати вмикач. Усе нижче гаситься екраном /settings.
-  tgNotifyBookings Boolean @default(true)
+  tgNotifyBookings    Boolean   @default(true)
   /// Нагадування перед турніром — власнику й модератору.
   ///
   /// Окремо від групових занять навмисно: турнір буває раз на місяць і
@@ -872,29 +984,33 @@ model User {
   /// вимикач на двох означав би, що людина, якій набридли щоденні
   /// нагадування, гасить разом із ними й те єдине, заради чого лишала б
   /// їх увімкненими.
-  tgNotifyTournaments Boolean @default(true)
+  tgNotifyTournaments Boolean   @default(true)
   /// Нагадування перед груповим заняттям — власнику й модератору.
   ///
   /// Теж true типово, але саме цей потік найгустіший: клуб із шістьма
   /// групами на день дає шість нагадувань щодня. Якщо виявиться забагато
   /// — гаситься окремо від турнірів одним дотиком.
-  tgNotifyGroups Boolean @default(true)
+  tgNotifyGroups      Boolean   @default(true)
   /// Нагадування тренеру про ВЛАСНЕ заняття, що зараз почнеться.
   ///
   /// Головне, заради чого тренер узагалі підключає бота: розклад він
   /// бачить і в кабінеті, а от нагадування за чверть години до виходу на
   /// корт нізвідки більше не приходить.
-  tgNotifySessions Boolean @default(true)
+  tgNotifySessions    Boolean   @default(true)
   /// За скільки хвилин до початку слати нагадування.
   ///
   /// У кожного своє: адміністратор за годину встигає підготувати зал,
   /// тренеру за годину нагадувати рано — він ще на попередньому занятті.
   /// Допустимі значення обмежені списком у lib/botSettings.ts, щоб
   /// «за 900 хвилин» не перетворило нагадування на випадковий спам.
-  tgRemindMinutes Int @default(15)
+  tgRemindMinutes     Int       @default(15)
 
   writtenNotes  Note[]
   resetRequests PasswordReset[]
+
+  /// Графік змін цього співробітника. Ставить його тільки власник.
+  shiftHours      StaffHours[]
+  shiftExceptions StaffShift[]
 }
 
 enum PassType {
@@ -941,6 +1057,8 @@ model Customer {
   note           String?
   /// Чорний список: не пускати онлайн-бронювання
   isBlocked      Boolean @default(false)
+  /// Дозволити онлайн-запис лише після повної передоплати.
+  requiresPrepay Boolean @default(false)
 
   /// Мітки клубу: «діти», «ранкова група», «тренується з Марією», «боржник».
   ///
@@ -1227,14 +1345,14 @@ model Promo {
   kind  PromoKind @default(WEEKLY)
 
   /// WEEKLY: дні тижня, 0 = неділя (як у Date.getDay).
-  weekdays Int[]
+  weekdays   Int[]
   /// DATES: перший і останній день включно, локальна дата клубу.
-  dateFrom DateTime? @db.Date
-  dateTo   DateTime? @db.Date
+  dateFrom   DateTime? @db.Date
+  dateTo     DateTime? @db.Date
   /// BIRTHDAY: скільки днів до дня народження акція вже діє і скільки
   /// після нього ще діє. 0/0 — рівно день народження, теж допустимо.
-  daysBefore Int @default(0)
-  daysAfter  Int @default(0)
+  daysBefore Int       @default(0)
+  daysAfter  Int       @default(0)
 
   /// Вікно часу всередині дня, хвилини від опівночі. Слот, що почався у
   /// вікні, продається за акційною ціною цілком — інакше одна година
@@ -1271,7 +1389,7 @@ model InventoryItem {
   clubId String @db.Uuid
   club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
 
-  name String
+  name     String
   /// Вільна назва групи: «Ракетки», «Мʼячі», «Сітки». Порожньо = без групи.
   category String?
   /// Скільки одиниць зараз у клубі.
@@ -1288,11 +1406,97 @@ model InventoryItem {
   photoMime      String?
   photoUpdatedAt DateTime?
 
+  /// Ціна прокату, копійки. null = позиція не здається і віджет її не бачить.
+  /// Прапорця «здається» окремо немає: річ без ціни здавати все одно ні за скільки.
+  rentPrice  Int?
+  rentMode   RentMode        @default(FIXED)
+  /// Чи повертають річ. Ракетку — так, воду й гриптейп — ні: витратна
+  /// позиція при видачі списується з quantity й назад не чекається.
+  returnable Boolean         @default(true)
+  rentals    BookingRental[]
+
   sortOrder Int      @default(0)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([clubId, sortOrder])
+}
+
+/// Як рахується ціна прокату.
+enum RentMode {
+  /// За видачу, незалежно від тривалості броні.
+  FIXED
+  /// Ставка × тривалість броні.
+  HOURLY
+}
+
+/// Що сталося з річчю фізично. На залишок НЕ впливає: зайнятість рахується
+/// лише за інтервалом броні, а це — позначка для рецепції й список
+/// «хто ще не повернув».
+enum RentalStatus {
+  RESERVED
+  ISSUED
+  RETURNED
+}
+
+/// Рядок прокату на броні.
+///
+/// Резерв — це сам рядок у броні зі статусом PENDING/CONFIRMED: скільки
+/// вільно з 18:00 до 19:00 = quantity позиції мінус сума рядків броней, що
+/// перетинають цей інтервал. EXCLUDE (як trainer_no_overlap) залишок N не
+/// порахує, тож гонку ловить SELECT … FOR UPDATE на рядку InventoryItem.
+///
+/// Назва, режим і ціна — знімок на момент додавання: позицію можуть
+/// перейменувати чи подорожчати, а сплачено було стільки.
+model BookingRental {
+  id       String @id @default(uuid()) @db.Uuid
+  clubId   String @db.Uuid
+  club     Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  /// Точка/філія. Одне значення й без UI — закладено, щоб не мігрувати вдруге.
+  pointKey String @default("main")
+
+  bookingId String        @db.Uuid
+  /// NoAction, не Cascade: видалення броні не має мовчки стерти рядок із
+  /// ракетками на руках — склад і застави тоді б не зійшлись. Бронь
+  /// скасовують (CANCELLED), а не видаляють. NoAction, а не Restrict:
+  /// перевірка в кінці оператора, тож каскад від Club (прибирає і бронь, і
+  /// рядки одним видаленням) проходить.
+  booking   Booking       @relation(fields: [bookingId], references: [id], onDelete: NoAction)
+  /// Restrict: позицію з прокатами не видаляють, її вимикають (rentPrice = null).
+  itemId    String        @db.Uuid
+  item      InventoryItem @relation(fields: [itemId], references: [id], onDelete: Restrict)
+
+  itemName  String
+  /// CHECK > 0 у міграції
+  quantity  Int
+  mode      RentMode
+  /// Копійки: за видачу (FIXED) або за годину (HOURLY)
+  unitPrice Int
+  /// Підсумок рядка, копійки. Входить у Booking.priceTotal і rentalTotal.
+  amount    Int
+
+  /// Знімок поворотності на момент броні: позицію могли перевести у
+  /// витратні вже після того, як ракетку віддали під повернення.
+  returnable Boolean @default(true)
+
+  status     RentalStatus @default(RESERVED)
+  issuedAt   DateTime?
+  issuedBy   String?
+  returnedAt DateTime?
+  returnedBy String?
+
+  /// Застава або штраф — заготовка. Заповнює адміністратор руками; ні
+  /// автоматичного розрахунку, ні утримань, ні сповіщень тут немає.
+  /// CHECK у міграції: або обидва поля, або жодного.
+  depositAmount Int?
+  depositReason String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  /// Один рядок на позицію в броні: кількість живе в quantity.
+  @@unique([bookingId, itemId])
+  @@index([clubId, itemId])
 }
 
 /// Покроковий діалог гравця з ботом — зараз це реєстрація: телефон → імʼя →

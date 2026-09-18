@@ -1,6 +1,11 @@
 import { prisma, notifyClub, isSlotTakenError } from '../db';
 import { notifyBooking } from '../notifyBooking';
+import { trimRentalsToFree } from '../rentalStore';
+import type { TrimResult } from '../rentals';
 import type { WebhookEvent } from './types';
+
+const hrn = (kop: number) => `${(kop / 100).toFixed(2)} грн`;
+const escapeHtml = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 export type ApplyResult = 'applied' | 'unknown-invoice' | 'stale' | 'already-final' | 'amount-mismatch';
 
@@ -15,6 +20,7 @@ export async function applyPayEvent(provider: string, ev: WebhookEvent, clubId?:
     const done = (status: ApplyResult) => ({
       status, notify: null as null | { bookingId: string; seatId?: string },
       lost: null as null | string, chatId: payment?.club.telegramChatId,
+      rentalCut: null as null | TrimResult,
     });
     if (!payment || (clubId && payment.clubId !== clubId)) return done('unknown-invoice');
     if (ev.at && payment.providerAt && ev.at < payment.providerAt) return done('stale');
@@ -39,6 +45,7 @@ export async function applyPayEvent(provider: string, ev: WebhookEvent, clubId?:
 
     if (ev.status === 'paid') {
       let lost: string | null = null;
+      let rentalCut: TrimResult | null = null;
       if (payment.seatId) {
         if (!seat) lost = 'SEAT_GONE';
         else if (seat.status === 'CANCELLED') lost = 'SEAT_CANCELLED';
@@ -59,15 +66,30 @@ export async function applyPayEvent(provider: string, ev: WebhookEvent, clubId?:
         await tx.$executeRawUnsafe('SAVEPOINT payment_confirmation');
         try {
           await tx.booking.update({ where: { id: bookingId }, data: { status: 'CONFIRMED', expiresAt: null } });
+          // Paid after the hold expired: rackets may have gone to someone else meanwhile.
+          // The court is what matters — keep the booking, cut missing rental, leave the overpayment to refund.
+          if (booking.status === 'EXPIRED') {
+            const lines = await tx.bookingRental.findMany({ where: { bookingId } });
+            if (lines.length) {
+              const trim = await trimRentalsToFree(tx, booking, lines, booking.startTime, booking.endTime);
+              if (trim.cuts.length) {
+                await tx.booking.update({ where: { id: bookingId }, data: {
+                  priceTotal: { decrement: -trim.delta }, rentalTotal: trim.rentalTotal,
+                } });
+                rentalCut = trim;
+              }
+            }
+          }
           await tx.$executeRawUnsafe('RELEASE SAVEPOINT payment_confirmation');
         } catch (error) {
           await tx.$executeRawUnsafe('ROLLBACK TO SAVEPOINT payment_confirmation');
           if (!isSlotTakenError(error)) throw error;
           lost = 'SLOT_LOST';
+          rentalCut = null;
         }
       }
       await tx.payment.update({ where: { id: payment.id }, data: { status: 'PAID', paidAt: at, providerAt: at, failReason: lost } });
-      return { ...done('applied'), lost, notify: lost ? null : notice };
+      return { ...done('applied'), lost, rentalCut, notify: lost ? null : notice };
     }
     if (ev.status === 'failed' || ev.status === 'expired') {
       await tx.payment.update({ where: { id: payment.id }, data: {
@@ -92,5 +114,9 @@ export async function applyPayEvent(provider: string, ev: WebhookEvent, clubId?:
   if (result.notify) void notifyBooking({ ...result.notify, event: 'paid' }).catch(() => console.error('[pay] notification failed'));
   if (result.lost) void notifyClub(result.chatId,
     '⚠️ <b>Оплата без запису</b>\nГроші отримано, але запис скасований або місце зайняте. Перевірте оплати в кабінеті та зв’яжіться з гравцем.');
+  if (result.rentalCut) void notifyClub(result.chatId,
+    '⚠️ <b>Оплата після холду: прокату не вистачило</b>\nБронь підтверджено, але поки гравець платив, частину інвентарю взяли інші: ' +
+    result.rentalCut.cuts.map(c => `${escapeHtml(c.itemName)} ${c.from}→${c.to}`).join(', ') +
+    `.\nПереплата ${hrn(-result.rentalCut.delta)} — поверніть гравцю в кабінеті.`);
   return result.status;
 }

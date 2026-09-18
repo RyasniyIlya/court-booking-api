@@ -1,0 +1,1 @@
+ALTER TABLE "Customer" ADD COLUMN "requiresPrepay" BOOLEAN NOT NULL DEFAULT false;

@@ -20,7 +20,7 @@ const { bookingsRouter } = await import('./bookings');
 const app = express().use(express.json()).use(bookingsRouter);
 const booking = {
   id: 'booking', clubId: 'club', capacity: null, status: 'PENDING', priceTotal: 50000,
-  ledgerEntries: [], payment: null, expiresAt: null, trainerId: null,
+  ledgerEntries: [], payment: null, expiresAt: null, trainerId: null, rentals: [], rentalTotal: 0,
   startTime: new Date('2030-01-01T10:00:00Z'), endTime: new Date('2030-01-01T11:00:00Z'),
 };
 beforeEach(() => { vi.clearAllMocks(); prisma.booking.findFirst.mockResolvedValue({ ...booking }); });

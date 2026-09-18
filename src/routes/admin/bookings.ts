@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { randomUUID } from 'node:crypto';
-import { paymentPlanSchema, totals } from '../../lib/settlements';
-import { isTournament } from '../../lib/tournamentPay';
+import { paymentPlanSchema } from '../../lib/settlements';
+import { isTournament, tournamentTitle } from '../../lib/tournamentPay';
 import { z } from 'zod';
 import { DateTime } from 'luxon';
 
@@ -9,8 +9,18 @@ import { prisma, isSlotTakenError } from '../../lib/db';
 import { normalizePhone } from '../../lib/phone';
 import { getActivePasses, findOrCreateCustomer } from '../../lib/customers';
 import { requireAuth, requireStaff, hasFeature, param } from './shared';
+import { diffFields, moveChange, recordChanges } from '../../lib/changeLog';
 import { notifyBooking, notifySeriesCancelled } from '../../lib/notifyBooking';
 import { isRegistrationOpen } from '../../lib/registrationCutoff';
+import { paymentStatusPatch } from '../../lib/bookingPaymentStatus';
+import { courtPriceWithPromos, type CourtPriceResult } from '../../lib/promo';
+import {
+  RentalError, loadOccupancy, lockRentableItems, previewRentals, recalcRentalsForMove,
+  rentalCreateData, reserveRentals,
+} from '../../lib/rentalStore';
+import {
+  MAX_RENT_LINES, MAX_RENT_QUANTITY, findShortages, type MoveResult,
+} from '../../lib/rentals';
 
 export const bookingsRouter = Router();
 
@@ -136,6 +146,10 @@ bookingsRouter.get(
             note: true,
           },
         },
+        /* Прокат: що видати й що ще не повернули. У групи рядків немає. */
+        rentals: {
+          orderBy: { createdAt: 'asc' },
+        },
         /* Записані в групове заняття. У приватної броні масив завжди
            порожній — окремої гілки в запиті не потрібно. Беремо повний
            список, а не лічильник: панель броні все одно показує, ХТО
@@ -194,6 +208,20 @@ bookingsRouter.get(
 
     const passes = await getActivePasses(ids);
 
+    /* Журнал змін по всіх бронях дня — одним запитом, а не по одному на
+       картку: правок за день одиниці, а запитів було б стільки ж, скільки
+       броней. Тренеру не віддаємо: пошта того, хто переніс чуже заняття,
+       — внутрішня кухня ресепшена. */
+    const changes = req.auth!.role === 'TRAINER' ? [] : await prisma.changeLog.findMany({
+      where: {
+        clubId: req.auth!.clubId,
+        entity: { in: ['BOOKING', 'TOURNAMENT'] },
+        entityId: { in: bookings.map((b) => b.id) },
+      },
+      select: { entityId: true, field: true, before: true, after: true, actorEmail: true, actorRole: true, at: true },
+      orderBy: { at: 'asc' },
+    });
+
     /* Хто чекає на цей час у черзі. Одним запитом на весь діапазон, а
        розкладаємо по бронях у памʼяті: черг на день одиниці. */
     const queued = await prisma.waitlistEntry.findMany({
@@ -212,6 +240,7 @@ bookingsRouter.get(
     res.json(
       bookings.map((b) => ({
         ...b,
+        changes: changes.filter((row) => row.entityId === b.id),
         pass: b.customerId
           ? passes.get(b.customerId) ?? null
           : null,
@@ -315,6 +344,17 @@ bookingsRouter.post(
           .min(0)
           .max(100_000_000)
           .optional(),
+
+        /* Прокат — лише для приватної броні. Ручна priceTotal вище — це
+           ціна корту й тренера; прокат додається до неї зверху, щоб
+           rentalTotal лишався рівно сумою рядків. */
+        rentals: z
+          .array(z.object({
+            itemId: z.string().uuid(),
+            quantity: z.number().int().min(1).max(MAX_RENT_QUANTITY),
+          }))
+          .max(MAX_RENT_LINES)
+          .default([]),
       })
       /* Дзеркалить CHECK booking_private_or_group у базі. Тут — щоб
          віддати зрозумілу помилку замість 500 від констрейнта. */
@@ -325,6 +365,13 @@ bookingsRouter.post(
               code: 'custom',
               path: ['title'],
               message: 'Групове заняття без назви',
+            });
+          }
+          if (d.rentals.length > 0) {
+            ctx.addIssue({
+              code: 'custom',
+              path: ['rentals'],
+              message: 'Прокат — лише для приватної броні',
             });
           }
         } else if (!d.customerName) {
@@ -474,71 +521,93 @@ bookingsRouter.post(
         })
       : null;
 
-    const priceTotal = !isGroup && d.priceTotal === undefined
+    /* Прокат без знижки, поверх ціни. Попередньо — щоб знати, чи бронь
+       платна; під замком у транзакції сума перевіряється ще раз. */
+    const rentalPreview = await previewRentals(prisma, clubId, d.rentals, start, end);
+    if (!rentalPreview.ok) {
+      return res.status(409).json({ error: 'RENTAL_NOT_AVAILABLE', itemId: rentalPreview.itemId });
+    }
+
+    const priceTotal = (!isGroup && d.priceTotal === undefined
       ? Math.round(priceBeforeDiscount * (100 - (customer?.discountPercent ?? 0)) / 100)
-      : priceBeforeDiscount;
+      : priceBeforeDiscount) + rentalPreview.total;
 
     const initialStatus = isGroup || priceTotal === 0
       ? d.status
       : 'PENDING';
 
+    /* Усе, що читає базу поза самою броню, — до транзакції: вона тримає
+       замок на ракетках, і чекати в ній на зайві запити нема чого. */
+    const actorEmail = (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email;
+    const paymentPlan = d.paymentPlan && (!isGroup || isTournament(d))
+      ? await paymentPlanSnapshot(d.paymentPlan, req.auth!.userId)
+      : undefined;
+
     try {
       const booking =
-        await prisma.booking.create({
-          data: {
-            clubId,
-            courtId: court.id,
-            /* Група: ні імені, ні телефону — замість них title. Приватна
-               бронь лишається рівно такою, як була, разом із порожнім
-               рядком замість телефону, якщо його не дали. */
-            customerName: isGroup
-              ? null
-              : d.customerName!,
-            customerPhone: isGroup
-              ? null
-              : (phone?.e164 ?? ''),
-            capacity: d.capacity ?? null,
-            title: isGroup
-              ? d.title!
-              : null,
-            pricePerSeat: isGroup
-              ? (d.pricePerSeat ?? 0)
-              : null,
-            customerId:
-              customer?.id ?? null,
-            trainerId:
-              trainer?.id ?? null,
-            trainerPrice,
-            comment: d.comment,
-            startTime: start,
-            endTime: end,
-            priceTotal,
-            status: initialStatus,
-            source: 'ADMIN',
-            /* Те саме правило, що й у PATCH: план оплати дозволений
-               приватній броні й турніру, але не звичайній групі. */
-            ...(d.paymentPlan && (!isGroup || isTournament(d))
-              ? { paymentPlan: await paymentPlanSnapshot(d.paymentPlan, req.auth!.userId) }
-              : {}),
-            createdBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
-            ...(initialStatus === 'CONFIRMED' ? {
-              confirmedBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
-              confirmedAt: new Date(),
-            } : {}),
-          },
-          include: {
-            court: {
-              select: {
-                name: true,
-              },
+        await prisma.$transaction(async (tx) => {
+          const rentals = await reserveRentals(tx, { clubId, start, end, request: d.rentals });
+          if (rentals.total !== rentalPreview.total) {
+            throw new RentalError(409, 'RENTAL_NOT_AVAILABLE');
+          }
+
+          return tx.booking.create({
+            data: {
+              rentalTotal: rentals.total,
+              rentals: { create: rentalCreateData(clubId, rentals.lines) },
+              clubId,
+              courtId: court.id,
+              /* Група: ні імені, ні телефону — замість них title. Приватна
+                 бронь лишається рівно такою, як була, разом із порожнім
+                 рядком замість телефону, якщо його не дали. */
+              customerName: isGroup
+                ? null
+                : d.customerName!,
+              customerPhone: isGroup
+                ? null
+                : (phone?.e164 ?? ''),
+              capacity: d.capacity ?? null,
+              title: isGroup
+                ? d.title!
+                : null,
+              pricePerSeat: isGroup
+                ? (d.pricePerSeat ?? 0)
+                : null,
+              customerId:
+                customer?.id ?? null,
+              trainerId:
+                trainer?.id ?? null,
+              trainerPrice,
+              comment: d.comment,
+              startTime: start,
+              endTime: end,
+              priceTotal,
+              status: initialStatus,
+              source: 'ADMIN',
+              /* Те саме правило, що й у PATCH: план оплати дозволений
+                 приватній броні й турніру, але не звичайній групі. */
+              ...(paymentPlan ? { paymentPlan } : {}),
+              createdBy: actorEmail,
+              ...(initialStatus === 'CONFIRMED' ? {
+                confirmedBy: actorEmail,
+                confirmedAt: new Date(),
+              } : {}),
             },
-            trainer: {
-              select: {
-                id: true,
-                name: true,
+            include: {
+              court: {
+                select: {
+                  name: true,
+                },
               },
+              trainer: {
+                select: {
+                  id: true,
+                  name: true,
+                },
+              },
+              rentals: true,
             },
-          },
+          });
         });
 
       /* Повідомляємо і тут, а не тільки при бронюванні з віджета:
@@ -565,6 +634,10 @@ bookingsRouter.post(
         return res.status(409).json({
           error: 'SLOT_TAKEN',
         });
+      }
+
+      if (e instanceof RentalError) {
+        return res.status(e.status).json({ error: e.code, ...e.details });
       }
 
       console.error(
@@ -608,6 +681,22 @@ bookingsRouter.patch(
           .trim()
           .max(300)
           .nullable()
+          .optional(),
+
+        /* Назва й ціна місця — тільки для групової події (турніру).
+           У приватної броні назви немає взагалі: там імʼя клієнта. */
+        title: z
+          .string()
+          .trim()
+          .min(1)
+          .max(80)
+          .optional(),
+
+        pricePerSeat: z
+          .number()
+          .int()
+          .min(0)
+          .max(10_000_00)
           .optional(),
 
         courtId: z
@@ -666,6 +755,7 @@ bookingsRouter.patch(
           ledgerEntries: {
             where: { seatId: null },
           },
+          rentals: true,
         },
       });
 
@@ -696,6 +786,8 @@ bookingsRouter.patch(
         p.trainerId !== undefined ||
         p.paymentPlan !== undefined ||
         p.courtId !== undefined ||
+        p.title !== undefined ||
+        p.pricePerSeat !== undefined ||
         p.start !== undefined ||
         p.end !== undefined
       ) {
@@ -734,6 +826,11 @@ bookingsRouter.patch(
       p.start || p.courtId,
     );
 
+    let movePricing: {
+      court: CourtPriceResult;
+      discountPercent: number;
+    } | null = null;
+
     if (moved) {
       if (end <= start) {
         return res.status(400).json({
@@ -763,18 +860,40 @@ bookingsRouter.patch(
       data.startTime = start;
       data.endTime = end;
 
-      const minutes =
-        (end.getTime() -
-          start.getTime()) /
-        60_000;
+      /* Ціна перенесеної броні — за тим самим правилом, що й перенесення
+         гравцем (POST /customer/bookings/:id/reschedule): корт з акціями +
+         тренер, мінус персональна знижка. Інакше адміністратор, посунувши
+         бронь зі знижкою, мовчки піднімав би їй ціну, а правило статусу
+         робило б із різниці борг. Суму збираємо нижче, коли відомий тренер.
+         Групу не чіпаємо: її priceTotal — це продані місця, а не корт. */
+      if (booking.capacity === null) {
+        const [club, customer] = await Promise.all([
+          prisma.club.findUniqueOrThrow({
+            where: { id: clubId },
+            select: { timezone: true, slotMinutes: true, promos: { where: { isActive: true } } },
+          }),
+          booking.customerId
+            ? prisma.customer.findUnique({
+                where: { id: booking.customerId },
+                select: { discountPercent: true, birthDate: true },
+              })
+            : null,
+        ]);
 
-      data.priceTotal =
-        Math.round(
-          (court.pricePerHour *
-            minutes) /
-            60,
-        ) +
-        booking.trainerPrice;
+        movePricing = {
+          court: courtPriceWithPromos({
+            pricePerHour: court.pricePerHour,
+            start,
+            end,
+            timezone: club.timezone,
+            courtId: court.id,
+            slotMinutes: court.slotMinutes ?? club.slotMinutes,
+            promos: club.promos,
+            birthDate: customer?.birthDate,
+          }),
+          discountPercent: customer?.discountPercent ?? 0,
+        };
+      }
     }
 
     if (p.status !== undefined) {
@@ -802,6 +921,30 @@ bookingsRouter.patch(
         p.comment === ''
           ? null
           : p.comment;
+    }
+
+    /* Назва й ціна місця — власність групової події. У приватної броні
+       міняти нічого: там імʼя клієнта, а не назва, і ціна корту, а не
+       місця. */
+    if (p.title !== undefined || p.pricePerSeat !== undefined) {
+      if (booking.capacity === null) {
+        return res.status(400).json({ error: 'NOT_A_GROUP_BOOKING' });
+      }
+      if (p.title !== undefined) {
+        /* Маркер турніру зберігаємо: саме за ним старий API відрізняє
+           турнір від звичайного групового заняття, і людина, яка стерла
+           емодзі з поля назви, не мала на увазі «перетвори це на йогу». */
+        data.title = isTournament(booking)
+          ? tournamentTitle(p.title)
+          : p.title;
+      }
+      if (p.pricePerSeat !== undefined) {
+        /* Уже продані місця не дешевшають і не дорожчають: BookingSeat.price
+           — знімок на момент запису, і переписати його заднім числом
+           означало б підняти борг людині, яка вже заплатила рівно стільки,
+           скільки в неї попросили. Нова ціна діє для нових реєстрацій. */
+        data.pricePerSeat = p.pricePerSeat;
+      }
     }
 
     if (p.trainerId !== undefined) {
@@ -850,32 +993,67 @@ bookingsRouter.patch(
       }
     }
 
+    if (movePricing) {
+      /* Тренер рахується на новий інтервал за поточною ставкою — як і в
+         перенесенні гравцем. Якщо тренера змінили цим же PATCH, ціна вже
+         порахована вище. */
+      let trainerPrice = data.trainerPrice as number | undefined;
+      if (trainerPrice === undefined) {
+        const trainer = booking.trainerId
+          ? await prisma.trainer.findFirst({
+              where: { id: booking.trainerId, clubId },
+              select: { pricePerHour: true },
+            })
+          : null;
+        trainerPrice = trainer
+          ? trainerCost(trainer.pricePerHour, start, end)
+          : booking.trainerPrice;
+        data.trainerPrice = trainerPrice;
+      }
+
+      /* Прокат — зверху й без знижки. rentalTotal поки старий: якщо прокат
+         на новий час урізається, різницю врахує транзакція нижче, під
+         замком на позиціях. */
+      data.priceTotal =
+        Math.round(
+          ((movePricing.court.price + trainerPrice) *
+            (100 - movePricing.discountPercent)) /
+            100,
+        ) +
+        booking.rentalTotal;
+      data.promoNames = movePricing.court.applied
+        .map((promo) => promo.title?.trim())
+        .filter((title): title is string => Boolean(title));
+      data.promoDiscount = Math.max(
+        0,
+        movePricing.court.basePrice - movePricing.court.price,
+      );
+    }
+
+    /* Прокат зачіпається, коли бронь переїжджає (на новий час ракеток може
+       не бути) або повертається зі скасованих (поки вона була скасована,
+       її ракетки могли взяти інші). Тоді ціна й статус рахуються в
+       транзакції нижче — після того, як відомо, що лишилось від прокату. */
+    const reactivating =
+      p.status !== undefined &&
+      p.status !== 'CANCELLED' &&
+      !BUSY.includes(booking.status as never);
+    const rentalWork =
+      booking.capacity === null &&
+      booking.rentals.length > 0 &&
+      p.status !== 'CANCELLED' &&
+      (moved || reactivating);
+
     /* Онлайн-холд підтверджує платіжний провайдер. Запис з оплатою на
        місці адміністратор може прийняти до оплати; борг лишається в касі. */
-    if (booking.capacity === null && p.status !== 'CANCELLED') {
-      const finalPrice = (data.priceTotal as number | undefined) ?? booking.priceTotal;
-      const paid = totals(
-        booking.ledgerEntries,
-        booking.payment?.status === 'PAID' ? booking.payment.amount : 0,
-      ).net;
-
-      if (finalPrice > 0) {
-        const awaitingOnlinePayment = Boolean(booking.expiresAt) || booking.payment?.status === 'PENDING';
-        if (p.status === 'CONFIRMED' && paid < finalPrice && awaitingOnlinePayment) {
-          return res.status(409).json({ error: 'PAYMENT_REQUIRED' });
-        }
-
-        const paidInFull = paid >= finalPrice;
-        const manuallyAccepted = !awaitingOnlinePayment &&
-          (p.status === 'CONFIRMED' || (p.status !== 'PENDING' && booking.status === 'CONFIRMED'));
-        data.status = paidInFull || manuallyAccepted ? 'CONFIRMED' : 'PENDING';
-        data.expiresAt = paidInFull ? null : booking.expiresAt;
-
-        if (!paidInFull && !manuallyAccepted) {
-          data.confirmedBy = null;
-          data.confirmedAt = null;
-        }
-      }
+    if (!rentalWork && booking.capacity === null && p.status !== 'CANCELLED') {
+      const settled = paymentStatusPatch({
+        booking,
+        finalPrice: (data.priceTotal as number | undefined) ?? booking.priceTotal,
+        requestedStatus: p.status,
+      });
+      if (!settled.ok) return res.status(409).json({ error: settled.error });
+      Object.assign(data, settled.data);
     }
 
     const finalTrainerId =
@@ -918,19 +1096,76 @@ bookingsRouter.patch(
       }
     }
 
+    let rentalShortages: MoveResult['shortages'] = [];
+
     try {
-      await prisma.booking.update({
-        where: {
-          id: booking.id,
-        },
-        data: {
-          ...data,
-          ...(data.status === 'CONFIRMED' && booking.status !== 'CONFIRMED' ? {
-            confirmedBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
-            confirmedAt: new Date(),
-          } : {}),
-        },
-      });
+      if (rentalWork) {
+        const actorEmail = (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email;
+
+        rentalShortages = await prisma.$transaction(async (tx) => {
+          let shortWarnings: MoveResult['shortages'] = [];
+
+          if (moved) {
+            /* Перенесення чек-листа не торкається: переїжджає бронь, а
+               видане лишається виданим. Міняється тільки сума HOURLY-позицій
+               — тривалість стала іншою, і ціна мусить збігтися з тим, що
+               клієнт справді взяв. Нестача на новий час іде адміністратору
+               попередженням: мовчки зрізати чужу бронь система права не
+               має, це його розмова з клієнтом, а не наше рішення. */
+            const move = await recalcRentalsForMove(tx, booking, booking.rentals, start, end);
+            shortWarnings = move.shortages;
+
+            data.priceTotal = (data.priceTotal as number) - booking.rentalTotal + move.rentalTotal;
+            data.rentalTotal = move.rentalTotal;
+          } else {
+            /* Повернення зі скасованих на те саме місце — не перенесення:
+               мовчки різати прокат тут нема підстав. Нехай адміністратор
+               побачить нестачу й сам вирішить, що зняти. */
+            const ids = booking.rentals.map((r) => r.itemId);
+            const items = await lockRentableItems(tx, clubId, ids);
+            const occupancy = await loadOccupancy(tx, clubId, ids, start, end, booking.id);
+            const shortages = findShortages(
+              booking.rentals.map((r) => ({ itemId: r.itemId, quantity: r.quantity })),
+              items, occupancy, start, end,
+            );
+            if (shortages.length > 0) throw new RentalError(409, 'RENTAL_BUSY', { shortages });
+          }
+
+          const settled = paymentStatusPatch({
+            booking,
+            finalPrice: (data.priceTotal as number | undefined) ?? booking.priceTotal,
+            requestedStatus: p.status,
+          });
+          if (!settled.ok) throw new SeatError(409, settled.error);
+          Object.assign(data, settled.data);
+
+          await tx.booking.update({
+            where: { id: booking.id },
+            data: {
+              ...data,
+              ...(data.status === 'CONFIRMED' && booking.status !== 'CONFIRMED' ? {
+                confirmedBy: actorEmail,
+                confirmedAt: new Date(),
+              } : {}),
+            },
+          });
+
+          return shortWarnings;
+        });
+      } else {
+        await prisma.booking.update({
+          where: {
+            id: booking.id,
+          },
+          data: {
+            ...data,
+            ...(data.status === 'CONFIRMED' && booking.status !== 'CONFIRMED' ? {
+              confirmedBy: (await prisma.user.findUniqueOrThrow({ where: { id: req.auth!.userId }, select: { email: true } })).email,
+              confirmedAt: new Date(),
+            } : {}),
+          },
+        });
+      }
 
       /* Скасування руками з кабінету. Тренер має дізнатись про це так
          само, як дізнався про сам виклик: він планує день по цих
@@ -946,8 +1181,45 @@ bookingsRouter.patch(
         });
       }
 
+      /* Журнал змін. Пишемо ПІСЛЯ вдалого запису: рядок «переніс бронь»
+         під відмову 409 гірший за відсутній — він стверджує те, чого не
+         сталось.
+
+         Статус, скасування й підтвердження в журнал не кладемо: у них є
+         власні мітки часу (cancelledAt, confirmedAt), і історія броні вже
+         показує їх поіменно. Дублювати означало б намалювати кожне
+         скасування двічі. */
+      const logged = diffFields(booking as unknown as Record<string, unknown>, data, [
+        'comment', 'trainerId', 'title', 'pricePerSeat', 'priceTotal',
+      ]);
+      const move = moveChange(booking, {
+        courtId: data.courtId as string | undefined,
+        startTime: data.startTime as Date | undefined,
+        endTime: data.endTime as Date | undefined,
+      });
+      if (move) logged.push(move);
+
+      if (logged.length > 0) {
+        const who = await prisma.user.findUniqueOrThrow({
+          where: { id: req.auth!.userId },
+          select: { email: true, role: true },
+        });
+        /* Журнал не має права завалити саму правку: бронь уже змінена, і
+           500 замість «готово» тут — це гірша брехня, ніж пропущений
+           рядок. Помилку лишаємо в логах сервера. */
+        await recordChanges(
+          prisma,
+          { clubId, entity: isTournament(booking) ? 'TOURNAMENT' : 'BOOKING', entityId: booking.id },
+          { userId: req.auth!.userId, email: who.email, role: who.role },
+          logged,
+        ).catch((e) => console.error('[change log] booking patch', e));
+      }
+
       res.json({
         ok: true,
+        /* Кабінет показує «на новий час вільна 1 з 2». Це попередження, а
+           не відмова: прокат лишився в броні як був. */
+        ...(rentalShortages.length > 0 ? { rentalShortages } : {}),
       });
     } catch (e) {
       if (isSlotTakenError(e)) {
@@ -956,13 +1228,21 @@ bookingsRouter.patch(
         });
       }
 
+      if (e instanceof RentalError) {
+        return res.status(e.status).json({ error: e.code, ...e.details });
+      }
+
+      if (e instanceof SeatError) {
+        return res.status(e.status).json({ error: e.code });
+      }
+
       throw e;
     }
   },
 );
 
 /* -------------------------------------------------------------------------- */
-/* BOOKING SERIES                                                             */
+/* BOOKING SERIES                                                            */
 /* -------------------------------------------------------------------------- */
 
 bookingsRouter.post(

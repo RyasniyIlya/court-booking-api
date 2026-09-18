@@ -21,6 +21,18 @@
 /** Той самий маркер, що й у web/src/lib/booking.js. */
 export const TOURNAMENT_PREFIX = '🏆 ';
 
+/**
+ * Назва турніру з маркером — рівно один раз.
+ *
+ * Дзеркало web/src/lib/booking.js: саме за цим префіксом старий API
+ * відрізняє турнір від звичайного групового заняття, і людина, яка
+ * стерла емодзі з поля назви, не мала на увазі «перетвори це на йогу».
+ */
+export function tournamentTitle(title: string): string {
+  const clean = String(title ?? '').trim().replace(/^🏆s*/u, '');
+  return `${TOURNAMENT_PREFIX}${clean}`;
+}
+
 export function isTournament(b: { capacity?: number | null; title?: string | null }): boolean {
   return b.capacity != null && String(b.title ?? '').startsWith(TOURNAMENT_PREFIX);
 }
@@ -58,10 +70,8 @@ export type JoinPayment =
  * Режим турніру сильніший за клубні правила в обидва боки, і це навмисно:
  * поставити «на місці» турніру в клубі з обовʼязковою передоплатою — це
  * не помилка, а нормальний випадок дитячого турніру, де внески збирає
- * тренер. А от «онлайн» без увімкненого еквайрингу — це вже обіцянка,
- * якої клуб не може дотримати, тому це відмова, а не тихий відкат до
- * оплати на місці: інакше гроші за турнір ніхто б не зібрав, і клуб
- * дізнався б про це в день гри.
+ * тренер. Якщо онлайн-оплата недоступна, реєстрацію не блокуємо: учасник
+ * записується з оплатою в клубі, а модератор бачить несплачений внесок.
  */
 export function resolveJoinPayment(input: {
   mode: TournamentPayMode;
@@ -77,7 +87,7 @@ export function resolveJoinPayment(input: {
 
   if (mode === 'ONSITE') return { online: false };
   if (mode === 'ONLINE') {
-    return prepayEnabled ? { online: true } : { error: 'ONLINE_PAYMENT_UNAVAILABLE' };
+    return { online: prepayEnabled };
   }
 
   if (!prepayEnabled) return { online: false };

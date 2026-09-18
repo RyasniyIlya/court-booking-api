@@ -1,0 +1,156 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import express from 'express';
+import request from 'supertest';
+
+/**
+ * Прокат у віджеті.
+ *
+ * Стережемо три обіцянки: прокат іде в ту саму суму, що й бронь (і не
+ * під знижку); вибір = гарантія, тобто нестача відкочує всю бронь; і сума
+ * під замком не може тихо відрізнятись від показаної гравцю.
+ */
+
+const ITEM = '22222222-2222-4222-8222-222222222222';
+const COURT = '11111111-1111-4111-8111-111111111111';
+
+const prisma = {
+  club: { findFirst: vi.fn(), findUnique: vi.fn() },
+  block: { findFirst: vi.fn() },
+  customer: { findUnique: vi.fn(async () => null) },
+  booking: { create: vi.fn() },
+  inventoryItem: { findMany: vi.fn() },
+  bookingRental: { findMany: vi.fn() },
+  $queryRaw: vi.fn(),
+  $transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(prisma)),
+};
+
+vi.mock('../lib/db', () => ({ prisma, isSlotTakenError: () => false }));
+vi.mock('../lib/payments', () => ({ providerFor: () => null, publicBase: () => 'https://api.test' }));
+vi.mock('../lib/notifyBooking', () => ({ notifyBooking: vi.fn() }));
+vi.mock('../lib/billing', () => ({ clubBilling: () => ({ online: true }) }));
+vi.mock('../lib/customers', async (orig) => ({
+  ...(await orig<typeof import('../lib/customers')>()),
+  findOrCreateCustomer: vi.fn(async () => ({
+    id: 'customer', isBlocked: false, requiresPrepay: false, discountPercent: 50,
+    birthDate: new Date('1990-01-01T00:00:00.000Z'),
+  })),
+}));
+
+const { publicRouter } = await import('./public');
+const app = express().use(express.json()).use(publicRouter);
+
+const club = {
+  id: 'club', slug: 'demo', timezone: 'UTC', leadTimeMinutes: 0, slotMinutes: 60,
+  prepayEnabled: false, prepayRequired: false, autoConfirm: true, promos: [], trainers: [],
+  courts: [{ id: COURT, pricePerHour: 40_000 }],
+  hours: Array.from({ length: 7 }, (_, weekday) => ({ weekday, openMinute: 0, closeMinute: 1440, isClosed: false })),
+};
+
+const racket = { id: ITEM, name: 'Ракетка Wilson', quantity: 4, rentPrice: 10_000, rentMode: 'HOURLY', returnable: true };
+
+const book = (rentals: unknown) => request(app).post('/clubs/demo/bookings').send({
+  courtId: COURT, start: '2030-01-01T10:00:00Z', end: '2030-01-01T12:00:00Z',
+  customerName: 'Player', customerPhone: '+380671112233', birthDate: '1990-01-01', rentals,
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  prisma.club.findFirst.mockResolvedValue(club);
+  prisma.club.findUnique.mockResolvedValue({ id: 'club' });
+  prisma.block.findFirst.mockResolvedValue(null);
+  prisma.inventoryItem.findMany.mockResolvedValue([racket]);
+  prisma.$queryRaw.mockResolvedValue([racket]);
+  prisma.bookingRental.findMany.mockResolvedValue([]);
+  prisma.booking.create.mockImplementation(async ({ data }) => ({ ...data, id: 'booking', cancelToken: 'cancel' }));
+});
+
+describe('POST /clubs/:slug/bookings з прокатом', () => {
+  it('прокат додається до суми після знижки й пишеться знімком', async () => {
+    const res = await book([{ itemId: ITEM, quantity: 2 }]);
+
+    expect(res.status).toBe(201);
+    // корт 120 хв = 80 000, знижка 50% → 40 000; 2 ракетки × 20 000 без знижки → 40 000
+    expect(res.body.priceTotal).toBe(80_000);
+
+    const { data } = prisma.booking.create.mock.calls[0][0];
+    expect(data.rentalTotal).toBe(40_000);
+    expect(data.rentals.create).toEqual([{
+      clubId: 'club', itemId: ITEM, itemName: 'Ракетка Wilson',
+      quantity: 2, mode: 'HOURLY', unitPrice: 10_000, amount: 40_000,
+    }]);
+    expect(prisma.$queryRaw).toHaveBeenCalledOnce();
+  });
+
+  it('без прокату — бронь як раніше, без замка', async () => {
+    const res = await book(undefined);
+    expect(res.status).toBe(201);
+    expect(res.body.priceTotal).toBe(40_000);
+    expect(prisma.$queryRaw).not.toHaveBeenCalled();
+    expect(prisma.booking.create.mock.calls[0][0].data).toMatchObject({ rentalTotal: 0, rentals: { create: [] } });
+  });
+
+  it('не вистачає — 409 з деталями, бронь не створюється', async () => {
+    prisma.bookingRental.findMany.mockResolvedValue([{
+      itemId: ITEM, quantity: 3,
+      booking: { startTime: new Date('2030-01-01T10:30:00Z'), endTime: new Date('2030-01-01T12:00:00Z') },
+    }]);
+
+    const res = await book([{ itemId: ITEM, quantity: 2 }]);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'RENTAL_BUSY', shortages: [{ itemId: ITEM, requested: 2, free: 1 }] });
+    expect(prisma.booking.create).not.toHaveBeenCalled();
+  });
+
+  it('позиція не здається — 409 ще до транзакції', async () => {
+    prisma.inventoryItem.findMany.mockResolvedValue([{ ...racket, rentPrice: null }]);
+
+    const res = await book([{ itemId: ITEM, quantity: 1 }]);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'RENTAL_NOT_AVAILABLE', itemId: ITEM });
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('подорожчала між розрахунком і замком — відмова, а не інший рахунок', async () => {
+    prisma.$queryRaw.mockResolvedValue([{ ...racket, rentPrice: 12_000 }]);
+
+    const res = await book([{ itemId: ITEM, quantity: 1 }]);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('RENTAL_NOT_AVAILABLE');
+    expect(prisma.booking.create).not.toHaveBeenCalled();
+  });
+
+  it('кількість поза межами — 400', async () => {
+    expect((await book([{ itemId: ITEM, quantity: 0 }])).status).toBe(400);
+    expect((await book([{ itemId: ITEM, quantity: 51 }])).status).toBe(400);
+  });
+});
+
+describe('GET /clubs/:slug/rentals', () => {
+  it('з інтервалом — вільний залишок за піком', async () => {
+    prisma.bookingRental.findMany.mockResolvedValue([{
+      itemId: ITEM, quantity: 3, status: 'RESERVED', returnable: true,
+      booking: { startTime: new Date('2030-01-01T10:00:00Z'), endTime: new Date('2030-01-01T11:00:00Z') },
+    }]);
+
+    const res = await request(app).get('/clubs/demo/rentals')
+      .query({ start: '2030-01-01T10:00:00Z', end: '2030-01-01T11:00:00Z' });
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual([expect.objectContaining({ id: ITEM, rentPrice: 10_000, rentMode: 'HOURLY', free: 1 })]);
+    expect(prisma.inventoryItem.findMany.mock.calls[0][0].where).toEqual({ clubId: 'club', rentPrice: { not: null } });
+  });
+
+  it('без інтервалу — free = null', async () => {
+    const res = await request(app).get('/clubs/demo/rentals');
+    expect(res.body[0].free).toBeNull();
+    expect(prisma.bookingRental.findMany).not.toHaveBeenCalled();
+  });
+
+  it('лише один кінець інтервалу — 400', async () => {
+    const res = await request(app).get('/clubs/demo/rentals').query({ start: '2030-01-01T10:00:00Z' });
+    expect(res.status).toBe(400);
+  });
+});

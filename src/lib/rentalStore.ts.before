@@ -1,0 +1,243 @@
+/**
+ * Прокат при броні — частина, що ходить у базу.
+ *
+ * Правила (ціна, пік зайнятості, урізання) живуть у lib/rentals.ts і
+ * перевіряються тестами без Postgres. Тут — лише читання рядків і замок.
+ *
+ * ── Чому FOR UPDATE, а не констрейнт ─────────────────────────────────────
+ * Тренера від подвійного продажу стереже EXCLUDE trainer_no_overlap, бо
+ * тренер один. У позиції залишок N, а «сума перетинів ≤ N» Postgres
+ * декларативно не виражає. Тому рядки InventoryItem блокуються на час
+ * перевірки: дві броні, що беруть ОСТАННЮ ракетку Wilson в одну мілісекунду,
+ * стають у чергу, і друга бачить уже закомічений рядок першої. Броні на
+ * інші позиції не чекають.
+ *
+ * Замок береться в порядку id — інакше дві броні «ракетка + мʼячі» і
+ * «мʼячі + ракетка» могли б узяти замки навхрест і зачекати одна одну.
+ */
+
+import type { Prisma, PrismaClient } from '@prisma/client';
+
+import {
+  bookingMinutes, findShortages, mergeLines, priceLines, freeQuantity, trimForReschedule,
+  type CurrentLine, type Occupancy, type PricedLine, type RentableItem, type RentRequestLine, type Shortage,
+  type TrimResult,
+} from './rentals';
+
+type Db = PrismaClient | Prisma.TransactionClient;
+
+/** Ті самі статуси, що займають корт. EXPIRED і CANCELLED резерв звільняють. */
+const BUSY = ['PENDING', 'CONFIRMED'] as const;
+
+/**
+ * Помилка прокату всередині транзакції. Кидаємо, щоб Prisma відкотила
+ * бронь разом із рядками; обробник роуту перекладає її в HTTP.
+ */
+export class RentalError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: 'RENTAL_BUSY' | 'RENTAL_NOT_AVAILABLE',
+    readonly details: { shortages?: Shortage[]; itemId?: string } = {},
+  ) {
+    super(code);
+  }
+}
+
+/** Блокує позиції клубу й повертає їх у вигляді для прокату. */
+export async function lockRentableItems(
+  tx: Prisma.TransactionClient,
+  clubId: string,
+  itemIds: string[],
+): Promise<Map<string, RentableItem>> {
+  const ids = [...new Set(itemIds)].sort();
+  if (ids.length === 0) return new Map();
+
+  const rows = await tx.$queryRaw<RentableItem[]>`
+    SELECT "id", "name", "quantity", "rentPrice", "rentMode"::text AS "rentMode"
+      FROM "InventoryItem"
+     WHERE "clubId" = ${clubId}::uuid AND "id" = ANY(${ids}::uuid[])
+     ORDER BY "id"
+       FOR UPDATE`;
+
+  return new Map(rows.map((r) => [r.id, r]));
+}
+
+/**
+ * Зайнятість позицій іншими бронями на інтервалі.
+ *
+ * `excludeBookingId` — власна бронь при правці чи перенесенні: інакше вона
+ * конкурувала б сама з собою за ті самі ракетки.
+ */
+export async function loadOccupancy(
+  db: Db,
+  clubId: string,
+  itemIds: string[],
+  start: Date,
+  end: Date,
+  excludeBookingId?: string,
+): Promise<Map<string, Occupancy[]>> {
+  const map = new Map<string, Occupancy[]>();
+  if (itemIds.length === 0) return map;
+
+  const rows = await db.bookingRental.findMany({
+    where: {
+      clubId,
+      itemId: { in: [...new Set(itemIds)] },
+      booking: {
+        status: { in: [...BUSY] },
+        startTime: { lt: end },
+        endTime: { gt: start },
+        ...(excludeBookingId ? { id: { not: excludeBookingId } } : {}),
+      },
+    },
+    select: { itemId: true, quantity: true, booking: { select: { startTime: true, endTime: true } } },
+  });
+
+  for (const r of rows) {
+    const list = map.get(r.itemId) ?? [];
+    list.push({ start: r.booking.startTime, end: r.booking.endTime, quantity: r.quantity });
+    map.set(r.itemId, list);
+  }
+  return map;
+}
+
+/**
+ * Резерв прокату під замком. Викликати ВСЕРЕДИНІ транзакції, що створює
+ * або змінює бронь: рядки BookingRental мають записатись до того, як
+ * замок відпуститься.
+ *
+ * Кидає RentalError, якщо позиція не здається або її не вистачає.
+ */
+export async function reserveRentals(
+  tx: Prisma.TransactionClient,
+  args: {
+    clubId: string;
+    start: Date;
+    end: Date;
+    request: RentRequestLine[];
+    excludeBookingId?: string;
+  },
+): Promise<{ lines: PricedLine[]; total: number }> {
+  const request = mergeLines(args.request);
+  if (request.length === 0) return { lines: [], total: 0 };
+
+  const ids = request.map((r) => r.itemId);
+  const items = await lockRentableItems(tx, args.clubId, ids);
+
+  const priced = priceLines(request, items, bookingMinutes(args.start, args.end));
+  if (!priced.ok) throw new RentalError(409, 'RENTAL_NOT_AVAILABLE', { itemId: priced.itemId });
+
+  const occupancy = await loadOccupancy(tx, args.clubId, ids, args.start, args.end, args.excludeBookingId);
+  const shortages = findShortages(request, items, occupancy, args.start, args.end);
+  if (shortages.length > 0) throw new RentalError(409, 'RENTAL_BUSY', { shortages });
+
+  return { lines: priced.lines, total: priced.total };
+}
+
+/**
+ * Попередній розрахунок без замка — щоб до транзакції знати суму броні
+ * (від неї залежить, чи потрібна передоплата). Під замком сума
+ * перераховується ще раз, і якщо позиція за цей час подорожчала чи
+ * перестала здаватись, транзакція відмовить.
+ */
+export async function previewRentals(
+  db: Db,
+  clubId: string,
+  request: RentRequestLine[],
+  start: Date,
+  end: Date,
+): Promise<{ ok: true; lines: PricedLine[]; total: number } | { ok: false; itemId: string }> {
+  const merged = mergeLines(request);
+  if (merged.length === 0) return { ok: true, lines: [], total: 0 };
+
+  const rows = await db.inventoryItem.findMany({
+    where: { clubId, id: { in: merged.map((r) => r.itemId) } },
+    select: { id: true, name: true, quantity: true, rentPrice: true, rentMode: true },
+  });
+  const priced = priceLines(merged, new Map(rows.map((r) => [r.id, r])), bookingMinutes(start, end));
+  return priced.ok ? priced : { ok: false, itemId: priced.itemId };
+}
+
+/**
+ * Урізає прокат броні до того, що вільно на [start, end), і записує рядки.
+ * Саму бронь (priceTotal, rentalTotal) НЕ чіпає — викликач пише її разом з
+ * іншими полями, а різницю бере з `delta` / `rentalTotal`.
+ *
+ * Двоє викликачів з одним правилом «бронь важливіша за ракетки»: перенесення
+ * адміністратором і оплата, що прийшла вже після кінця холду (за ці хвилини
+ * ракетки могли взяти інші). Викликати в транзакції.
+ */
+export async function trimRentalsToFree(
+  tx: Prisma.TransactionClient,
+  booking: { id: string; clubId: string },
+  current: CurrentLine[],
+  start: Date,
+  end: Date,
+): Promise<TrimResult> {
+  const ids = current.map((r) => r.itemId);
+  const items = await lockRentableItems(tx, booking.clubId, ids);
+  const occupancy = await loadOccupancy(tx, booking.clubId, ids, start, end, booking.id);
+  const free = new Map(ids.map((id) => [
+    id,
+    freeQuantity(items.get(id)?.quantity ?? 0, occupancy.get(id) ?? [], start, end),
+  ]));
+
+  const trim = trimForReschedule(current, free, bookingMinutes(start, end));
+
+  if (trim.removedIds.length > 0) {
+    await tx.bookingRental.deleteMany({ where: { id: { in: trim.removedIds } } });
+  }
+  for (const line of trim.kept) {
+    await tx.bookingRental.update({
+      where: { id: line.id },
+      data: { quantity: line.quantity, amount: line.amount },
+    });
+  }
+  return trim;
+}
+
+/** Дані рядка для nested create у Booking. */
+export const rentalCreateData = (clubId: string, lines: PricedLine[]) =>
+  lines.map((l) => ({
+    clubId,
+    itemId: l.itemId,
+    itemName: l.itemName,
+    quantity: l.quantity,
+    mode: l.mode,
+    unitPrice: l.unitPrice,
+    amount: l.amount,
+  }));
+
+/**
+ * Що можна взяти напрокат на цей інтервал — для віджета й кабінету.
+ * Без інтервалу `free` = null: список показується, але обіцянки немає.
+ * `excludeBookingId` — кабінет править прокат цієї броні: її власні ракетки
+ * рахуються вільними для неї самої.
+ */
+export async function listRentables(db: Db, clubId: string, start?: Date, end?: Date, excludeBookingId?: string) {
+  const items = await db.inventoryItem.findMany({
+    where: { clubId, rentPrice: { not: null } },
+    select: {
+      id: true, name: true, category: true, unit: true, quantity: true,
+      rentPrice: true, rentMode: true, photoMime: true, photoUpdatedAt: true,
+    },
+    orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+  });
+
+  const occupancy = start && end
+    ? await loadOccupancy(db, clubId, items.map((i) => i.id), start, end, excludeBookingId)
+    : new Map<string, Occupancy[]>();
+
+  return items.map((i) => ({
+    id: i.id,
+    name: i.name,
+    category: i.category,
+    unit: i.unit,
+    rentPrice: i.rentPrice!,
+    rentMode: i.rentMode,
+    photoUrl: i.photoMime
+      ? `/api/public/inventory/${i.id}/photo?v=${i.photoUpdatedAt?.getTime() ?? 0}`
+      : null,
+    free: start && end ? freeQuantity(i.quantity, occupancy.get(i.id) ?? [], start, end) : null,
+  }));
+}

@@ -545,6 +545,7 @@ customersRouter.patch(
           .optional(),
         note: z.string().trim().max(1000).nullable().optional(),
         isBlocked: z.boolean().optional(),
+        requiresPrepay: z.boolean().optional(),
         birthDate: birthDateText.nullable().optional(),
         discountPercent: z.number().int().min(0).max(90).optional(),
       })
@@ -552,7 +553,7 @@ customersRouter.patch(
     if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
     const d = parsed.data;
-    if (d.tags === undefined && d.note === undefined && d.isBlocked === undefined && d.birthDate === undefined && d.discountPercent === undefined) {
+    if (d.tags === undefined && d.note === undefined && d.isBlocked === undefined && d.requiresPrepay === undefined && d.birthDate === undefined && d.discountPercent === undefined) {
       return res.status(400).json({ error: 'NOTHING_TO_UPDATE' });
     }
 
@@ -568,6 +569,7 @@ customersRouter.patch(
         ...(tags ? { tags } : {}),
         ...(d.note !== undefined ? { note: d.note } : {}),
         ...(d.isBlocked !== undefined ? { isBlocked: d.isBlocked } : {}),
+        ...(d.requiresPrepay !== undefined ? { requiresPrepay: d.requiresPrepay } : {}),
         ...(d.birthDate !== undefined ? { birthDate: d.birthDate ? birthDateValue(d.birthDate) : null } : {}),
         ...(d.discountPercent !== undefined ? { discountPercent: d.discountPercent } : {}),
       },
@@ -576,7 +578,7 @@ customersRouter.patch(
 
     const customer = await prisma.customer.findUnique({
       where: { id: id.data },
-      select: { id: true, name: true, phone: true, tags: true, note: true, isBlocked: true,
+      select: { id: true, name: true, phone: true, tags: true, note: true, isBlocked: true, requiresPrepay: true,
         birthDate: true, discountPercent: true, bonusBalance: true },
     });
     res.json(customer && { ...customer, birthDate: dateOnly(customer.birthDate) });

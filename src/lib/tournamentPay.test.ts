@@ -3,8 +3,8 @@ import { isTournament, tournamentPayMode, resolveJoinPayment } from './tournamen
 
 /**
  * Перевіряємо не підписи, а два випадки, через які гроші зникають: турнір
- * «тільки онлайн» у клубі без еквайрингу (нікого не можна пустити з
- * обіцянкою заплатити) і турнір «на місці» в клубі з обовʼязковою
+ * «тільки онлайн» у клубі без еквайрингу (реєстрація переходить на
+ * оплату в клубі) і турнір «на місці» в клубі з обовʼязковою
  * передоплатою (гравця не можна вести на платіжку).
  */
 
@@ -74,10 +74,10 @@ describe('resolveJoinPayment', () => {
     expect(resolveJoinPayment({ mode: 'ONLINE', price: 50000, ...club })).toEqual({ online: true });
   });
 
-  it('«тільки онлайн» без еквайрингу — відмова, а не тиха оплата на місці', () => {
+  it('«тільки онлайн» без еквайрингу переходить на оплату в клубі', () => {
     expect(resolveJoinPayment({
       mode: 'ONLINE', price: 50000, prepayEnabled: false, prepayRequired: false,
-    })).toEqual({ error: 'ONLINE_PAYMENT_UNAVAILABLE' });
+    })).toEqual({ online: false });
   });
 
   it('за клубними правилами без вибору гравця — 400, а не мовчазна бронь', () => {

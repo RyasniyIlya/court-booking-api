@@ -72,6 +72,26 @@ describe('locked private payment transitions', () => {
     expect(db.tx.$executeRawUnsafe).toHaveBeenCalledWith('ROLLBACK TO SAVEPOINT payment_confirmation');
     expect(notifyClub).toHaveBeenCalledOnce();
   });
+  it('late payment keeps the court and cuts rental that was taken meanwhile', async () => {
+    Object.assign(db.state.booking, {
+      status: 'EXPIRED', clubId: 'club', priceTotal: 25000, rentalTotal: 5000,
+      startTime: new Date('2030-01-01T10:00:00Z'), endTime: new Date('2030-01-01T11:00:00Z'),
+    });
+    db.state.rentals = [{ id: 'line', itemId: 'racket', itemName: 'Ракетка', quantity: 1, mode: 'FIXED', unitPrice: 5000, amount: 5000 }];
+    // The item row comes back empty from the lock query: nothing of it is free any more.
+    await applyPayEvent('mono', paid);
+    expect(db.state.booking).toMatchObject({ status: 'CONFIRMED', priceTotal: 20000, rentalTotal: 0 });
+    expect(db.state.rentals).toEqual([]);
+    expect(db.state.payment).toMatchObject({ status: 'PAID', failReason: null });
+    expect(notifyBooking).toHaveBeenCalledOnce();
+    expect(notifyClub).toHaveBeenCalledWith('123', expect.stringContaining('50.00 грн'));
+  });
+  it('a still-held booking is confirmed without touching its rental', async () => {
+    db.state.rentals = [{ id: 'line', itemId: 'racket', itemName: 'Ракетка', quantity: 1, mode: 'FIXED', unitPrice: 5000, amount: 5000 }];
+    await applyPayEvent('mono', paid);
+    expect(db.tx.bookingRental.findMany).not.toHaveBeenCalled();
+    expect(notifyClub).not.toHaveBeenCalled();
+  });
   it('propagates infrastructure failures for provider retry', async () => {
     db.tx.booking.update.mockRejectedValueOnce(new Error('database unavailable'));
     await expect(applyPayEvent('mono', paid)).rejects.toThrow('database unavailable');

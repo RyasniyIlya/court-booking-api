@@ -79,10 +79,7 @@ export async function createClub(input: NewClubInput) {
         address: input.address ?? null,
         logoUrl: input.logoUrl ?? null,
         slotMinutes: input.slotMinutes ?? 60,
-        // За замовчуванням вільний слот можна взяти аж до його початку.
-        // Клуб, якому потрібен час на підготовку, усе ще задає запас у
-        // налаштуваннях явно.
-        leadTimeMinutes: input.leadTimeMinutes ?? 0,
+        leadTimeMinutes: input.leadTimeMinutes ?? 60,
         horizonDays: input.horizonDays ?? 14,
         autoConfirm: input.autoConfirm ?? true,
       },

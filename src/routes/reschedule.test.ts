@@ -7,6 +7,7 @@ const tx = {
   bookingReschedule: { create: vi.fn() },
   booking: { findFirst: vi.fn(), updateMany: vi.fn() },
   block: { findFirst: vi.fn() }, court: { findFirst: vi.fn() }, passUsage: { findUnique: vi.fn() },
+  $queryRaw: vi.fn(), bookingRental: { findMany: vi.fn() },
 };
 const prisma = { ...tx, $transaction: vi.fn(async (run: (db: typeof tx) => Promise<unknown>) => run(tx)) };
 const verifyCustomerToken = vi.fn();
@@ -19,6 +20,7 @@ const { publicRouter } = await import('./public');
 const app = express().use(express.json()).use('/api/public', publicRouter);
 const id = '12345678-1234-4234-8234-123456789012';
 const version = '2026-09-01T00:00:00.000Z';
+const RACKET = '22222222-2222-4222-8222-222222222222';
 const target = { courtId: id, start: '2099-10-02T10:00:00.000Z', end: '2099-10-02T11:00:00.000Z', version, expectedPrice: 10000 };
 let booking: any;
 const post = (data = {}) => request(app).post(`/api/public/customer/bookings/${id}/reschedule`)
@@ -30,6 +32,7 @@ beforeEach(() => {
     startTime: new Date('2099-10-01T10:00:00Z'), endTime: new Date('2099-10-01T11:00:00Z'),
     updatedAt: new Date(version), priceTotal: 10000, courtId: id, trainerId: null, trainer: null,
     payment: { status: 'PAID' }, expiresAt: null, customer: { discountPercent: 0 }, paymentPlan: { method: 'CASH' },
+    rentals: [], rentalTotal: 0,
     club: { timezone: 'UTC', leadTimeMinutes: 15, slotMinutes: 60, promos: [],
       hours: Array.from({length: 7}, (_, weekday) => ({ weekday, openMinute: 0, closeMinute: 1440, isClosed: false })) } };
   tx.booking.findFirst.mockImplementation(async ({ where }) => where.customerId ? booking : null);
@@ -37,6 +40,8 @@ beforeEach(() => {
   tx.court.findFirst.mockResolvedValue({ id, name: 'Корт', pricePerHour: 10000, slotMinutes: 60 });
   tx.block.findFirst.mockResolvedValue(null);
   tx.passUsage.findUnique.mockResolvedValue(null);
+  tx.$queryRaw.mockResolvedValue([{ id: RACKET, name: 'Ракетка', quantity: 2, rentPrice: 5000, rentMode: 'FIXED' }]);
+  tx.bookingRental.findMany.mockResolvedValue([]);
 });
 describe('перенесення', () => {
   it('рівно 6 годин дозволено, на мілісекунду пізніше — ні', () => {
@@ -85,5 +90,45 @@ describe('перенесення', () => {
     tx.booking.updateMany.mockRejectedValueOnce({ code: '23P01' });
     expect((await post()).body.error).toBe('SLOT_TAKEN');
     expect(notifyBooking).not.toHaveBeenCalled();
+  });
+});
+
+describe('перенесення з прокатом', () => {
+  const withRackets = () => {
+    booking = { ...booking, priceTotal: 20000, rentalTotal: 10000, rentals: [
+      { id: 'line', itemId: RACKET, itemName: 'Ракетка', quantity: 2, mode: 'FIXED', unitPrice: 5000, amount: 10000 },
+    ] };
+  };
+  const taken = (quantity: number) => tx.bookingRental.findMany.mockResolvedValue([{
+    itemId: RACKET, quantity,
+    booking: { startTime: new Date('2099-10-02T10:00:00Z'), endTime: new Date('2099-10-02T11:00:00Z') },
+  }]);
+
+  it('ракетки є — ціна включає прокат, бронь переїжджає разом із ним', async () => {
+    withRackets();
+    const res = await post({ expectedPrice: 20000 });
+    expect(res.status).toBe(200);
+    expect(res.body.price).toBe(20000);
+    expect(tx.booking.updateMany).toHaveBeenCalled();
+    // власний прокат не конкурує сам із собою
+    expect(tx.bookingRental.findMany.mock.calls[0][0].where.booking.id).toEqual({ not: id });
+  });
+
+  it('не вистачає — попередній розрахунок каже, чого саме', async () => {
+    withRackets();
+    taken(1);
+    const res = await post({ preview: true });
+    expect(res.body.reason).toBe('RENTAL_SHORTAGE');
+    expect(res.body.rentalShortages).toEqual([{ itemId: RACKET, itemName: 'Ракетка', requested: 2, free: 1 }]);
+    expect(tx.booking.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('не вистачає — гравець сам не переносить і суму не змінює', async () => {
+    withRackets();
+    taken(1);
+    const res = await post({ expectedPrice: 20000 });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('RENTAL_SHORTAGE');
+    expect(tx.booking.updateMany).not.toHaveBeenCalled();
   });
 });

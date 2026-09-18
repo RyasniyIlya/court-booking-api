@@ -57,6 +57,9 @@ const LIST_SELECT = {
   photoMime: true,
   photoUpdatedAt: true,
   sortOrder: true,
+  rentPrice: true,
+  rentMode: true,
+  returnable: true,
 } as const;
 
 type Row = {
@@ -83,6 +86,15 @@ const itemShape = {
   unit: z.string().trim().max(16).nullable(),
   note: z.string().trim().max(300).nullable(),
   sortOrder: z.number().int().min(0).max(10_000),
+
+  /* Прокат. `rentPrice: null` — позиція не здається, і віджет її не бачить;
+     окремого прапорця «здається» немає навмисно (див. schema.prisma).
+     Ціна в копійках, як і всюди в проєкті. */
+  rentPrice: z.number().int().min(0).max(100_000_000).nullable(),
+  rentMode: z.enum(['FIXED', 'HOURLY']),
+  /* Ракетку повертають, воду — ні. Витратну позицію видача списує з
+     quantity назавжди, тож перемикач міняє не підпис, а рух складу. */
+  returnable: z.boolean(),
 };
 
 const createSchema = z.object({
@@ -92,6 +104,9 @@ const createSchema = z.object({
   unit: itemShape.unit.default(null),
   note: itemShape.note.default(null),
   sortOrder: itemShape.sortOrder.default(0),
+  rentPrice: itemShape.rentPrice.default(null),
+  rentMode: itemShape.rentMode.default('FIXED'),
+  returnable: itemShape.returnable.default(true),
 });
 
 const patchSchema = z.object(itemShape).partial();
@@ -123,6 +138,9 @@ inventoryRouter.post('/inventory', requireAuth, requireStaff, async (req, res) =
       unit: blankToNull(d.unit),
       note: blankToNull(d.note),
       sortOrder: d.sortOrder,
+      rentPrice: d.rentPrice,
+      rentMode: d.rentMode,
+      returnable: d.returnable,
     },
     select: LIST_SELECT,
   });
@@ -153,6 +171,9 @@ inventoryRouter.patch('/inventory/:id', requireAuth, requireStaff, async (req, r
       ...(p.unit !== undefined ? { unit: blankToNull(p.unit) } : {}),
       ...(p.note !== undefined ? { note: blankToNull(p.note) } : {}),
       ...(p.sortOrder !== undefined ? { sortOrder: p.sortOrder } : {}),
+      ...(p.rentPrice !== undefined ? { rentPrice: p.rentPrice } : {}),
+      ...(p.rentMode !== undefined ? { rentMode: p.rentMode } : {}),
+      ...(p.returnable !== undefined ? { returnable: p.returnable } : {}),
     },
     select: LIST_SELECT,
   });

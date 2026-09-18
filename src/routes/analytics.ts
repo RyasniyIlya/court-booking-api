@@ -928,7 +928,7 @@ analyticsRouter.get('/customers', async (req, res) => {
     select: {
       id: true, name: true, phone: true, note: true, tags: true,
       email: true,
-      isBlocked: true, createdAt: true, telegramChatId: true,
+      isBlocked: true, requiresPrepay: true, createdAt: true, telegramChatId: true,
       birthDate: true, discountPercent: true, bonusBalance: true,
     },
   });
@@ -982,6 +982,7 @@ analyticsRouter.get('/customers', async (req, res) => {
       note: c.note,
       tags: c.tags,
       isBlocked: c.isBlocked,
+      requiresPrepay: c.requiresPrepay,
       hasCabinet: Boolean(c.birthDate),
       birthDate: dateOnly(c.birthDate),
       daysUntilBirthday: daysUntilBirthday(c.birthDate, now),

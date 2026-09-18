@@ -173,6 +173,23 @@ describe('POST /clubs/:slug/bookings/:id/join', () => {
     expect(res.status).toBe(201);
   });
 
+  it('турнір з онлайн-оплатою не блокується, якщо еквайринг не підключений', async () => {
+    prisma.club.findFirst.mockResolvedValue({
+      ...CLUB, prepayEnabled: true, prepayRequired: true,
+    });
+    tx.$queryRaw.mockResolvedValue(groupRow({
+      title: '🏆 Осінній кубок', paymentPlan: { method: 'ONLINE' },
+    }));
+
+    const res = await join();
+
+    expect(res.status).toBe(201);
+    expect(res.body.payUrl).toBeUndefined();
+    expect(tx.bookingSeat.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ status: 'BOOKED', expiresAt: null }),
+    }));
+  });
+
   it('заняття чужого клубу не видно — 404, а не 403', async () => {
     // 403 підказав би, що таке заняття існує
     tx.$queryRaw.mockResolvedValue(groupRow({ clubId: 'other-club' }));
@@ -192,6 +209,19 @@ describe('POST /clubs/:slug/bookings/:id/join', () => {
     const res = await join();
     expect(res.status).toBe(403);
     expect(res.body.error).toBe('CUSTOMER_BLOCKED');
+  });
+
+  it('клієнт «тільки з передоплатою» не обходить оплату через турнір', async () => {
+    prisma.club.findFirst.mockResolvedValue({
+      ...CLUB, prepayEnabled: true, prepayRequired: false,
+    });
+    vi.mocked(findOrCreateCustomer).mockResolvedValue({
+      id: 'c', isBlocked: false, requiresPrepay: true, discountPercent: 0,
+    } as never);
+    const res = await join({ payChoice: 'onsite' });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('ONLINE_PAYMENT_UNAVAILABLE');
+    expect(tx.bookingSeat.create).not.toHaveBeenCalled();
   });
 
   it('невідомий клуб — 404', async () => {

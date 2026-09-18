@@ -1,0 +1,180 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import express from 'express';
+import request from 'supertest';
+
+/**
+ * Прокат у кабінеті.
+ *
+ * Правка набору — це гроші: додали ракетку до оплаченої броні — має
+ * зʼявитись борг (статус — за тим самим правилом, що при зміні тренера),
+ * зняли — переплата. Видача — лише позначка, але
+ * «Видано» двічі або з кінця ланцюжка писати не можна.
+ */
+
+const BOOKING = '33333333-3333-4333-8333-333333333333';
+const RACKET = '22222222-2222-4222-8222-222222222222';
+const BALLS = '44444444-4444-4444-8444-444444444444';
+const RENTAL = '55555555-5555-4555-8555-555555555555';
+
+const prisma = {
+  $queryRaw: vi.fn(),
+  $transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(prisma)),
+  booking: { findUniqueOrThrow: vi.fn(), update: vi.fn() },
+  bookingRental: {
+    findMany: vi.fn(), deleteMany: vi.fn(), update: vi.fn(), create: vi.fn(),
+    updateMany: vi.fn(), findFirst: vi.fn(), findUniqueOrThrow: vi.fn(),
+  },
+  inventoryItem: { findMany: vi.fn() },
+  user: { findUniqueOrThrow: vi.fn(async () => ({ email: 'admin@club.test' })) },
+};
+
+vi.mock('../../lib/db', () => ({ prisma }));
+vi.mock('./shared', () => ({
+  requireAuth: (req: { auth?: unknown }, _res: unknown, next: () => void) => {
+    req.auth = { userId: 'admin', clubId: 'club', role: 'ADMIN', trainerId: null }; next();
+  },
+  requireStaff: (_req: unknown, _res: unknown, next: () => void) => next(),
+  param: (req: { params: Record<string, string> }, key: string) => req.params[key],
+}));
+
+const { rentalsRouter } = await import('./rentals');
+const app = express().use(express.json()).use(rentalsRouter);
+
+const racketItem = { id: RACKET, name: 'Ракетка Wilson', quantity: 4, rentPrice: 12_000, rentMode: 'HOURLY' };
+const ballsItem = { id: BALLS, name: 'Мʼячі', quantity: 10, rentPrice: 5_000, rentMode: 'FIXED' };
+
+/** Оплачена бронь на годину з однією ракеткою за старою ціною 10 000. */
+const booking = (over: Record<string, unknown> = {}) => ({
+  id: BOOKING, clubId: 'club', capacity: null, status: 'CONFIRMED',
+  startTime: new Date('2030-01-01T10:00:00Z'), endTime: new Date('2030-01-01T11:00:00Z'),
+  priceTotal: 50_000, rentalTotal: 10_000, expiresAt: null, payment: null,
+  ledgerEntries: [{ kind: 'PAYMENT', amount: 50_000 }],
+  rentals: [{
+    id: RENTAL, itemId: RACKET, itemName: 'Ракетка Wilson', quantity: 1,
+    mode: 'HOURLY', unitPrice: 10_000, amount: 10_000, status: 'ISSUED',
+  }],
+  ...over,
+});
+
+const put = (rentals: unknown) => request(app).put(`/bookings/${BOOKING}/rentals`).send({ rentals });
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  prisma.$queryRaw.mockImplementation(async (strings: TemplateStringsArray) =>
+    strings.join('').includes('"Booking"') ? [{ id: BOOKING }] : [racketItem, ballsItem]);
+  prisma.booking.findUniqueOrThrow.mockResolvedValue(booking());
+  prisma.booking.update.mockImplementation(async ({ data }) => ({ id: BOOKING, ...data }));
+  prisma.bookingRental.findMany.mockResolvedValue([]);
+});
+
+describe('PUT /bookings/:id/rentals', () => {
+  it('додали мʼячі до оплаченої броні — борг у касі, прийнята бронь лишається CONFIRMED; наявна ракетка за знімком', async () => {
+    const res = await put([{ itemId: RACKET, quantity: 2 }, { itemId: BALLS, quantity: 1 }]);
+
+    expect(res.status).toBe(200);
+    // 50 000 − 10 000 старого прокату + (2 × 10 000 за знімком + 5 000) = 65 000
+    expect(prisma.booking.update.mock.calls[0][0].data).toMatchObject({
+      priceTotal: 65_000, rentalTotal: 25_000, status: 'CONFIRMED',
+    });
+    expect(prisma.bookingRental.update).toHaveBeenCalledWith({
+      where: { id: RENTAL }, data: { quantity: 2, amount: 20_000 },
+    });
+    expect(prisma.bookingRental.create.mock.calls[0][0].data).toMatchObject({
+      itemId: BALLS, quantity: 1, mode: 'FIXED', unitPrice: 5_000, amount: 5_000, bookingId: BOOKING,
+    });
+  });
+
+  it('зняли весь прокат — рядок видаляється, бронь лишається оплаченою', async () => {
+    const res = await put([]);
+
+    expect(res.status).toBe(200);
+    expect(prisma.bookingRental.deleteMany).toHaveBeenCalledWith({ where: { id: { in: [RENTAL] } } });
+    expect(prisma.booking.update.mock.calls[0][0].data).toMatchObject({
+      priceTotal: 40_000, rentalTotal: 0, status: 'CONFIRMED',
+    });
+  });
+
+  it('не вистачає — 409 із деталями, нічого не пишеться', async () => {
+    prisma.bookingRental.findMany.mockResolvedValue([{
+      itemId: RACKET, quantity: 3,
+      booking: { startTime: new Date('2030-01-01T10:00:00Z'), endTime: new Date('2030-01-01T11:00:00Z') },
+    }]);
+
+    const res = await put([{ itemId: RACKET, quantity: 2 }]);
+
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'RENTAL_BUSY', shortages: [{ itemId: RACKET, requested: 2, free: 1 }] });
+    expect(prisma.booking.update).not.toHaveBeenCalled();
+    expect(prisma.bookingRental.update).not.toHaveBeenCalled();
+    // власна бронь не конкурує сама з собою
+    expect(prisma.bookingRental.findMany.mock.calls[0][0].where.booking.id).toEqual({ not: BOOKING });
+  });
+
+  it('бронь під онлайн-холдом лишається PENDING, поки не доплатять', async () => {
+    prisma.booking.findUniqueOrThrow.mockResolvedValue(booking({
+      status: 'PENDING', expiresAt: new Date('2030-01-01T09:00:00Z'), ledgerEntries: [],
+    }));
+    const res = await put([{ itemId: RACKET, quantity: 1 }]);
+    expect(res.status).toBe(200);
+    expect(prisma.booking.update.mock.calls[0][0].data.status).toBe('PENDING');
+  });
+
+  it('групове заняття — 400', async () => {
+    prisma.booking.findUniqueOrThrow.mockResolvedValue(booking({ capacity: 8, rentals: [] }));
+    expect((await put([{ itemId: RACKET, quantity: 1 }])).body.error).toBe('RENTALS_PRIVATE_ONLY');
+  });
+
+  it('скасована бронь — 409', async () => {
+    prisma.booking.findUniqueOrThrow.mockResolvedValue(booking({ status: 'CANCELLED' }));
+    expect((await put([])).body.error).toBe('BOOKING_INACTIVE');
+  });
+
+  it('чужа бронь — 404', async () => {
+    prisma.$queryRaw.mockResolvedValue([]);
+    expect((await put([])).status).toBe(404);
+  });
+});
+
+describe('видача й повернення', () => {
+  it('RESERVED → ISSUED з автором', async () => {
+    prisma.bookingRental.updateMany.mockResolvedValue({ count: 1 });
+    prisma.bookingRental.findUniqueOrThrow.mockResolvedValue({ id: RENTAL, status: 'ISSUED' });
+
+    const res = await request(app).post(`/rentals/${RENTAL}/issue`);
+
+    expect(res.status).toBe(200);
+    const call = prisma.bookingRental.updateMany.mock.calls[0][0];
+    expect(call.where).toMatchObject({ id: RENTAL, clubId: 'club', status: 'RESERVED' });
+    expect(call.data).toMatchObject({ status: 'ISSUED', issuedBy: 'admin@club.test' });
+  });
+
+  it('вдруге «Видано» — 409, а не друга видача', async () => {
+    prisma.bookingRental.updateMany.mockResolvedValue({ count: 0 });
+    prisma.bookingRental.findFirst.mockResolvedValue({ id: RENTAL });
+    expect((await request(app).post(`/rentals/${RENTAL}/issue`)).body.error).toBe('BAD_TRANSITION');
+  });
+
+  it('повернення лише з ISSUED', async () => {
+    prisma.bookingRental.updateMany.mockResolvedValue({ count: 1 });
+    prisma.bookingRental.findUniqueOrThrow.mockResolvedValue({ id: RENTAL, status: 'RETURNED' });
+    await request(app).post(`/rentals/${RENTAL}/return`);
+    expect(prisma.bookingRental.updateMany.mock.calls[0][0].where.status).toBe('ISSUED');
+  });
+
+  it('undo з RETURNED повертає в ISSUED і стирає позначку повернення', async () => {
+    prisma.bookingRental.findFirst.mockResolvedValue({ status: 'RETURNED' });
+    prisma.bookingRental.updateMany.mockResolvedValue({ count: 1 });
+    prisma.bookingRental.findUniqueOrThrow.mockResolvedValue({ id: RENTAL, status: 'ISSUED' });
+
+    await request(app).post(`/rentals/${RENTAL}/undo`);
+
+    expect(prisma.bookingRental.updateMany.mock.calls[0][0].data)
+      .toEqual({ status: 'ISSUED', returnedAt: null, returnedBy: null });
+  });
+
+  it('чужий рядок — 404', async () => {
+    prisma.bookingRental.updateMany.mockResolvedValue({ count: 0 });
+    prisma.bookingRental.findFirst.mockResolvedValue(null);
+    expect((await request(app).post(`/rentals/${RENTAL}/return`)).status).toBe(404);
+  });
+});

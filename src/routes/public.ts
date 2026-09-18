@@ -26,6 +26,10 @@ import { planFeatures } from '../lib/plans';
 import { createPlayerLinkCode, PLAYER_LINK_MINUTES, playerStartPayload, unlinkPlayers } from '../lib/playerBot';
 import { joinWaitlist, type JoinError } from '../lib/waitlist';
 import { TelegramMiniAppDataError, verifyTelegramMiniAppData } from '../lib/telegramMiniApp';
+import {
+  RentalError, listRentables, loadOccupancy, lockRentableItems, previewRentals, rentalCreateData, reserveRentals,
+} from '../lib/rentalStore';
+import { MAX_RENT_LINES, MAX_RENT_QUANTITY, findShortages } from '../lib/rentals';
 
 /** Бот налаштований і план клубу дозволяє Telegram */
 const playerTelegramReady = (plan: Parameters<typeof planFeatures>[0]) =>
@@ -51,7 +55,7 @@ publicRouter.post('/customer/bookings/:id/reschedule', async (req, res) => {
       const b = await tx.booking.findFirst({
         where: { id: String(req.params.id), customerId: auth.customerId, clubId: auth.clubId },
         include: { customer: true, payment: true, club: { include: { hours: true, promos: true, plan: true } },
-          trainer: { include: { hours: true, exceptions: true } } },
+          trainer: { include: { hours: true, exceptions: true } }, rentals: true },
       });
       if (!b) return fail('NOT_FOUND');
       if (b.capacity !== null || !['PENDING', 'CONFIRMED'].includes(b.status)) return fail('NOT_AVAILABLE');
@@ -78,12 +82,21 @@ publicRouter.post('/customer/bookings/:id/reschedule', async (req, res) => {
       if (usage && !usage.revertedAt && (start < usage.pass.validFrom || end > usage.pass.validUntil)) return fail('PASS_EXPIRED');
       const courtPrice = courtPriceWithPromos({ pricePerHour: court.pricePerHour, start, end,
         timezone: b.club.timezone, courtId: court.id, slotMinutes, promos: b.club.promos, birthDate: b.customer?.birthDate }).price;
-      const price = Math.round((courtPrice + trainerPrice) * (100 - (b.customer?.discountPercent ?? 0)) / 100);
+      // Прокат їде разом із бронню і сумою не змінюється: тривалість та сама, тож HOURLY коштує стільки ж.
+      // Якщо на новий час ракеток не вистачає — гравець сам не переносить (урізати може лише клуб):
+      // інакше сума зменшилась би, а зміна суми потребує окремої платіжної операції.
+      const rentalIds = b.rentals.map(r => r.itemId);
+      const rentalItems = await lockRentableItems(tx, auth.clubId, rentalIds);
+      const rentalShortages = findShortages(b.rentals.map(r => ({ itemId: r.itemId, quantity: r.quantity })), rentalItems,
+        await loadOccupancy(tx, auth.clubId, rentalIds, start, end, b.id), start, end)
+        .map(s => ({ ...s, itemName: b.rentals.find(r => r.itemId === s.itemId)?.itemName ?? '' }));
+      const price = Math.round((courtPrice + trainerPrice) * (100 - (b.customer?.discountPercent ?? 0)) / 100) + b.rentalTotal;
       // Зміна суми потребує окремої платіжної операції. До її реалізації
       // не змінюємо ні бронь, ні наявні списання/платежі.
       const reason = b.expiresAt || b.payment?.status === 'PENDING' || b.payment?.refundRequestedAt ? 'PAYMENT_PENDING'
-        : price !== b.priceTotal ? 'PRICE_DIFFERENCE' : null;
-      if (d.preview) return { price, oldPrice: b.priceTotal, reason, start: d.start, end: d.end, courtName: court.name };
+        : rentalShortages.length ? 'RENTAL_SHORTAGE' : price !== b.priceTotal ? 'PRICE_DIFFERENCE' : null;
+      if (d.preview) return { price, oldPrice: b.priceTotal, reason, start: d.start, end: d.end, courtName: court.name,
+        ...(rentalShortages.length ? { rentalShortages } : {}) };
       if (reason) return fail(reason);
       if (d.expectedPrice !== price) return fail('CHANGED');
       if (!canReschedule(b.startTime)) return fail('CLOSED');
@@ -244,9 +257,6 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     // true+false — гравець сам обирає «зараз» чи «на місці».
     prepayEnabled: club.prepayEnabled,
     prepayRequired: club.prepayRequired,
-    // Не віддаємо реквізити назовні — лише можливість провести платіж.
-    // Віджет одразу запропонує оплату в клубі, якщо провайдер не готовий.
-    onlinePaymentAvailable: Boolean(club.prepayEnabled && providerFor(club)),
     /* Акції клубу — для повідомлення у віджеті: «у нас дешевший ранок»
        гравець має побачити до того, як почне шукати вільну годину. Це
        правила, а не ціни: скільки коштуватиме конкретна година, віджет
@@ -386,6 +396,34 @@ publicRouter.get('/clubs/:slug/trainers', async (req, res) => {
       t.hours, range.start, range.end, club.timezone, t.exceptions,
     )),
   })));
+});
+
+/**
+ * GET /api/public/clubs/:slug/rentals?start=&end=
+ *
+ * Що можна взяти напрокат. З інтервалом — скільки кожної позиції вільно
+ * саме на нього (пік зайнятості, див. lib/rentals.ts). Без інтервалу
+ * `free` = null: віджет може показати асортимент ще до вибору часу.
+ */
+publicRouter.get('/clubs/:slug/rentals', async (req, res) => {
+  const parsed = z.object({
+    start: z.string().datetime({ offset: true }).optional(),
+    end: z.string().datetime({ offset: true }).optional(),
+  }).safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const { start, end } = parsed.data;
+  if (Boolean(start) !== Boolean(end)) return res.status(400).json({ error: 'START_AND_END_TOGETHER' });
+  if (start && end && new Date(end) <= new Date(start)) return res.status(400).json({ error: 'BAD_INTERVAL' });
+
+  const club = await prisma.club.findUnique({ where: { slug: req.params.slug }, select: { id: true } });
+  if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
+
+  res.json(await listRentables(
+    prisma, club.id,
+    start ? new Date(start) : undefined,
+    end ? new Date(end) : undefined,
+  ));
 });
 
 /**
@@ -608,6 +646,11 @@ const bookingSchema = z.object({
    */
   payChoice: z.enum(['online', 'onsite']).optional(),
   birthDate: birthDateText,
+  /** Прокат до броні. Вибір = гарантія: залишок резервується разом зі слотом. */
+  rentals: z.array(z.object({
+    itemId: z.string().uuid(),
+    quantity: z.number().int().min(1).max(MAX_RENT_QUANTITY),
+  })).max(MAX_RENT_LINES).default([]),
 });
 
 /**
@@ -715,7 +758,7 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
      бронює, тому дата народження їде в розрахунок. Вона вже звірена з
      карткою вище (BIRTH_DATE_MISMATCH), тож підставити чужий день
      народження заради знижки не вийде. */
-  const { price: courtPrice } = courtPriceWithPromos({
+  const courtPricing = courtPriceWithPromos({
     pricePerHour: court.pricePerHour,
     start,
     end,
@@ -725,6 +768,7 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     promos: club.promos,
     birthDate: body.birthDate,
   });
+  const courtPrice = courtPricing.price;
 
   // Тренер: перевіряємо, що він цього клубу, активний і не зайнятий.
   // Friendly pre-check; trainer_no_overlap is the final concurrent-write guard.
@@ -753,26 +797,32 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     trainerPrice = Math.round((trainer.pricePerHour * minutes) / 60);
   }
 
+  /* Прокат рахуємо до рішення про передоплату: від повної суми залежить,
+     чи платна бронь узагалі. Остаточно ціна й залишок перевіряються під
+     замком у транзакції нижче. Знижка на прокат не діє — додаємо після неї. */
+  const rentalPreview = await previewRentals(prisma, club.id, body.rentals, start, end);
+  if (!rentalPreview.ok) {
+    return res.status(409).json({ error: 'RENTAL_NOT_AVAILABLE', itemId: rentalPreview.itemId });
+  }
+
   const priceBeforeDiscount = courtPrice + trainerPrice;
-  const priceTotal = Math.round(priceBeforeDiscount * (100 - (customer?.discountPercent ?? 0)) / 100);
+  const priceTotal = Math.round(priceBeforeDiscount * (100 - (customer?.discountPercent ?? 0)) / 100)
+    + rentalPreview.total;
 
   // Три стани клуба: оплати немає (prepayEnabled=false), оплата обов'язкова
   // (prepayRequired=true, типово) — і новий: гравець сам обирає при броні.
   // У третьому стані вибір обов'язковий — без нього незрозуміло, чи повертати
   // слот, тому просимо перепитати, а не тихо вгадувати «на місці».
-  const paymentProvider = club.prepayEnabled ? providerFor(club) : null;
-  const onlinePaymentAvailable = Boolean(paymentProvider);
-
-  if (onlinePaymentAvailable && !club.prepayRequired && !body.payChoice) {
+  const customerRequiresPrepay = Boolean(customer?.requiresPrepay && priceTotal > 0);
+  if (!customerRequiresPrepay && club.prepayEnabled && !club.prepayRequired && !body.payChoice) {
     return res.status(400).json({ error: 'PAY_CHOICE_REQUIRED' });
   }
 
-  /* Якщо платіжний провайдер тимчасово не налаштований, не блокуємо сам
-     запис: створюємо звичайну заявку з оплатою в клубі. Це також захищає
-     старі вкладки, які ще могли надіслати payChoice=online. */
-  const wantsOnlinePay = onlinePaymentAvailable
-    && (club.prepayRequired || body.payChoice === 'online');
-  const provider = wantsOnlinePay ? paymentProvider : null;
+  const wantsOnlinePay = customerRequiresPrepay || club.prepayRequired || body.payChoice === 'online';
+  const provider = club.prepayEnabled && wantsOnlinePay ? providerFor(club) : null;
+  if (club.prepayEnabled && wantsOnlinePay && priceTotal > 0 && !provider) {
+    return res.status(409).json({ error: 'ONLINE_PAYMENT_UNAVAILABLE' });
+  }
   const needsPay = Boolean(provider) && priceTotal > 0;
   const expiresAt = needsPay
     ? new Date(Date.now() + club.payHoldMinutes * 60_000)
@@ -780,31 +830,51 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
 
   let booking;
   try {
-    // Гонку двох одночасних запитів ловить EXCLUDE USING gist у БД,
-    // а не перевірка в коді — тому окрема транзакція з SELECT ... не потрібна.
+    // Гонку за корт ловить EXCLUDE USING gist у БД. Гонку за ракетки —
+    // FOR UPDATE на позиціях у reserveRentals (див. lib/rentalStore.ts),
+    // тому бронь і її прокат пишуться однією транзакцією. Без прокату
+    // транзакція порожня обгортка навколо того самого create.
     // PENDING теж рахується зайнятим, тому слот тримається під час оплати.
-    booking = await prisma.booking.create({
-      data: {
-        clubId: club.id,
-        courtId: court.id,
-        customerName: body.customerName,
-        customerPhone: phone.e164,
-        customerId: customer?.id ?? null,
-        comment: body.comment,
-        startTime: start,
-        endTime: end,
-        priceTotal,
-        trainerId: trainer?.id ?? null,
-        trainerPrice,
-        /* Платна бронь підтверджується тільки фактом повної оплати.
-           Обіцянка заплатити на місці лишає її PENDING без таймера. */
-        status: priceTotal > 0 ? 'PENDING' : (club.autoConfirm ? 'CONFIRMED' : 'PENDING'),
-        expiresAt,
-        source: 'WIDGET',
-      },
+    booking = await prisma.$transaction(async (tx) => {
+      const rentals = await reserveRentals(tx, {
+        clubId: club.id, start, end, request: body.rentals,
+      });
+      /* Між попереднім розрахунком і замком позицію могли переоцінити.
+         Тихо виставити інший рахунок не можна — гравець бачив іншу суму. */
+      if (rentals.total !== rentalPreview.total) {
+        throw new RentalError(409, 'RENTAL_NOT_AVAILABLE');
+      }
+
+      return tx.booking.create({
+        data: {
+          rentalTotal: rentals.total,
+          rentals: { create: rentalCreateData(club.id, rentals.lines) },
+          clubId: club.id,
+          courtId: court.id,
+          customerName: body.customerName,
+          customerPhone: phone.e164,
+          customerId: customer?.id ?? null,
+          comment: body.comment,
+          startTime: start,
+          endTime: end,
+          priceTotal,
+          promoNames: courtPricing.applied
+            .map((promo) => promo.title?.trim())
+            .filter((title): title is string => Boolean(title)),
+          promoDiscount: Math.max(0, courtPricing.basePrice - courtPricing.price),
+          trainerId: trainer?.id ?? null,
+          trainerPrice,
+          /* Платна бронь підтверджується тільки фактом повної оплати.
+             Обіцянка заплатити на місці лишає її PENDING без таймера. */
+          status: priceTotal > 0 ? 'PENDING' : (club.autoConfirm ? 'CONFIRMED' : 'PENDING'),
+          expiresAt,
+          source: 'WIDGET',
+        },
+      });
     });
   } catch (e) {
     if (isSlotTakenError(e)) return res.status(409).json({ error: 'SLOT_TAKEN' });
+    if (e instanceof RentalError) return res.status(e.status).json({ error: e.code, ...e.details });
     console.error('[booking] create failed', e);
     return res.status(500).json({ error: 'INTERNAL' });
   }
@@ -1003,22 +1073,26 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
       /* Чим платить учасник. У турніру своє правило, у решти груп — клубне
          (див. lib/tournamentPay.ts). Рахуємо всередині транзакції, бо
          тільки тут ми вже прочитали саму подію під замком. */
-      const pay = resolveJoinPayment({
-        mode: tournamentPayMode(b),
-        price,
-        prepayEnabled: club.prepayEnabled,
-        prepayRequired: club.prepayRequired,
-        payChoice: body.payChoice,
-      });
+      const pay = customer?.requiresPrepay && price > 0
+        ? { online: true as const }
+        : resolveJoinPayment({
+          mode: tournamentPayMode(b),
+          price,
+          prepayEnabled: club.prepayEnabled,
+          prepayRequired: club.prepayRequired,
+          payChoice: body.payChoice,
+        });
       if (pay.error) {
         throw new HttpError(pay.error === 'PAY_CHOICE_REQUIRED' ? 400 : 409, pay.error);
       }
 
       /* Еквайринг увімкнено, але ключі не заведені — платіжки не буде.
-         Для турніру «тільки онлайн» це відмова: пустити без оплати
-         означало б зламати саме те правило, заради якого його ставили. */
+         Реєстрацію через це не втрачаємо: місце оформлюється з оплатою
+         в клубі, а модератор бачить внесок у картці учасника. */
       provider = pay.online ? providerFor(club) : null;
-      if (pay.online && !provider) throw new HttpError(409, 'ONLINE_PAYMENT_UNAVAILABLE');
+      if (customer?.requiresPrepay && price > 0 && !provider) {
+        throw new HttpError(409, 'ONLINE_PAYMENT_UNAVAILABLE');
+      }
 
       const needsPay = Boolean(provider) && price > 0;
 
@@ -1512,6 +1586,11 @@ publicRouter.get('/customer/me', async (req, res) => {
         startTime: true,
         endTime: true,
         priceTotal: true,
+        /* Відмітка ресепшену. Без неї минуле заняття доводилось показувати
+           гравцю як «Зіграно» просто тому, що час минув, — і неявка
+           виглядала як гра. */
+        attendance: true,
+        attendanceAt: true,
         court: { select: { name: true } },
         trainer: { select: { name: true } },
       },
@@ -1559,9 +1638,13 @@ publicRouter.get('/customer/me', async (req, res) => {
 
   /* Підсумок гравця про себе: скільки разів приходив, де грає найчастіше,
      з ким тренується і скільки тижнів поспіль не пропускає. */
+  /* Неявка — не відвідування. Інакше серія тижнів, рівень і досягнення
+     росли б у того, хто забронював і не прийшов, а клуб цю годину
+     втратив. Заняття без відмітки рахуємо як зігране: не відмітив
+     ресепшен — не гравцю за це відповідати. */
   const stats = playerStats(
     [
-      ...pastBookings.map((b) => ({
+      ...pastBookings.filter((b) => b.attendance !== 'NO_SHOW').map((b) => ({
         start: b.startTime,
         end: b.endTime,
         courtName: b.court?.name ?? null,
@@ -1688,6 +1771,11 @@ publicRouter.get('/customer/me', async (req, res) => {
         end: b.endTime.toISOString(),
         courtName: b.court?.name ?? 'Корт',
         trainerName: b.trainer?.name ?? null,
+        /* UNKNOWN їде як є, а не підмінюється на ARRIVED: «ресепшен не
+           відмітив» і «гравець прийшов» — різні факти, і сперечатись біля
+           стійки доведеться саме про цю різницю. */
+        attendance: b.attendance,
+        attendanceAt: b.attendanceAt?.toISOString() ?? null,
       })),
       ...pastSeats.map((s) => ({
         id: `seat:${s.id}`,
@@ -1696,6 +1784,11 @@ publicRouter.get('/customer/me', async (req, res) => {
         end: s.booking.endTime.toISOString(),
         courtName: s.booking.court?.name ?? 'Корт',
         trainerName: s.booking.trainer?.name ?? null,
+        /* Місце в груповому занятті ресепшен поштучно не відмічає
+           (attendance.ts: GROUP_ATTENDANCE_NOT_SUPPORTED), тому тут
+           завжди UNKNOWN — і віджет не вдає, ніби відмітка була. */
+        attendance: 'UNKNOWN' as const,
+        attendanceAt: null,
       })),
     ].sort((a, b) => b.start.localeCompare(a.start)),
   });

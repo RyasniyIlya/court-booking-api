@@ -33,6 +33,8 @@ const booking = (over: Record<string, unknown> = {}) => ({
   startTime: new Date('2026-10-15T09:00:00Z'),
   endTime: new Date('2026-10-15T10:00:00Z'),
   priceTotal: 45000,
+  promoNames: [],
+  promoDiscount: 0,
   customerName: 'Петро',
   customerPhone: '+380671112233',
   trainerId: TRAINER_ID,
@@ -71,6 +73,22 @@ describe('notifyBooking', () => {
     for (const chat of ['club-chat', 'owner-chat', 'mod-chat']) {
       expect(textFor(chat)).toContain('+380671112233');
       expect(textFor(chat)).toContain('450.00 грн');
+    }
+  });
+
+  it('клуб і модератор бачать, яку акцію використав клієнт', async () => {
+    prisma.booking.findUnique.mockResolvedValue(booking({
+      priceTotal: 36000,
+      promoNames: ['Щаслива година'],
+      promoDiscount: 9000,
+    }));
+    prisma.user.findMany.mockResolvedValue([{ tgChatId: 'mod-chat', role: 'ADMIN' }]);
+
+    await notifyBooking({ bookingId: BOOKING_ID, event: 'created' });
+
+    for (const chat of ['club-chat', 'mod-chat']) {
+      expect(textFor(chat)).toContain('Акція: Щаслива година');
+      expect(textFor(chat)).toContain('знижка 90.00 грн');
     }
   });
 

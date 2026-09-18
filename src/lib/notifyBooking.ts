@@ -92,6 +92,8 @@ export async function notifyBooking(params: Params): Promise<void> {
       startTime: true,
       endTime: true,
       priceTotal: true,
+      promoNames: true,
+      promoDiscount: true,
       customerName: true,
       customerPhone: true,
       customer: { select: { telegramChatId: true } },
@@ -144,6 +146,9 @@ export async function notifyBooking(params: Params): Promise<void> {
     booking.trainer ? `Тренер: ${html(booking.trainer.name)}` : '',
     who.name ? `Клієнт: ${html(who.name)}` : '',
     who.phone ? `Телефон: ${html(who.phone)}` : '',
+    !seat && booking.promoNames.length > 0
+      ? `🏷 Акція: ${booking.promoNames.map(html).join(', ')}${booking.promoDiscount > 0 ? ` · знижка ${hrn(booking.promoDiscount)}` : ''}`
+      : '',
     money > 0 ? hrn(money) : '',
   ].filter(Boolean).join('\n');
 
