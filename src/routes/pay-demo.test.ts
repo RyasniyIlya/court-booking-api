@@ -11,17 +11,19 @@ const app = express().use(payRouter);
 beforeEach(() => {
   vi.clearAllMocks();
   vi.stubEnv('NODE_ENV', 'production');
-  vi.stubEnv('DEMO_PAYMENTS', 'true');
+  vi.stubEnv('DEMO_PAYMENTS', '');
   prisma.payment.findUnique.mockResolvedValue({ amount: 50000, clubId: 'demo-club', pageUrl: 'https://api.test/api/pay/mock/mock_123?back=https%3A%2F%2Fsite.test%2Fc%2Fdemo&what=Court' });
   applyPayEvent.mockResolvedValue('applied');
 });
 afterEach(() => vi.unstubAllEnvs());
-it('enables the provider on the hosted prototype only with explicit opt-in', () => {
+/* Клуб обрав тестову оплату в налаштуваннях — вона працює й на
+   опублікованому прототипі. Закрити її можна явним DEMO_PAYMENTS=false. */
+it('тестова платіжка працює у production і вимикається явним DEMO_PAYMENTS=false', () => {
   expect(providerFor({ paymentProvider: 'mock', paymentTokenEnc: null })?.name).toBe('mock');
   vi.stubEnv('DEMO_PAYMENTS', 'false');
   expect(providerFor({ paymentProvider: 'mock', paymentTokenEnc: null })).toBeNull();
 });
-it('keeps both demo endpoints closed in production without opt-in', async () => {
+it('keeps both demo endpoints closed when the operator switched them off', async () => {
   vi.stubEnv('DEMO_PAYMENTS', 'false');
   expect((await request(app).get('/mock/mock_123')).status).toBe(404);
   expect((await request(app).post('/mock/mock_123/complete?status=success')).status).toBe(404);

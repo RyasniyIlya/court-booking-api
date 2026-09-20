@@ -1,4 +1,19 @@
-/** Explicit opt-in for a hosted prototype. Real providers are unaffected. */
+/**
+ * Чи працює тестова платіжка.
+ *
+ * Провайдер `mock` — це явний вибір клубу в налаштуваннях, підписаний
+ * «заглушка для перевірки · без грошей». Раніше поверх цього вибору стояв
+ * другий замок: у production заглушка мовчала, доки оператор не виставить
+ * DEMO_PAYMENTS=true. На опублікованому прототипі цієї змінної ніхто не
+ * ставив — і клуб, який свідомо обрав тестову оплату, отримував
+ * «онлайн-оплата недоступна» замість платіжки.
+ *
+ * Тепер замок один: обрав mock — тестова оплата проходить. DEMO_PAYMENTS
+ * лишився вимикачем на випадок, коли прототип показують назовні і
+ * «оплату» в один клік краще закрити зовсім: DEMO_PAYMENTS=false.
+ *
+ * Справжніх провайдерів (mono, LiqPay) це не стосується взагалі.
+ */
 export function mockPaymentsEnabled(): boolean {
-  return process.env.NODE_ENV !== 'production' || process.env.DEMO_PAYMENTS === 'true';
+  return process.env.DEMO_PAYMENTS !== 'false';
 }

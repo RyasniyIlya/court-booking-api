@@ -30,6 +30,10 @@ services:
       - key: PAYMENTS_SECRET
         generateValue: true
 
+      # Тестова платіжка (провайдер "mock") працює без окремої змінної —
+      # її вмикає сам клуб у налаштуваннях. Щоб закрити заглушку зовсім,
+      # додати тут DEMO_PAYMENTS зі значенням "false".
+
       # Публічна адреса цього ж сервісу — для webHookUrl платіжки.
       # Render підставляє хост без схеми, тому publicBase() сам додає https://
       - key: PUBLIC_API_URL
