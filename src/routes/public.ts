@@ -847,10 +847,13 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
   }
 
   const wantsOnlinePay = customerRequiresPrepay || club.prepayRequired || body.payChoice === 'online';
+  /* Еквайринг увімкнено, але платіжки не буде: ключі не заведені, токен не
+     розшифровується або mock вимкнено на проді. Бронь через це не втрачаємо —
+     так само, як реєстрацію на турнір (див. нижче по файлу). Гравець
+     записується з оплатою в клубі, адміністратор бачить несплачену бронь і
+     підтверджує її сам. Закритий клуб і зайнятий час далі блокують бронь як
+     раніше — мовчазний еквайринг не те саме, що зачинені двері. */
   const provider = club.prepayEnabled && wantsOnlinePay ? providerFor(club) : null;
-  if (club.prepayEnabled && wantsOnlinePay && priceTotal > 0 && !provider) {
-    return res.status(409).json({ error: 'ONLINE_PAYMENT_UNAVAILABLE' });
-  }
   const needsPay = Boolean(provider) && priceTotal > 0;
   const expiresAt = needsPay
     ? new Date(Date.now() + club.payHoldMinutes * 60_000)
@@ -988,13 +991,26 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
         customerToken,
       });
     } catch (e) {
-      // Рахунок не виставився — тримати слот немає підстав, віддаємо назад одразу.
+      /* Банк не відповів. Раніше бронь тут згорала — гравець, який усе
+         заповнив і натиснув «оплатити», лишався ні з чим через чужий
+         таймаут. Тримаємо заявку неоплаченою і без терміну утримання:
+         адміністратор передзвонить і візьме гроші в клубі — так само, як
+         за вибору «оплатити на місці». Час звільняє тільки закритий клуб
+         або відмова адміністратора, а не мовчазний еквайринг. */
       console.error('[booking] invoice failed', e);
       await prisma.booking.update({
         where: { id: booking.id },
-        data: { status: 'EXPIRED', expiresAt: null },
+        data: { expiresAt: null },
       }).catch(() => {});
-      return res.status(502).json({ error: 'PAYMENT_UNAVAILABLE' });
+      void notifyBooking({ bookingId: booking.id, event: 'created' });
+      return res.status(201).json({
+        id: booking.id,
+        status: 'PENDING',
+        cancelToken: booking.cancelToken,
+        priceTotal,
+        payUnavailable: true,
+        customerToken,
+      });
     }
   }
 
@@ -1161,9 +1177,6 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
          Реєстрацію через це не втрачаємо: місце оформлюється з оплатою
          в клубі, а модератор бачить внесок у картці учасника. */
       provider = pay.online ? providerFor(club) : null;
-      if (customer?.requiresPrepay && price > 0 && !provider) {
-        throw new HttpError(409, 'ONLINE_PAYMENT_UNAVAILABLE');
-      }
 
       const needsPay = Boolean(provider) && price > 0;
 
@@ -1255,13 +1268,28 @@ publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
       expiresAt: seat.expiresAt!.toISOString(),
     });
   } catch (e) {
-    // Рахунок не виставився — тримати місце немає підстав, віддаємо одразу.
+    /* Банк не відповів — але учасник уже записався, і віддавати його місце
+       через чужий таймаут немає за що. Лишаємо запис як оплату в клубі:
+       рівно те саме, що бачить гравець, який обрав «на місці». */
     console.error('[join] invoice failed', e);
     await prisma.bookingSeat.update({
       where: { id: seat.id },
-      data: { status: 'EXPIRED', expiresAt: null },
+      data: { status: 'BOOKED', expiresAt: null },
     }).catch(() => {});
-    return res.status(502).json({ error: 'PAYMENT_UNAVAILABLE' });
+    /* Виручку заняття нарощуємо тут, бо вебхука вже не буде: транзакція
+       вище пропустила інкремент, розраховуючи на оплату онлайн. */
+    await prisma.booking.update({
+      where: { id: group.id },
+      data: { priceTotal: { increment: price } },
+    }).catch(() => {});
+    void notifyBooking({ bookingId: group.id, seatId: seat.id, event: 'created' });
+    return res.status(201).json({
+      id: seat.id,
+      cancelToken: seat.cancelToken,
+      price,
+      status: 'BOOKED',
+      payUnavailable: true,
+    });
   }
 });
 

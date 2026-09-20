@@ -211,7 +211,9 @@ describe('POST /clubs/:slug/bookings/:id/join', () => {
     expect(res.body.error).toBe('CUSTOMER_BLOCKED');
   });
 
-  it('клієнт «тільки з передоплатою» не обходить оплату через турнір', async () => {
+  /* Еквайринг мовчить — платіжки не буде ні зараз, ні за хвилину. Відмова
+     означала б «цьому гравцеві ніколи», тож записуємо з оплатою в клубі. */
+  it('клієнта «тільки з передоплатою» записуємо, коли платіжки немає', async () => {
     prisma.club.findFirst.mockResolvedValue({
       ...CLUB, prepayEnabled: true, prepayRequired: false,
     });
@@ -219,9 +221,10 @@ describe('POST /clubs/:slug/bookings/:id/join', () => {
       id: 'c', isBlocked: false, requiresPrepay: true, discountPercent: 0,
     } as never);
     const res = await join({ payChoice: 'onsite' });
-    expect(res.status).toBe(409);
-    expect(res.body.error).toBe('ONLINE_PAYMENT_UNAVAILABLE');
-    expect(tx.bookingSeat.create).not.toHaveBeenCalled();
+    expect(res.status).toBe(201);
+    expect(tx.bookingSeat.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ status: 'BOOKED', expiresAt: null }),
+    });
   });
 
   it('невідомий клуб — 404', async () => {

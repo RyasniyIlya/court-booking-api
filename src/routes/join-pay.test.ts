@@ -23,7 +23,7 @@ const tx = {
 
 const prisma = {
   club: { findFirst: vi.fn() },
-  booking: { findMany: vi.fn(), findUnique: vi.fn() },
+  booking: { findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn() },
   block: { findFirst: vi.fn() },
   bookingSeat: { findMany: vi.fn(), findUnique: vi.fn(), update: vi.fn() },
   payment: { create: vi.fn() },
@@ -44,6 +44,8 @@ vi.mock('../lib/customers', () => ({
 }));
 
 vi.mock('../lib/billing', () => ({ clubBilling: () => ({ online: true }) }));
+
+vi.mock('../lib/notifyBooking', () => ({ notifyBooking: vi.fn() }));
 
 const createInvoice = vi.fn(async () => ({
   providerRef: 'inv-1',
@@ -106,6 +108,7 @@ beforeEach(() => {
   }));
   tx.booking.update.mockResolvedValue({});
   prisma.bookingSeat.update.mockResolvedValue({});
+  prisma.booking.update.mockResolvedValue({});
   prisma.payment.create.mockResolvedValue({});
   createInvoice.mockResolvedValue({ providerRef: 'inv-1', pageUrl: 'https://pay.test/inv-1' });
 });
@@ -167,14 +170,15 @@ describe('запис у групу з передоплатою', () => {
     expect(invoiceOrder).toBeGreaterThan(txOrder);
   });
 
-  it('банк не відповів — місце віддається назад, а не висить у PENDING', async () => {
+  it('банк не відповів — місце лишається за гравцем з оплатою в клубі', async () => {
     createInvoice.mockRejectedValue(new Error('банк лежить'));
     const res = await join();
-    expect(res.status).toBe(502);
-    expect(res.body.error).toBe('PAYMENT_UNAVAILABLE');
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe('BOOKED');
+    expect(res.body.payUnavailable).toBe(true);
     expect(prisma.bookingSeat.update).toHaveBeenCalledWith({
       where: { id: 'seat-1' },
-      data: { status: 'EXPIRED', expiresAt: null },
+      data: { status: 'BOOKED', expiresAt: null },
     });
   });
 

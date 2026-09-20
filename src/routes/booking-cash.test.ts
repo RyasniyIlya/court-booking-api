@@ -1,7 +1,8 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-const prisma = { club: { findFirst: vi.fn() }, block: { findFirst: vi.fn() }, customer: { findUnique: vi.fn() }, booking: { create: vi.fn() },
+const prisma = { club: { findFirst: vi.fn() }, block: { findFirst: vi.fn() }, customer: { findUnique: vi.fn() },
+  booking: { create: vi.fn(), update: vi.fn() }, payment: { create: vi.fn() },
   /* Бронь пишеться в транзакції разом із прокатом; без прокату це той самий create. */
   $transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(prisma)) };
 const providerFor = vi.fn(() => null);
@@ -25,17 +26,22 @@ beforeEach(() => {
   prisma.block.findFirst.mockResolvedValue(null);
   prisma.customer.findUnique.mockResolvedValue(null);
   prisma.booking.create.mockImplementation(async ({ data }) => ({ ...data, id: 'booking', cancelToken: 'cancel' }));
+  prisma.booking.update.mockResolvedValue({});
+  prisma.payment.create.mockResolvedValue({});
+  providerFor.mockReturnValue(null);
   vi.mocked(findOrCreateCustomer).mockResolvedValue(null);
 });
-it('requires online prepayment for a restricted customer', async () => {
+/* Еквайринг мовчить — оплатити онлайн неможливо в принципі, тож відмова
+   означала б «ніколи». Бронь лишається неоплаченою і чекає адміністратора. */
+it('клієнта «тільки з передоплатою» не лишає без броні, коли платити нічим', async () => {
   vi.mocked(findOrCreateCustomer).mockResolvedValue({
     id: 'customer', isBlocked: false, requiresPrepay: true, discountPercent: 0,
     birthDate: new Date('1990-01-01T00:00:00.000Z'),
   } as never);
   const res = await book('onsite');
-  expect(res.status).toBe(409);
-  expect(res.body.error).toBe('ONLINE_PAYMENT_UNAVAILABLE');
-  expect(prisma.booking.create).not.toHaveBeenCalled();
+  expect(res.status).toBe(201);
+  expect(res.body.status).toBe('PENDING');
+  expect(prisma.booking.create).toHaveBeenCalledWith({ data: expect.objectContaining({ status: 'PENDING', expiresAt: null }) });
 });
 const book = (payChoice: string) => request(app).post('/clubs/demo/bookings').send({ courtId, payChoice,
   start: '2030-01-01T10:00:00Z', end: '2030-01-01T11:00:00Z', customerName: 'Player', customerPhone: '+380671112233', birthDate: '1990-01-01' });
@@ -47,9 +53,28 @@ it('holds a cash booking for administrator review even when online payments are 
   expect(prisma.booking.create).toHaveBeenCalledWith({ data: expect.objectContaining({ status: 'PENDING', expiresAt: null, courtId }) });
   expect(notifyBooking).toHaveBeenCalled();
 });
-it('reports unavailable online payment without pretending a booking was created', async () => {
+it('обрана онлайн-оплата при мовчазному еквайрингу не скасовує бронь', async () => {
   const res = await book('online');
-  expect(res.status).toBe(409);
-  expect(res.body.error).toBe('ONLINE_PAYMENT_UNAVAILABLE');
-  expect(prisma.booking.create).not.toHaveBeenCalled();
+  expect(res.status).toBe(201);
+  expect(res.body.status).toBe('PENDING');
+  expect(prisma.booking.create).toHaveBeenCalledWith({ data: expect.objectContaining({ status: 'PENDING', expiresAt: null }) });
+  expect(notifyBooking).toHaveBeenCalled();
+});
+
+/* Банк мовчить уже після того, як гравець натиснув «оплатити». Раніше
+   бронь тут згорала в EXPIRED — людина лишалась без часу через чужий
+   таймаут. Тепер заявка чекає адміністратора, як і будь-яка неоплачена. */
+it('банк не виставив рахунок — бронь лишається заявкою, а не згорає', async () => {
+  providerFor.mockReturnValue({
+    name: 'mock',
+    createInvoice: vi.fn(async () => { throw new Error('банк лежить'); }),
+  } as never);
+  const res = await book('online');
+  expect(res.status).toBe(201);
+  expect(res.body.status).toBe('PENDING');
+  expect(res.body.payUnavailable).toBe(true);
+  expect(prisma.booking.update).toHaveBeenCalledWith({
+    where: { id: 'booking' }, data: { expiresAt: null },
+  });
+  expect(notifyBooking).toHaveBeenCalled();
 });
