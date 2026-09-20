@@ -571,6 +571,20 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
     return;
   }
 
+  /* Підбір партнерів із віджета: t.me/<бот>?start=games. Гравець приходить
+     сюди вже з наміром, тому показуємо ігри одразу, а не меню. Якщо чат ще
+     не привʼязаний до картки — пропонуємо вхід, бо без картки ми не знаємо
+     ні клубу, ні рівня, а показати «всі ігри світу» гірше, ніж нічого. */
+  if (cmd === '/start' && args[0] === 'games') {
+    if (msg.chat.type !== 'private') {
+      await sendMessage(chatId, 'Підбір гри працює тільки в особистому чаті з ботом.');
+      return;
+    }
+    if (await handlePlayerCommand(chatId, '/games', [])) return;
+    await playerLoginClubChoice(chatId);
+    return;
+  }
+
   const startClub = cmd === '/start' ? slugFromStartPayload(args[0]) : null;
   if (startClub) {
     if (!await showBookingClub(chatId, startClub)) {

@@ -20,14 +20,33 @@ export function slugFromStartPayload(payload: string | undefined): string | null
   return /^[a-z0-9][a-z0-9-]{1,47}$/.test(slug) ? slug : null;
 }
 
+/**
+ * Мітка, з якою бот веде людину на сторінку запису.
+ *
+ * Бот сам броней не створює — він дає посилання. Тому єдиний спосіб
+ * побачити у звіті, скільки записів приніс бот, — позначити це посилання
+ * так само, як клуб позначає рекламне. Без мітки такі броні зливаються з
+ * прямими заходами, і питання «чи потрібен нам бот» лишається без
+ * відповіді в цифрах.
+ *
+ * medium саме `messaging`, а не `cpc`: бот нічого не коштує за клік, і
+ * записати його у витрати на рекламу означало б зіпсувати єдине число,
+ * заради якого весь облік джерел і робиться.
+ */
+const BOT_TAGS = 'utm_source=telegram&utm_medium=messaging&utm_campaign=bot';
+
 export function bookingUrl(slug: string, env: NodeJS.ProcessEnv = process.env): string | null {
   const base = publicWebBase(env);
-  return base ? `${base}/c/${encodeURIComponent(slug)}` : null;
+  return base ? `${base}/c/${encodeURIComponent(slug)}?${BOT_TAGS}` : null;
 }
 
 export function profileUrl(slug: string, env: NodeJS.ProcessEnv = process.env): string | null {
-  const base = bookingUrl(slug, env);
-  return base ? `${base}?cbProfile=1` : null;
+  /* Будуємо від publicWebBase, а не від bookingUrl: інакше мітки бота
+     приклеїлися б двічі — один раз звідти, другий раз тут. */
+  const base = publicWebBase(env);
+  return base
+    ? `${base}/c/${encodeURIComponent(slug)}?cbProfile=1&${BOT_TAGS}`
+    : null;
 }
 
 export function clubChoiceKeyboard(clubs: BookingClub[]) {

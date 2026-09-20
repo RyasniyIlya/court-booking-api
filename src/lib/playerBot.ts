@@ -387,6 +387,21 @@ export async function handlePlayerCommand(chatId: string, cmd: string, args: str
     return true;
   }
 
+  /* Підбір партнерів. Живе в чаті, а не у віджеті: пошук «з ким зіграти»
+     тягнеться днями, і перевіряти вкладку заради нього ніхто не буде. */
+  if (cmd === '/games') {
+    const customers = await prisma.customer.findMany({
+      where: { telegramChatId: chatId },
+      select: { id: true },
+    });
+    if (customers.length === 0) return false;
+    /* Імпорт на місці, а не зверху: openMatchBot бере звідси підписи часу
+       й посилання на день, тож статичний імпорт замкнув би коло. */
+    const { sendMatches } = await import('./openMatchBot.js');
+    await sendMatches(chatId);
+    return true;
+  }
+
   if (cmd === '/stop') {
     const customers = await prisma.customer.findMany({
       where: { telegramChatId: chatId },

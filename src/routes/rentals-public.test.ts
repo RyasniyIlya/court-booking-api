@@ -76,7 +76,7 @@ describe('POST /clubs/:slug/bookings з прокатом', () => {
     expect(data.rentalTotal).toBe(40_000);
     expect(data.rentals.create).toEqual([{
       clubId: 'club', itemId: ITEM, itemName: 'Ракетка Wilson',
-      quantity: 2, mode: 'HOURLY', unitPrice: 10_000, amount: 40_000,
+      quantity: 2, mode: 'HOURLY', unitPrice: 10_000, amount: 40_000, returnable: true,
     }]);
     expect(prisma.$queryRaw).toHaveBeenCalledOnce();
   });

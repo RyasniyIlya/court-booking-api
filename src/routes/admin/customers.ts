@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
+import { SKILL_LEVELS } from '../../lib/openMatch';
 import { isSearchableTail } from '../../lib/phone';
 import { getActivePass, getActivePasses } from '../../lib/customers';
 import { requireAuth, requireStaff, requireRole, param } from './shared';
@@ -548,12 +549,16 @@ customersRouter.patch(
         requiresPrepay: z.boolean().optional(),
         birthDate: birthDateText.nullable().optional(),
         discountPercent: z.number().int().min(0).max(90).optional(),
+        /* Ігровий рівень: його питають на ресепшені один раз, а далі він
+           вирішує, кого кликати у відкриті ігри. nullable — рівень можна
+           й зняти, якщо поставили навмання. */
+        skillLevel: z.enum(SKILL_LEVELS).nullable().optional(),
       })
       .safeParse(req.body);
     if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
     const d = parsed.data;
-    if (d.tags === undefined && d.note === undefined && d.isBlocked === undefined && d.requiresPrepay === undefined && d.birthDate === undefined && d.discountPercent === undefined) {
+    if (d.tags === undefined && d.note === undefined && d.isBlocked === undefined && d.requiresPrepay === undefined && d.birthDate === undefined && d.discountPercent === undefined && d.skillLevel === undefined) {
       return res.status(400).json({ error: 'NOTHING_TO_UPDATE' });
     }
 
@@ -572,6 +577,7 @@ customersRouter.patch(
         ...(d.requiresPrepay !== undefined ? { requiresPrepay: d.requiresPrepay } : {}),
         ...(d.birthDate !== undefined ? { birthDate: d.birthDate ? birthDateValue(d.birthDate) : null } : {}),
         ...(d.discountPercent !== undefined ? { discountPercent: d.discountPercent } : {}),
+        ...(d.skillLevel !== undefined ? { skillLevel: d.skillLevel } : {}),
       },
     });
     if (count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
@@ -579,7 +585,7 @@ customersRouter.patch(
     const customer = await prisma.customer.findUnique({
       where: { id: id.data },
       select: { id: true, name: true, phone: true, tags: true, note: true, isBlocked: true, requiresPrepay: true,
-        birthDate: true, discountPercent: true, bonusBalance: true },
+        birthDate: true, discountPercent: true, bonusBalance: true, skillLevel: true },
     });
     res.json(customer && { ...customer, birthDate: dateOnly(customer.birthDate) });
   },

@@ -1,6 +1,12 @@
 import { Router } from 'express';
 import { canReschedule } from '../lib/reschedule';
 import { z } from 'zod';
+import {
+  bookingAttribution,
+  customerFirstTouch,
+  readAttribution,
+  shouldSetFirstTouch,
+} from '../lib/attribution';
 import rateLimit from 'express-rate-limit';
 import { DateTime } from 'luxon';
 import { prisma, isSlotTakenError } from '../lib/db';
@@ -25,6 +31,7 @@ import { botReady } from '../lib/telegram';
 import { planFeatures } from '../lib/plans';
 import { createPlayerLinkCode, PLAYER_LINK_MINUTES, playerStartPayload, unlinkPlayers } from '../lib/playerBot';
 import { joinWaitlist, type JoinError } from '../lib/waitlist';
+import { bandLabel } from '../lib/openMatch';
 import { TelegramMiniAppDataError, verifyTelegramMiniAppData } from '../lib/telegramMiniApp';
 import {
   RentalError, listRentables, loadOccupancy, lockRentableItems, previewRentals, rentalCreateData, reserveRentals,
@@ -485,6 +492,11 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
         title: true,
         pricePerSeat: true,
         paymentPlan: true,
+        /* Відкрита гра — та сама група, але гравцю вона про інше: не
+           «заняття з тренером», а «люди шукають партнерів на ваш рівень». */
+        isOpenMatch: true,
+        levelMin: true,
+        levelMax: true,
         trainer: { select: { name: true } },
         /* PENDING рахується зайнятим нарівні з BOOKED: місце під оплатою
            вже не вільне, і показувати його як вільне означало б вести
@@ -612,6 +624,10 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
             endLabel: DateTime.fromJSDate(g.endTime)
               .setZone(club.timezone).toFormat('HH:mm'),
             startsHere: g.startTime.getTime() === sMs,
+            /* Рівень підписуємо падельною шкалою, а не літерою з
+               підкресленням: «C+ · 3.0–3.5» гравець читає, «C_PLUS» — ні. */
+            isOpenMatch: g.isOpenMatch,
+            levelLabel: g.isOpenMatch ? bandLabel(g.levelMin, g.levelMax) : null,
             registrationOpen: isRegistrationOpen(g.startTime, now.getTime()),
             registrationClosesAt: registrationClosesAt(g.startTime).toISOString(),
           },
@@ -646,6 +662,18 @@ const bookingSchema = z.object({
    */
   payChoice: z.enum(['online', 'onsite']).optional(),
   birthDate: birthDateText,
+  /**
+   * Звідки прийшов гравець: мітки з посилання і домен переходу.
+   *
+   * Усе необовʼязкове й усе перевіряється сервером. Зведений канал тут НЕ
+   * приймається навмисно — його рахує lib/attribution.ts. Інакше будь-хто
+   * підписав би свою бронь «реклама», і звіт про окупність реклами став
+   * би тим, що напишуть у запиті.
+   */
+  utmSource: z.string().trim().max(200).optional(),
+  utmMedium: z.string().trim().max(200).optional(),
+  utmCampaign: z.string().trim().max(200).optional(),
+  referrer: z.string().trim().max(500).optional(),
   /** Прокат до броні. Вибір = гарантія: залишок резервується разом зі слотом. */
   rentals: z.array(z.object({
     itemId: z.string().uuid(),
@@ -828,6 +856,48 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     ? new Date(Date.now() + club.payHoldMinutes * 60_000)
     : null;
 
+  /* Джерело рахуємо тут, до транзакції: воно ні на що не впливає в
+     розрахунках, і тримати його всередині замку сенсу немає.
+
+     Власним вважаємо той домен, на якому стоїть сам віджет, — беремо його
+     з Origin запиту. Клуб окремого поля з адресою сайту не має, та воно й
+     не потрібне: віджет можуть вбудувати на будь-яку сторінку клубу, і
+     «свій» тут означає саме «та сторінка, з якої натиснули бронювати».
+     Без цієї перевірки кожен другий запис отримав би канал «чужі сайти»
+     від переходу з головної на сторінку корту. */
+  const ownHost = (() => {
+    try {
+      return req.headers.origin ? new URL(req.headers.origin).hostname : null;
+    } catch {
+      return null;
+    }
+  })();
+  const attributionRaw = readAttribution(body, {
+    bookingSource: 'WIDGET',
+    own: ownHost,
+  });
+  const attribution = bookingAttribution(attributionRaw);
+
+  /* Перший дотик — рівно один раз, коли в картці ще порожньо.
+     `firstChannel: null` в умові, а не тільки перевірка вище: між читанням
+     картки й цим записом могла пройти паралельна бронь тієї ж людини.
+
+     Помилку ковтаємо свідомо, і саме try/catch, а не `.catch()`: якщо
+     виклик кине синхронно, проміс не створиться і `.catch()` до нього не
+     доживе — тоді вся бронь падала б із 500 через незаписану рекламну
+     мітку. Не дізнатись, звідки прийшов клієнт, прикро; не дати людині
+     забронювати корт — гірше. */
+  if (customer && shouldSetFirstTouch(customer)) {
+    try {
+      await prisma.customer.updateMany({
+        where: { id: customer.id, clubId: club.id, firstChannel: null },
+        data: customerFirstTouch(attributionRaw),
+      });
+    } catch (e) {
+      console.warn('[attribution] first touch', (e as Error)?.message);
+    }
+  }
+
   let booking;
   try {
     // Гонку за корт ловить EXCLUDE USING gist у БД. Гонку за ракетки —
@@ -869,6 +939,7 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
           status: priceTotal > 0 ? 'PENDING' : (club.autoConfirm ? 'CONFIRMED' : 'PENDING'),
           expiresAt,
           source: 'WIDGET',
+          ...attribution,
         },
       });
     });
@@ -1718,6 +1789,13 @@ publicRouter.get('/customer/me', async (req, res) => {
     telegram: {
       available: playerTelegramReady(club?.plan),
       connected: Boolean(customer.telegramChatId),
+      /* Пряме посилання на підбір партнерів. Сам підбір живе в чаті:
+         пошук «з ким зіграти» тягнеться днями, і сидіти заради нього у
+         вкладці ніхто не буде, а бот напише сам. Payload `games` відкриває
+         список ігор одразу, без блукання по меню. */
+      gamesUrl: playerTelegramReady(club?.plan) && customer.telegramChatId
+        ? `https://t.me/${process.env.TELEGRAM_BOT_USERNAME}?start=games`
+        : null,
     },
     waitlist: waitlist.map((w) => ({
       id: w.id,

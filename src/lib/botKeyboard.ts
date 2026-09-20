@@ -42,6 +42,7 @@ const BTN_SETTINGS = '⚙️ Сповіщення';
 const BY_LABEL: Record<string, string> = {
   '🎾 Забронювати': '/book',
   '📋 Мої записи': '/my',
+  '🤝 Знайти гру': '/games',
   '👤 Мій профіль': '/profile',
   '👤 Увійти в профіль': '/profile',
   '🚪 Вийти з профілю': '/stop',
@@ -65,6 +66,9 @@ export function playerKeyboard() {
   return {
     keyboard: [
       [{ text: '🎾 Забронювати' }, { text: '📋 Мої записи' }],
+      /* Підбір партнерів поруч із бронюванням: це два способи опинитись
+         на корті, і другий потрібен саме тим, кому нема з ким грати. */
+      [{ text: '🤝 Знайти гру' }],
       [{ text: '👤 Мій профіль' }, { text: '🚪 Вийти з профілю' }],
     ],
     resize_keyboard: true,
@@ -219,6 +223,7 @@ const COMMANDS_TRAINER = [
 export const COMMANDS_GUEST = [
   { command: 'book', description: 'Забронювати корт' },
   { command: 'my', description: 'Мої записи' },
+  { command: 'games', description: 'Знайти гру: хто шукає партнерів' },
   { command: 'profile', description: 'Увійти в профіль гравця' },
   { command: 'login', description: 'Увійти: /login пошта пароль' },
   { command: 'help', description: 'Що я вмію' },

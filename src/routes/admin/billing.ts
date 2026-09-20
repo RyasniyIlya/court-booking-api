@@ -42,6 +42,25 @@ billingRouter.get(
     const info =
       clubBilling(club);
 
+    /* Каталог планів — щоб кабінет показав усі тарифи, а не лише свій.
+       Тільки активні: знятий з продажу план лишається у клуба, якому вже
+       призначений (він приходить окремо в `plan`), але пропонувати його
+       іншим нема сенсу. Порядок той самий, що й у платформи, інакше клуб
+       і оператор бачили б різні списки. */
+    const plans =
+      await prisma.plan.findMany({
+        where: {
+          isActive: true,
+        },
+
+        orderBy: [
+          { sortOrder: 'asc' },
+          { tier: 'asc' },
+        ],
+
+        select: PLAN_SELECT,
+      });
+
     const invoices =
       await prisma.clubInvoice.findMany({
         where: {
@@ -117,6 +136,11 @@ billingRouter.get(
               customPrice: club.planPrice !== null,
             }
           : null,
+      /* Каталог цілком. Ціну клубу сюди НЕ підставляємо: тут каталожна
+         ціна, а індивідуальна домовленість видна в `plan.price` вище.
+         Інакше власна знижка розповзлася б на чужі тарифи. */
+      plans,
+
       features:
         planFeatures(club.plan),
 

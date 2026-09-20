@@ -13,6 +13,8 @@ import { diffFields, moveChange, recordChanges } from '../../lib/changeLog';
 import { notifyBooking, notifySeriesCancelled } from '../../lib/notifyBooking';
 import { isRegistrationOpen } from '../../lib/registrationCutoff';
 import { paymentStatusPatch } from '../../lib/bookingPaymentStatus';
+import { OPEN_MATCH_TITLE, SKILL_LEVELS } from '../../lib/openMatch';
+import { inviteMatch } from '../../lib/openMatchInvite';
 import { courtPriceWithPromos, type CourtPriceResult } from '../../lib/promo';
 import {
   RentalError, loadOccupancy, lockRentableItems, previewRentals, recalcRentalsForMove,
@@ -345,6 +347,22 @@ bookingsRouter.post(
           .max(100_000_000)
           .optional(),
 
+        /* ── Відкрита гра ───────────────────────────────────────────────
+           Те саме групове заняття, тільки без тренера й без назви
+           заняття: гравцям бракує партнерів на свій рівень. Рівень
+           необовʼязковий — гра без нього видима всім. */
+        isOpenMatch: z
+          .boolean()
+          .default(false),
+
+        levelMin: z
+          .enum(SKILL_LEVELS)
+          .nullish(),
+
+        levelMax: z
+          .enum(SKILL_LEVELS)
+          .nullish(),
+
         /* Прокат — лише для приватної броні. Ручна priceTotal вище — це
            ціна корту й тренера; прокат додається до неї зверху, щоб
            rentalTotal лишався рівно сумою рядків. */
@@ -359,8 +377,29 @@ bookingsRouter.post(
       /* Дзеркалить CHECK booking_private_or_group у базі. Тут — щоб
          віддати зрозумілу помилку замість 500 від констрейнта. */
       .superRefine((d, ctx) => {
+        /* Відкрита гра — це група: без місць до неї нема куди записатись.
+           Дзеркалить CHECK booking_open_match_is_group. */
+        if (d.isOpenMatch && d.capacity == null) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['capacity'],
+            message: 'Відкрита гра без місць',
+          });
+        }
+
+        /* Діапазон навпаки («від B+ до C») мовчки не перевертаємо: це не
+           одруківка, а незрозуміло чого хотів адміністратор. */
+        if (d.levelMin && d.levelMax && SKILL_LEVELS.indexOf(d.levelMin) > SKILL_LEVELS.indexOf(d.levelMax)) {
+          ctx.addIssue({
+            code: 'custom',
+            path: ['levelMax'],
+            message: 'Рівень «від» вищий за «до»',
+          });
+        }
+
         if (d.capacity != null) {
-          if (!d.title) {
+          /* У відкритої гри назва своя: заняття немає, є година й рівень. */
+          if (!d.title && !d.isOpenMatch) {
             ctx.addIssue({
               code: 'custom',
               path: ['title'],
@@ -568,8 +607,11 @@ bookingsRouter.post(
                 : (phone?.e164 ?? ''),
               capacity: d.capacity ?? null,
               title: isGroup
-                ? d.title!
+                ? (d.title ?? OPEN_MATCH_TITLE)
                 : null,
+              isOpenMatch: d.isOpenMatch,
+              levelMin: d.levelMin ?? null,
+              levelMax: d.levelMax ?? null,
               pricePerSeat: isGroup
                 ? (d.pricePerSeat ?? 0)
                 : null,
@@ -626,8 +668,20 @@ bookingsRouter.post(
         skipClubChat: true,
       });
 
+      /* Відкрита гра без запрошень — просто порожня година в розкладі.
+         Кличемо одразу і чекаємо на результат: кабінет показує список
+         «кого покликали й чому» тим самим екраном, інакше «ми когось
+         повідомили» доводиться брати на віру. Збій розсилки саму гру не
+         скасовує — бронь уже створена й корт зайнятий. */
+      const invited = booking.isOpenMatch
+        ? await inviteMatch(booking.id).catch((e) => {
+            console.error('[open-match] запрошення не розіслані', booking.id, e);
+            return [];
+          })
+        : [];
+
       res.status(201).json(
-        booking,
+        booking.isOpenMatch ? { ...booking, invited } : booking,
       );
     } catch (e) {
       if (isSlotTakenError(e)) {

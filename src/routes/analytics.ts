@@ -6,6 +6,19 @@ import { requireAuth, requireRole, requireFeature } from './admin';
 import { buildLoadProfile } from '../lib/loadProfile';
 import { bookingFunnel, retentionFromVisits, roundPct, type FunnelBooking } from '../lib/deepAnalytics';
 import { dateOnly, daysUntilBirthday } from '../lib/birthday';
+import { recordChanges } from '../lib/changeLog';
+import {
+  loadRoster,
+  rosterCsv,
+  rosterFileName,
+  rosterWorkbookSheets,
+  tierCounts,
+  TIER_ACTIVE_DAYS,
+  TIER_FADING_DAYS,
+  type ExportMeta,
+  type RosterRow,
+} from '../lib/customerRoster';
+import { buildWorkbook, XLSX_CONTENT_TYPE } from '../lib/xlsx';
 
 /**
  * CRM-аналітика кабінету. Окремий файл, а не ще один розділ
@@ -808,66 +821,288 @@ analyticsRouter.delete('/expenses/:id', async (req, res) => {
 /* КАРТОТЕКА КЛІЄНТІВ                                                         */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Межі сегментів у днях від останнього відвідування.
- *
- * Не налаштування клубу — свідомо. Три сегменти мають означати те саме в
- * усіх клубах, інакше «згасає» в одному дорівнює «активний» в іншому, і
- * будь-яка розмова про цифри між нами й клубом розсипається. Якщо колись
- * попросять — це два поля в Club, але починати з них зарано.
+/*
+ * Межі сегментів, tierOf і сам збирач картотеки переїхали в
+ * lib/customerRoster.ts: тепер екран і вивантаження рахують одне й те саме
+ * одним кодом. Реекспорт лишається, бо на `tierOf` із цього модуля
+ * посилаються тести політик — правила сегментації описані саме там.
  */
-const TIER_ACTIVE_DAYS = 30;
-const TIER_FADING_DAYS = 90;
+export {
+  tierOf,
+  TIER_ACTIVE_DAYS,
+  TIER_FADING_DAYS,
+  TIER_NEW_VISITS,
+  type CustomerTier,
+} from '../lib/customerRoster';
 
 /**
- * Скільки перших відвідувань людина ще вважається новачком.
+ * GET /api/admin/analytics/traffic?period=week|month|custom
  *
- * Раніше новачком був тільки той, хто записався і НЕ БУВ ЖОДНОГО РАЗУ, —
- * тобто сегмент зникав рівно тоді, коли з людиною вперше можна поговорити
- * про клуб. А новачок — це не «нуль візитів», це той, хто ще не вирішив,
- * лишається він чи ні: його зустрічають, запамʼятовують імʼя, питають, як
- * пішло. Пʼять занять — це приблизно місяць-півтора занять раз на тиждень,
- * рівно той строк, за який людина або стає постійною, або зникає.
+ * Звідки приходять броні й клієнти.
  *
- * Число тут, а не в налаштуваннях клубу, — з тієї ж причини, що й межі в
- * днях: сегмент має означати те саме всюди.
+ * ── Два різні питання в одній відповіді ──────────────────────────────────
+ *
+ * `channels` — останній дотик: що спрацювало на броні цього періоду. Це
+ * відповідь на «чи окупається реклама просто зараз».
+ *
+ * `acquisition` — перший дотик: що привело в клуб людей, чиї картки
+ * заведені в цьому періоді. Відповідь на «звідки беруться нові».
+ *
+ * Плутати їх не можна. Постійний гравець, який сьогодні зайшов із
+ * закладки, дає «прямий захід» у першому звіті — але клуб його колись
+ * привів Instagram, і саме це видно в другому.
+ *
+ * ── Про «невідомо» ───────────────────────────────────────────────────────
+ *
+ * Броні, створені до появи обліку, мають порожній канал. Вони йдуть
+ * окремим рядком `unknown`, а не розкидаються по каналах і не ховаються:
+ * інакше перший же звіт показав би, що 100% трафіку — «прямі заходи»,
+ * і клуб зробив би з цього неправильний висновок про рекламу.
  */
-const TIER_NEW_VISITS = 5;
+analyticsRouter.get('/traffic', async (req, res) => {
+  const parsed = periodQuery.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
-export type CustomerTier = 'ACTIVE' | 'FADING' | 'LOST' | 'NEW';
+  const club = await prisma.club.findUnique({
+    where: { id: req.auth!.clubId },
+    select: { timezone: true },
+  });
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
 
-/**
- * До якого сегмента належить клієнт.
- *
- * NEW окремо від LOST: людина, яка записалась учора, і людина, яка зникла
- * пів року тому, — це різні розмови. Перших зустрічають, других повертають.
- *
- * ── Чому новачок живе всередині «ходить», а не поруч ─────────────────────
- *
- * Спочатку рахуємо, чи людина взагалі ходить, і лише потім — чи вона ще
- * новачок. Тобто той, у кого три візити, але останній був три місяці тому,
- * це FADING, а не NEW.
- *
- * Інакше сегменти почали б брехати саме там, де вони найпотрібніші:
- * новачок, який сходив двічі й пропав, — це найважливіший дзвінок у всій
- * картотеці, а лишившись у «новачках» він виглядав би як людина, яку
- * просто ще не встигли зустріти.
- */
-export function tierOf(
-  lastVisit: Date | null,
-  firstSeen: Date,
-  now: Date,
-  visits = 0,
-): CustomerTier {
-  if (!lastVisit) {
-    const daysKnown = (now.getTime() - firstSeen.getTime()) / 86_400_000;
-    return daysKnown <= TIER_ACTIVE_DAYS ? 'NEW' : 'LOST';
+  const bounds = periodBounds(parsed.data, club.timezone, DateTime.now());
+  if (!bounds) return res.status(400).json({ error: 'BAD_PERIOD' });
+  const { current } = bounds;
+  const clubId = req.auth!.clubId;
+
+  const [bookings, customers] = await Promise.all([
+    prisma.booking.findMany({
+      where: {
+        clubId,
+        status: 'CONFIRMED',
+        startTime: { gte: current.start, lte: current.end },
+      },
+      select: {
+        trafficChannel: true, utmSource: true, utmMedium: true,
+        utmCampaign: true, referrerHost: true, priceTotal: true, customerId: true,
+      },
+    }),
+    prisma.customer.findMany({
+      where: { clubId, createdAt: { gte: current.start, lte: current.end } },
+      select: { firstChannel: true, firstUtmSource: true, firstUtmCampaign: true },
+    }),
+  ]);
+
+  res.json({
+    range: { from: current.start.toISOString(), to: current.end.toISOString() },
+    channels: groupChannels(bookings),
+    acquisition: groupAcquisition(customers),
+    campaigns: groupCampaigns(bookings),
+    totals: {
+      bookings: bookings.length,
+      revenue: bookings.reduce((s, b) => s + b.priceTotal, 0),
+      newCustomers: customers.length,
+      /* Скільки записів узагалі без джерела. Клуб має бачити, на якій
+         частці даних побудований висновок, перш ніж на нього спиратися. */
+      unknown: bookings.filter((b) => !b.trafficChannel).length,
+    },
+  });
+});
+
+/** Броні за зведеним каналом: скільки, на скільки і від скількох людей. */
+function groupChannels(rows: {
+  trafficChannel: string | null; priceTotal: number; customerId: string | null;
+}[]) {
+  const acc = new Map<string, { bookings: number; revenue: number; customers: Set<string> }>();
+
+  for (const row of rows) {
+    const key = row.trafficChannel ?? 'UNKNOWN';
+    const cell = acc.get(key) ?? { bookings: 0, revenue: 0, customers: new Set<string>() };
+    cell.bookings += 1;
+    cell.revenue += row.priceTotal;
+    if (row.customerId) cell.customers.add(row.customerId);
+    acc.set(key, cell);
   }
-  const days = (now.getTime() - lastVisit.getTime()) / 86_400_000;
-  if (days > TIER_FADING_DAYS) return 'LOST';
-  if (days > TIER_ACTIVE_DAYS) return 'FADING';
-  return visits <= TIER_NEW_VISITS ? 'NEW' : 'ACTIVE';
+
+  return [...acc.entries()]
+    .map(([channel, cell]) => ({
+      channel,
+      bookings: cell.bookings,
+      revenue: cell.revenue,
+      customers: cell.customers.size,
+      /* Середній чек по каналу — головне число для порівняння: канал може
+         давати мало броней, але дорогих. */
+      avgCheck: cell.bookings ? Math.round(cell.revenue / cell.bookings) : 0,
+    }))
+    .sort((a, b) => b.revenue - a.revenue || b.bookings - a.bookings);
 }
+
+/** Нові картки за першим дотиком — що приводить людей у клуб. */
+function groupAcquisition(rows: { firstChannel: string | null; firstUtmSource: string | null }[]) {
+  const acc = new Map<string, number>();
+  for (const row of rows) {
+    const key = row.firstChannel ?? 'UNKNOWN';
+    acc.set(key, (acc.get(key) ?? 0) + 1);
+  }
+  return [...acc.entries()]
+    .map(([channel, customers]) => ({ channel, customers }))
+    .sort((a, b) => b.customers - a.customers);
+}
+
+/**
+ * Окремі кампанії — під ними й ухвалюють рішення «продовжити чи зупинити».
+ *
+ * Рядки без utm_campaign сюди не потрапляють: «без кампанії» — це не
+ * кампанія, і бачити її поруч із реальними означає щоразу відфільтровувати
+ * її очима.
+ */
+function groupCampaigns(rows: {
+  utmSource: string | null; utmCampaign: string | null; priceTotal: number;
+}[]) {
+  const acc = new Map<string, { source: string | null; bookings: number; revenue: number }>();
+
+  for (const row of rows) {
+    if (!row.utmCampaign) continue;
+    const key = `${row.utmSource ?? '—'}|${row.utmCampaign}`;
+    const cell = acc.get(key) ?? { source: row.utmSource, bookings: 0, revenue: 0 };
+    cell.bookings += 1;
+    cell.revenue += row.priceTotal;
+    acc.set(key, cell);
+  }
+
+  return [...acc.entries()]
+    .map(([key, cell]) => ({ campaign: key.split('|')[1], ...cell }))
+    .sort((a, b) => b.revenue - a.revenue)
+    .slice(0, 20);
+}
+
+/**
+ * Відбір картотеки — спільний для екрана і для вивантаження.
+ *
+ * Один і той самий набір параметрів навмисно: клуб фільтрує список на
+ * екрані, бачить потрібних людей і натискає «Завантажити». Якби фільтри
+ * розрізнялись, у файлі опинялись би не ті, кого щойно відібрали, — а це
+ * найгірше, що може зробити вивантаження.
+ */
+const rosterQuery = z.object({
+  tier: z.enum(['ACTIVE', 'FADING', 'LOST', 'NEW']).optional(),
+  tag: z.string().trim().min(1).max(40).optional(),
+  q: z.string().trim().min(1).max(40).optional(),
+});
+
+type RosterSort = 'visits' | 'spend' | 'recent' | 'name' | 'birthday';
+
+/** Порядок рядків. Мутує копію, а не вхідний масив. */
+function sortRoster(rows: RosterRow[], sort: RosterSort): RosterRow[] {
+  return [...rows].sort((a, b) => {
+    if (sort === 'visits') return b.visits - a.visits;
+    if (sort === 'spend') return b.spend - a.spend;
+    if (sort === 'name') return a.name.localeCompare(b.name, 'uk');
+    if (sort === 'birthday') return (a.daysUntilBirthday ?? 999) - (b.daysUntilBirthday ?? 999);
+    // recent: хто був найпізніше. Ті, хто не був жодного разу, — у кінці.
+    if (!a.lastVisit && !b.lastVisit) return 0;
+    if (!a.lastVisit) return 1;
+    if (!b.lastVisit) return -1;
+    return b.lastVisit.localeCompare(a.lastVisit);
+  });
+}
+
+/**
+ * GET /api/admin/analytics/customers/export?format=xlsx|csv
+ *
+ * Картотека клубу файлом: Excel або CSV, із тими самими фільтрами, що на
+ * екрані.
+ *
+ * ── Чому тільки OWNER ────────────────────────────────────────────────────
+ *
+ * Решта аналітики — агрегати: завантаження кортів, виручка, частки. Тут
+ * інше: імена, телефони й email усіх клієнтів одним файлом. Це і є та база,
+ * заради якої клуб платить за систему, і найцінніше, що з нього можна
+ * винести. Адміністратор працює з картками щодня — але поштучно, через
+ * пошук на ресепшені; винести всю базу може лише власник.
+ *
+ * Вивантаження пишеться в ChangeLog. Не для покарання, а тому що це єдина
+ * дія в кабінеті, після якої персональні дані клубу живуть поза системою:
+ * коли вони спливуть у конкурента, питання «хто і коли скачав» має мати
+ * відповідь.
+ *
+ * ── Про розмежування клубів ──────────────────────────────────────────────
+ *
+ * `clubId` береться лише з токена (`req.auth`) і ніколи з запиту. Тому
+ * параметра «вивантажити інший клуб» не існує в принципі, і його не можна
+ * підставити: база спільна, доступ — ні.
+ */
+analyticsRouter.get(
+  '/customers/export',
+  requireRole('OWNER'),
+  async (req, res) => {
+    const parsed = rosterQuery
+      .extend({
+        format: z.enum(['xlsx', 'csv']).default('xlsx'),
+        sort: z.enum(['visits', 'spend', 'recent', 'name', 'birthday']).default('name'),
+      })
+      .safeParse(req.query);
+    if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+    const { format, sort, tier, tag, q } = parsed.data;
+
+    /* Пошта в токені не лежить — беремо з картки користувача разом із
+       клубом. Потрібна саме для журналу: «хто скачав» має читатись через
+       рік, коли акаунт уже може не існувати. */
+    const [club, actor] = await Promise.all([
+      prisma.club.findUnique({
+        where: { id: req.auth!.clubId },
+        select: { name: true, timezone: true },
+      }),
+      prisma.user.findFirst({
+        where: { id: req.auth!.userId, clubId: req.auth!.clubId },
+        select: { email: true },
+      }),
+    ]);
+    if (!club || !actor) return res.status(404).json({ error: 'NOT_FOUND' });
+
+    const now = new Date();
+    const all = await loadRoster(req.auth!.clubId, { tag, q }, now);
+    const rows = sortRoster(tier ? all.filter((r) => r.tier === tier) : all, sort);
+
+    const meta: ExportMeta = {
+      clubName: club.name,
+      timezone: club.timezone,
+      now,
+      filter: { tier, tag, q },
+    };
+
+    /* Журнал пишемо до відправки файла: інакше запис, що впав, лишив би
+       вивантаження без сліду саме тоді, коли слід найпотрібніший. */
+    await recordChanges(
+      prisma,
+      { clubId: req.auth!.clubId, entity: 'CustomerExport', entityId: req.auth!.clubId },
+      { userId: req.auth!.userId, email: actor.email, role: req.auth!.role },
+      [{
+        field: 'export',
+        before: null,
+        after: { format, rows: rows.length, filter: meta.filter },
+      }],
+    );
+
+    const fileName = rosterFileName(meta, format);
+    /* filename* у RFC 5987 — щоб кирилиця в назві клубу доїхала до браузера
+       цілою; простий filename лишаємо запасним для старих клієнтів. */
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="customers.${format}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+    );
+    /* Картотека — персональні дані, а не сторінка каталогу: жодних кешів
+       по дорозі. */
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      return res.send(rosterCsv(rows, meta));
+    }
+
+    res.setHeader('Content-Type', XLSX_CONTENT_TYPE);
+    return res.send(buildWorkbook(rosterWorkbookSheets(rows, meta)));
+  },
+);
 
 /**
  * GET /api/admin/analytics/customers
@@ -889,11 +1124,8 @@ export function tierOf(
  * повертати того, хто був учора.
  */
 analyticsRouter.get('/customers', async (req, res) => {
-  const parsed = z
-    .object({
-      tier: z.enum(['ACTIVE', 'FADING', 'LOST', 'NEW']).optional(),
-      tag: z.string().trim().min(1).max(40).optional(),
-      q: z.string().trim().min(1).max(40).optional(),
+  const parsed = rosterQuery
+    .extend({
       sort: z.enum(['visits', 'spend', 'recent', 'name', 'birthday']).default('recent'),
       limit: z.coerce.number().int().min(1).max(500).default(100),
     })
@@ -901,121 +1133,14 @@ analyticsRouter.get('/customers', async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
   const { tier, tag, q, sort, limit } = parsed.data;
 
-  const clubId = req.auth!.clubId;
   const now = new Date();
-
-  /* Пошук: по імені завжди, по хвосту телефона — тільки коли в запиті є
-     цифри. Спершу тут при пошуку по літерах у OR підставлялось значення,
-     яке «свідомо не збігається» — і Postgres відхиляв ВЕСЬ запит
-     (22021: нульовий байт не є валідним UTF8), тобто пошук по імені не
-     працював зовсім. Тепер умову просто не додаємо, замість вигадування
-     значення, що не може збігтися. */
-  const digits = q ? q.replace(/[^0-9]/g, '').slice(-7) : '';
-  const search = q
-    ? [
-      { name: { contains: q, mode: 'insensitive' as const } },
-      { email: { contains: q, mode: 'insensitive' as const } },
-      ...(digits.length >= 3 ? [{ phoneTail: { endsWith: digits } }] : []),
-    ]
-    : null;
-
-  const customers = await prisma.customer.findMany({
-    where: {
-      clubId,
-      ...(tag ? { tags: { has: tag } } : {}),
-      ...(search ? { OR: search } : {}),
-    },
-    select: {
-      id: true, name: true, phone: true, note: true, tags: true,
-      email: true,
-      isBlocked: true, requiresPrepay: true, createdAt: true, telegramChatId: true,
-      birthDate: true, discountPercent: true, bonusBalance: true,
-    },
-  });
-  if (customers.length === 0) return res.json({ tiers: {}, customers: [] });
-
-  const ids = customers.map((c) => c.id);
-
-  /* Два джерела відвідувань. Скасовані не рахуються в жодному: людина
-     записалась і не прийшла — це не візит, і в статистику лояльності
-     він потрапляти не має. */
-  const [bookings, seats] = await Promise.all([
-    prisma.booking.findMany({
-      where: {
-        clubId,
-        customerId: { in: ids },
-        status: 'CONFIRMED',
-        startTime: { lte: now },
-      },
-      select: { customerId: true, priceTotal: true, startTime: true },
-    }),
-    prisma.bookingSeat.findMany({
-      where: {
-        customerId: { in: ids },
-        status: 'BOOKED',
-        booking: { clubId, status: 'CONFIRMED', startTime: { lte: now } },
-      },
-      select: { customerId: true, price: true, booking: { select: { startTime: true } } },
-    }),
-  ]);
-
-  type Row = { visits: number; spend: number; last: Date | null };
-  const stats = new Map<string, Row>();
-  const bump = (id: string, when: Date, money: number) => {
-    const r = stats.get(id) ?? { visits: 0, spend: 0, last: null };
-    r.visits += 1;
-    r.spend += money;
-    if (!r.last || when > r.last) r.last = when;
-    stats.set(id, r);
-  };
-
-  for (const b of bookings) bump(b.customerId!, b.startTime, b.priceTotal);
-  for (const s of seats) bump(s.customerId!, s.booking.startTime, s.price);
-
-  let rows = customers.map((c) => {
-    const r = stats.get(c.id) ?? { visits: 0, spend: 0, last: null };
-    return {
-      id: c.id,
-      name: c.name,
-      phone: c.phone,
-      email: c.email,
-      note: c.note,
-      tags: c.tags,
-      isBlocked: c.isBlocked,
-      requiresPrepay: c.requiresPrepay,
-      hasCabinet: Boolean(c.birthDate),
-      birthDate: dateOnly(c.birthDate),
-      daysUntilBirthday: daysUntilBirthday(c.birthDate, now),
-      discountPercent: c.discountPercent,
-      bonusBalance: c.bonusBalance,
-      since: c.createdAt.toISOString(),
-      visits: r.visits,
-      spend: r.spend,
-      lastVisit: r.last?.toISOString() ?? null,
-      tier: tierOf(r.last, c.createdAt, now, r.visits),
-    };
-  });
+  const all = await loadRoster(req.auth!.clubId, { tag, q }, now);
+  if (all.length === 0) return res.json({ tiers: {}, customers: [] });
 
   /* Підсумок по сегментах рахуємо ДО фільтра: клуб має бачити, скільки
      всього втрачених, навіть коли дивиться на активних. */
-  const tiers = rows.reduce<Record<string, number>>((acc, r) => {
-    acc[r.tier] = (acc[r.tier] ?? 0) + 1;
-    return acc;
-  }, {});
-
-  if (tier) rows = rows.filter((r) => r.tier === tier);
-
-  rows.sort((a, b) => {
-    if (sort === 'visits') return b.visits - a.visits;
-    if (sort === 'spend') return b.spend - a.spend;
-    if (sort === 'name') return a.name.localeCompare(b.name, 'uk');
-    if (sort === 'birthday') return (a.daysUntilBirthday ?? 999) - (b.daysUntilBirthday ?? 999);
-    // recent: хто був найпізніше. Ті, хто не був жодного разу, — у кінці.
-    if (!a.lastVisit && !b.lastVisit) return 0;
-    if (!a.lastVisit) return 1;
-    if (!b.lastVisit) return -1;
-    return b.lastVisit.localeCompare(a.lastVisit);
-  });
+  const tiers = tierCounts(all);
+  const rows = sortRoster(tier ? all.filter((r) => r.tier === tier) : all, sort);
 
   res.json({
     tiers,

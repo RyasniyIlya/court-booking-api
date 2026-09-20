@@ -11,12 +11,12 @@ const prisma = {
   user: { findUniqueOrThrow: vi.fn(async () => ({ email: 'admin@club.test' })) },
   $transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(prisma)),
 };
-const trimRentalsToFree = vi.fn();
+const recalcRentalsForMove = vi.fn();
 vi.mock('../../lib/db', () => ({ prisma, isSlotTakenError: () => false }));
 vi.mock('../../lib/notifyBooking', () => ({ notifyBooking: vi.fn(), notifySeriesCancelled: vi.fn() }));
 vi.mock('../../lib/rentalStore', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../../lib/rentalStore')>()),
-  trimRentalsToFree,
+  recalcRentalsForMove,
 }));
 vi.mock('./shared', () => ({
   requireAuth: (req: { auth?: unknown }, _res: unknown, next: () => void) => {
@@ -77,7 +77,7 @@ it('applies club promos, trainer and discount, and adds rentals on top undiscoun
     trainerId: TRAINER, trainerPrice: 10000, rentalTotal: 5000, promoNames: [], promoDiscount: 0,
     rentals: [{ id: 'line', itemId: 'racket', quantity: 1, amount: 5000 }],
   });
-  trimRentalsToFree.mockResolvedValue({ cuts: [], rentalTotal: 5000 });
+  recalcRentalsForMove.mockResolvedValue({ lines: [], shortages: [], rentalTotal: 5000, delta: 0 });
 
   const res = await move({ start: '2030-01-01T08:00:00Z', end: '2030-01-01T09:00:00Z' });
 
