@@ -173,6 +173,21 @@ customersRouter.post(
             .int()
             .min(0)
             .optional(),
+        /* Як заплатили. Потрібно касі й бухгалтеру: без цього продаж
+           абонемента в звіті — «не вказано». */
+        payMethod:
+          z.enum([
+            'CASH',
+            'CARD',
+            'TRANSFER',
+            'ONLINE',
+          ])
+            .optional(),
+        payAccount:
+          z.string()
+            .trim()
+            .max(150)
+            .default(''),
       })
       .safeParse(
         req.body,
@@ -335,6 +350,14 @@ customersRouter.post(
 
           price:
             terms.price,
+
+          /* Безкоштовний абонемент грошей не приносив — і способу оплати
+             в нього немає, хоч би що прийшло з форми. */
+          payMethod:
+            terms.price > 0 ? d.payMethod ?? null : null,
+
+          payAccount:
+            terms.price > 0 ? d.payAccount : '',
         },
       });
 

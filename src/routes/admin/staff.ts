@@ -63,7 +63,7 @@ staffRouter.post(
         email: z.string().trim().toLowerCase().email(),
         name: z.string().trim().min(2).max(80).optional(),
         password: z.string().min(8).max(128),
-        role: z.enum(['ADMIN', 'TRAINER']),
+        role: z.enum(['ADMIN', 'TRAINER', 'ACCOUNTANT']),
         trainerId: z.string().uuid().nullable().optional(),
       })
       .safeParse(req.body);
@@ -84,7 +84,7 @@ staffRouter.post(
       });
     }
 
-    if (parsed.data.role === 'ADMIN' && !parsed.data.name) {
+    if (parsed.data.role !== 'TRAINER' && !parsed.data.name) {
       return res.status(400).json({ error: 'NAME_REQUIRED' });
     }
 
@@ -96,6 +96,13 @@ staffRouter.post(
 
     if (parsed.data.role === 'TRAINER' && !await hasFeature(req.auth!.clubId, 'trainers')) {
       return res.status(402).json({ error: 'PLAN_REQUIRED', feature: 'trainers' });
+    }
+
+    /* Бухгалтер без «Аналітики» побачив би тільки 402 на кожному запиті
+       фінансів — акаунт без сенсу. Плани редагують без деплою, тому
+       перевіряємо базу, а не токен, як і всюди на цьому шляху. */
+    if (parsed.data.role === 'ACCOUNTANT' && !await hasFeature(req.auth!.clubId, 'analytics')) {
+      return res.status(402).json({ error: 'PLAN_REQUIRED', feature: 'analytics' });
     }
 
     if (parsed.data.trainerId) {

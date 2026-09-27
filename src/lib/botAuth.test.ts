@@ -1,5 +1,12 @@
-import { describe, it, expect, beforeEach } from 'vitest';
-import { clearFails, lockRemaining, noteFail, resetThrottle, menuFor } from './botAuth';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+
+const mocks = vi.hoisted(() => ({ findUnique: vi.fn(), updateMany: vi.fn(), update: vi.fn(), checkPassword: vi.fn() }));
+vi.mock('./db', () => ({
+  prisma: { user: { findUnique: mocks.findUnique, updateMany: mocks.updateMany, update: mocks.update } },
+}));
+vi.mock('./passwordCheck', () => ({ checkPassword: mocks.checkPassword }));
+
+import { clearFails, lockRemaining, loginByPassword, noteFail, resetThrottle, menuFor } from './botAuth';
 import { parseLogin } from './botHandlers';
 
 /**
@@ -80,5 +87,34 @@ describe('меню за роллю', () => {
 
   it('власник бачить', () => {
     expect(menuFor('OWNER')).toContain('/week');
+  });
+});
+
+describe('loginByPassword — бухгалтер у бота не заходить', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    resetThrottle();
+    mocks.checkPassword.mockResolvedValue({ ok: true });
+  });
+
+  it('правильний пароль, роль ACCOUNTANT — чат лишається невʼязаним', async () => {
+    mocks.findUnique.mockResolvedValue({
+      id: 'u1', role: 'ACCOUNTANT', passwordHash: 'hash',
+      club: { name: 'Клуб', plan: { tier: 3 } },
+    });
+    const reply = await loginByPassword('123', 'buh@club.test', 'correct-password');
+    expect(reply).toContain('тільки в кабінеті');
+    expect(mocks.update).not.toHaveBeenCalled();
+    expect(mocks.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('той самий пароль, роль OWNER — чат привʼязується як і раніше', async () => {
+    mocks.findUnique.mockResolvedValue({
+      id: 'u2', role: 'OWNER', passwordHash: 'hash',
+      club: { name: 'Клуб', plan: { tier: 3 } },
+    });
+    const reply = await loginByPassword('123', 'owner@club.test', 'correct-password');
+    expect(reply).toContain('Вхід виконано');
+    expect(mocks.update).toHaveBeenCalledWith(expect.objectContaining({ where: { id: 'u2' } }));
   });
 });

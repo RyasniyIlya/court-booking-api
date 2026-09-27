@@ -2,8 +2,10 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import { publicRouter } from './routes/public';
+import { assistantRouter } from './routes/assistant';
 import { adminRouter } from './routes/admin';
 import { analyticsRouter } from './routes/analytics';
+import { financeRouter } from './routes/finance';
 import { platformRouter } from './routes/platform';
 import { payRouter } from './routes/pay';
 import { startExpirySweeper } from './lib/expire';
@@ -72,8 +74,10 @@ app.use('/api/platform', cors({
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/public', publicRouter);
+app.use('/api/public', assistantRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/admin/analytics', analyticsRouter);
+app.use('/api/admin/finance', financeRouter);
 app.use('/api/platform', platformRouter);
 
 /**

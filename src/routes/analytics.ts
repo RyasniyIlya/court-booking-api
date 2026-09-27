@@ -4,6 +4,7 @@ import { DateTime } from 'luxon';
 import { prisma } from '../lib/db';
 import { requireAuth, requireRole, requireFeature } from './admin';
 import { buildLoadProfile } from '../lib/loadProfile';
+import { loadClubLoadProfile } from '../lib/clubLoad';
 import { bookingFunnel, retentionFromVisits, roundPct, type FunnelBooking } from '../lib/deepAnalytics';
 import { dateOnly, daysUntilBirthday } from '../lib/birthday';
 import { recordChanges } from '../lib/changeLog';
@@ -402,74 +403,18 @@ analyticsRouter.get('/load', async (req, res) => {
     .safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
-  const clubId = req.auth!.clubId;
+  const result = await loadClubLoadProfile(req.auth!.clubId, parsed.data.weeks, DateTime.now());
+  if (!result) return res.status(404).json({ error: 'NOT_FOUND' });
 
-  const club = await prisma.club.findUnique({
-    where: { id: clubId },
-    select: {
-      timezone: true,
-      createdAt: true,
-      hours: { select: { weekday: true, openMinute: true, closeMinute: true, isClosed: true } },
-    },
-  });
-  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
-
-  const weeks = parsed.data.weeks;
-  const anchor = DateTime.now().setZone(club.timezone).startOf('week');
-  const to = anchor.toJSDate();
-
-  /* Вікно не заходить за появу клубу: до реєстрації корти не могли
-     простоювати, і без цього обрізання клуб першого місяця бачив би
-     завантаження, поділене на неіснуючі тижні.
-
-     Того самого для окремого корту зробити не вийде: Court не зберігає
-     дати створення. Корт, доданий посеред вікна, перші тижні виглядатиме
-     недозавантаженим — це відоме обмеження, а не помилка розрахунку. */
-  const windowStart = anchor.minus({ weeks }).toJSDate();
-  const from = club.createdAt > windowStart ? club.createdAt : windowStart;
-
-  /* Броні й блокування беремо ПЕРЕТИНОМ з вікном, а не за startTime: заняття,
-     що почалось до опівночі понеділка й тягнеться в наш період, зайняло корт
-     так само, як будь-яке інше. */
-  const [courts, blocks, bookings] = await Promise.all([
-    prisma.court.findMany({
-      where: { clubId, isActive: true },
-      select: { id: true },
-    }),
-    prisma.block.findMany({
-      where: { clubId, startTime: { lt: to }, endTime: { gt: from } },
-      select: { courtId: true, startTime: true, endTime: true },
-    }),
-    prisma.booking.findMany({
-      where: {
-        clubId,
-        status: 'CONFIRMED',
-        startTime: { lt: to },
-        endTime: { gt: from },
-      },
-      select: { courtId: true, startTime: true, endTime: true, priceTotal: true },
-    }),
-  ]);
-
-  const profile = buildLoadProfile({
-    from, to, timezone: club.timezone, hours: club.hours, courts, blocks, bookings,
-  });
-
-  const range = { weeks, from: from.toISOString(), to: to.toISOString() };
+  const range = { weeks: result.window.weeks, from: result.window.from.toISOString(), to: result.window.to.toISOString() };
 
   /* Чесно кажемо «замало», а не малюємо графік по трьох бронях — той самий
      принцип, що в /forecast з NOT_ENOUGH_DATA. */
-  if (profile.totals.bookings < LOAD_MIN_BOOKINGS) {
-    return res.json({
-      available: false,
-      reason: 'NOT_ENOUGH_DATA',
-      ...range,
-      bookings: profile.totals.bookings,
-      needBookings: LOAD_MIN_BOOKINGS,
-    });
+  if (!result.available) {
+    return res.json({ available: false, reason: result.reason, ...range, bookings: result.bookings, needBookings: result.needBookings });
   }
 
-  res.json({ available: true, ...range, ...profile });
+  res.json({ available: true, ...range, ...result.profile });
 });
 
 /* -------------------------------------------------------------------------- */
@@ -773,7 +718,7 @@ analyticsRouter.get('/expenses', async (req, res) => {
 
 const addExpenseSchema = z.object({
   month: z.string().regex(/^\d{4}-\d{2}$/),
-  category: z.enum(['SALARY', 'RENT', 'BANK_FEE', 'UTILITIES', 'OTHER']),
+  category: z.enum(['SALARY', 'RENT', 'BANK_FEE', 'UTILITIES', 'MARKETING', 'EQUIPMENT', 'TAX', 'OTHER']),
   label: z.string().trim().min(1).max(120),
   /** Гривні з поля вводу, як і решта грошових полів у кабінеті — переводимо в копійки тут. */
   amountGrn: z.number().positive(),

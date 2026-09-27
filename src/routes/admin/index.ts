@@ -23,6 +23,8 @@ import { staffShiftsRouter } from './staff-shifts';
 import { promosRouter } from './promos';
 import { inventoryRouter } from './inventory';
 import { rentalsRouter } from './rentals';
+import { aiRouter } from './ai';
+import { requireAuth, blockAccountant } from './shared';
 
 /**
  * /api/admin — кабінет клубу, розрізаний по доменах замість одного
@@ -35,6 +37,14 @@ import { rentalsRouter } from './rentals';
 export const adminRouter = Router();
 
 adminRouter.use(authRouter);
+/*
+ * Бухгалтер (ACCOUNTANT) далі не проходить — усе нижче це бронювання,
+ * клієнти, персонал і клуб, а йому належать лише фінанси
+ * (окремий роутер, /api/admin/finance, монтується в src/index.ts).
+ * authRouter вище лишається доступним: /register, /login — публічні,
+ * /me й /password — самообслуговування, потрібне будь-якій ролі.
+ */
+adminRouter.use(requireAuth, blockAccountant);
 /* Пошук перед bookingsRouter: /bookings/search не має впасти в /bookings/:id. */
 adminRouter.use(bookingSearchRouter);
 adminRouter.use(bookingsRouter);
@@ -64,6 +74,7 @@ adminRouter.use(promosRouter);
    тримає свій express.raw на власному шляху. */
 adminRouter.use(inventoryRouter);
 adminRouter.use(rentalsRouter);
+adminRouter.use(aiRouter);
 
 // analytics.ts монтується окремо в index.ts (src/index.ts), але захищає
 // свої роути тим самим requireAuth/requireRole, що й кабінет.

@@ -59,16 +59,25 @@ export function analyticsMessages(clubName: string, range: string, timezone: str
   return pages.map((p, i) => `${p}\n\n<i>${i + 1} / ${pages.length}</i>`);
 }
 
-export async function botAnalytics(clubId: string, input: string) {
+export type ClubCourtReport = { clubName: string; timezone: string; label: string; generated: string; rows: CourtAnalytics[] };
+
+/**
+ * Дані звіту по кортах без перевірки тарифу — для нейроаналітика власника
+ * (`ownerAssistant`), де роут уже пройшов `requireFeature('ai')`. Друга
+ * перевірка `featAnalytics` тут не потрібна: `ai` й `analytics` різні
+ * прапорці, і мовчазний неспівпад між ними всередині чату виглядав би як
+ * помилка, а не як межа тарифу. `null` — клуб не знайдено/неактивний або
+ * період невалідний; текст про це формує викликач.
+ */
+export async function courtAnalytics(clubId: string, input: string): Promise<ClubCourtReport | null> {
   const club = await prisma.club.findUnique({ where: { id: clubId }, select: {
     name: true, timezone: true, createdAt: true, isActive: true,
-    plan: { select: { featTrainers: true, featGroups: true, featAnalytics: true } },
     hours: { select: { weekday: true, openMinute: true, closeMinute: true, isClosed: true } },
   } });
-  if (!club?.isActive || !planFeatures(club.plan).analytics) return ['Аналітика недоступна для поточного клубу або тарифу.'];
+  if (!club?.isActive) return null;
   const now = DateTime.now().setZone(club.timezone);
   const range = analyticsRange(input, club.timezone, now);
-  if (!range) return ['Оберіть today, yesterday, week, month або минулу дату YYYY-MM-DD. Наприклад: /analytics 2026-09-01'];
+  if (!range) return null;
   const { from, to } = range;
   const [courts, bookings, blocks] = await Promise.all([
     prisma.court.findMany({ where: { clubId }, select: { id: true, name: true, isActive: true } }),
@@ -95,5 +104,15 @@ export async function botAnalytics(clubId: string, input: string) {
       occupancy: totals.openMinutes ? totals.occupancy * 100 : null,
     };
   });
-  return analyticsMessages(club.name, range.label, club.timezone, rows, now.toFormat('dd.MM.yyyy HH:mm:ss'));
+  return { clubName: club.name, timezone: club.timezone, label: range.label, generated: now.toFormat('dd.MM.yyyy HH:mm:ss'), rows };
+}
+
+export async function botAnalytics(clubId: string, input: string) {
+  const gate = await prisma.club.findUnique({ where: { id: clubId }, select: {
+    isActive: true, plan: { select: { featTrainers: true, featGroups: true, featAnalytics: true } },
+  } });
+  if (!gate?.isActive || !planFeatures(gate.plan).analytics) return ['Аналітика недоступна для поточного клубу або тарифу.'];
+  const data = await courtAnalytics(clubId, input);
+  if (!data) return ['Оберіть today, yesterday, week, month або минулу дату YYYY-MM-DD. Наприклад: /analytics 2026-09-01'];
+  return analyticsMessages(data.clubName, data.label, data.timezone, data.rows, data.generated);
 }

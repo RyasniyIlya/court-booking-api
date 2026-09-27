@@ -35,9 +35,13 @@ const team = { tier: 2, featTrainers: true, featGroups: true, featAnalytics: fal
 const pro = { tier: 3, featTrainers: true, featGroups: true, featAnalytics: true };
 describe('subscription packages', () => {
  it.each([null, undefined, base])('does not grant paid features without a paid package: %s', plan => {
- expect(planFeatures(plan)).toEqual({trainers:false, groups:false, analytics:false, telegram:false});
+ expect(planFeatures(plan)).toEqual({trainers:false, groups:false, analytics:false, telegram:false, ai:false});
  });
- it('team includes trainers and groups only', () => expect(planFeatures(team)).toEqual({trainers:true,groups:true,analytics:false,telegram:false}));
- it('maximum includes Telegram', () => expect(planFeatures(pro)).toEqual({trainers:true,groups:true,analytics:true,telegram:true}));
- it('analytics on a custom lower tier does not grant Telegram', () => expect(planFeatures({...base,featAnalytics:true}).telegram).toBe(false));
+ it('team includes trainers and groups only', () => expect(planFeatures(team)).toEqual({trainers:true,groups:true,analytics:false,telegram:false,ai:false}));
+ it('maximum includes Telegram and the AI manager', () => expect(planFeatures(pro)).toEqual({trainers:true,groups:true,analytics:true,telegram:true,ai:true}));
+ it('analytics on a custom lower tier does not grant Telegram or AI', () => {
+ const f = planFeatures({...base,featAnalytics:true});
+ expect(f.telegram).toBe(false);
+ expect(f.ai).toBe(false);
+ });
 });

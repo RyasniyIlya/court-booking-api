@@ -191,6 +191,7 @@ passesRouter.get(
         validFrom: p.validFrom.toISOString(),
         validUntil: p.validUntil.toISOString(),
         price: p.price,
+        payMethod: p.payMethod,
         revokedAt: p.revokedAt?.toISOString() ?? null,
       })),
     });

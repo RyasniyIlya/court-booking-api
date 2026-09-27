@@ -140,7 +140,9 @@ export async function verifyAccountPassword(
 }
 
 /**
- * Персонал клубу: OWNER або ADMIN. Тренера відсікає роль акаунта.
+ * Персонал клубу: OWNER або ADMIN. Тренера й бухгалтера відсікає роль
+ * акаунта — обидва мають вужчий, окремо визначений доступ (свій розклад
+ * і фінанси відповідно), а не «усе, крім явно забороненого».
  */
 export function requireStaff(
   req: Request,
@@ -153,10 +155,37 @@ export function requireStaff(
     });
   }
 
-  if (req.auth.role === 'TRAINER') {
+  if (req.auth.role === 'TRAINER' || req.auth.role === 'ACCOUNTANT') {
     return res.status(403).json({
       error: 'FORBIDDEN',
       requiredRole: ['OWNER', 'ADMIN'],
+    });
+  }
+
+  next();
+}
+
+/**
+ * Бухгалтеру закрито все під /api/admin/*, крім фінансів
+ * (окремий роутер, /api/admin/finance) і самообслуговування з authRouter
+ * (/me, /password, /login, /register).
+ *
+ * Один вартовий на весь роутер, а не позначка на кожному ендпоінті:
+ * половина роутів тут не проходить через requireStaff узагалі (вони
+ * читають дані і при TRAINER, звужуючи вибірку по trainerId в коді
+ * ендпоінта, а не вартовим) — і кожен такий роут довелось би окремо
+ * навчати нової ролі. Один пропущений рядок серед десятків файлів — це
+ * рівно та розмита логіка, від якої lib/access.js на фронтенді
+ * застерігає у власному коментарі; тут те саме застереження, але для бека.
+ */
+export function blockAccountant(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+) {
+  if (req.auth?.role === 'ACCOUNTANT') {
+    return res.status(403).json({
+      error: 'FORBIDDEN',
     });
   }
 

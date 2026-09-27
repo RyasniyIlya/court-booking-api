@@ -6,6 +6,8 @@ export type PlanFeatures = {
   /** Поглиблена аналітика і картотека клієнтів */
   analytics: boolean;
   telegram: boolean;
+  /** Нейронний менеджер для гравців і нейроаналітик для власника */
+  ai: boolean;
 };
 
 /** Без призначеного плану платні можливості закриті. */
@@ -14,6 +16,7 @@ export const BASE_FEATURES: PlanFeatures = {
   groups: false,
   analytics: false,
   telegram: false,
+  ai: false,
 };
 
 type PlanLike = {
@@ -37,6 +40,9 @@ export function planFeatures(plan: PlanLike): PlanFeatures {
     groups: plan.featGroups,
     analytics: plan.featAnalytics,
     telegram: plan.tier === 3,
+    /* Найвищий тариф, разом із Telegram: обидва — «розумний» шар поверх
+       базових броней, і окремого прапорця в базі для нього не заводимо. */
+    ai: plan.tier === 3,
   };
 }
 
