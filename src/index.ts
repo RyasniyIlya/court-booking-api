@@ -5,14 +5,18 @@ import { publicRouter } from './routes/public';
 import { assistantRouter } from './routes/assistant';
 import { adminRouter } from './routes/admin';
 import { analyticsRouter } from './routes/analytics';
+import { exportRouter } from './routes/export';
 import { financeRouter } from './routes/finance';
 import { platformRouter } from './routes/platform';
+import { platformCrmRouter } from './routes/platformCrm';
+import { requirePlatformAuth } from './lib/platformAuth';
 import { payRouter } from './routes/pay';
 import { startExpirySweeper } from './lib/expire';
 import { startBot, telegramWebhookSecret } from './lib/botRunner';
 import { startDigestScheduler } from './lib/digestScheduler';
 import { startReminderScheduler } from './lib/remind';
 import { startPlayerScheduler } from './lib/playerRemind';
+import { startWinbackScheduler } from './lib/winback';
 import { handleUpdate } from './lib/botHandlers';
 import { processTelegramUpdate } from './lib/telegramReceipt';
 import { paymentsSecretReady } from './lib/crypto';
@@ -28,6 +32,16 @@ app.set('trust proxy', 1);
 // від байтів. Якщо тіло пройде через express.json(), підпис не збіжиться.
 app.use('/api/pay', express.raw({ type: '*/*', limit: '100kb' }), payRouter);
 
+// Імпорт лідів з реєстру — до 1000 рядків за раз (~1 МБ). Тільки цей шлях
+// і тільки для оператора: загальні 100 КБ лишаються для всього іншого.
+// Має стояти ПЕРЕД загальним парсером — той інакше відповість 413 першим.
+// Токен перевіряється ДО читання тіла: 5 МБ без входу ніхто не надішле.
+// OPTIONS пропускаємо: preflight токена не несе, а CORS підключено нижче.
+app.use(
+  '/api/platform/leads/import',
+  (req, res, next) => (req.method === 'OPTIONS' ? next() : requirePlatformAuth(req, res, next)),
+  express.json({ limit: '5mb' }),
+);
 app.use(express.json({ limit: '100kb' }));
 
 // Віджет вантажиться на чужих доменах — публічне API відкрите для всіх
@@ -77,8 +91,13 @@ app.use('/api/public', publicRouter);
 app.use('/api/public', assistantRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/admin/analytics', analyticsRouter);
+/* Вивантаження бази клубу — окремо від analyticsRouter і без
+   requireFeature('analytics'): дані клубу (броні, клієнти) належать
+   власнику на будь-якому тарифі, див. коментар у routes/export.ts. */
+app.use('/api/admin/export', exportRouter);
 app.use('/api/admin/finance', financeRouter);
 app.use('/api/platform', platformRouter);
+app.use('/api/platform', platformCrmRouter);
 
 /**
  * Вебхук Telegram. Це єдиний шлях для вхідних команд: фоновий polling
@@ -152,5 +171,9 @@ app.listen(port, () => {
 
     // Гравцям: нагадування за 3 години з «Прийду / Скасувати» і черга.
     startPlayerScheduler();
+
+    // Повернення тих, хто давно не грав: раз на годину, вдень за часом клубу,
+    // тільки за згодою гравця й лише там, де клуб це ввімкнув.
+    startWinbackScheduler();
   }
 });

@@ -7,6 +7,7 @@ const prisma = {
   clubGroup: { findUnique: vi.fn(), findMany: vi.fn() },
   club: { updateMany: vi.fn(), update: vi.fn() },
   clubInvoice: { create: vi.fn() },
+  crmActivity: { create: vi.fn() },
   $transaction: vi.fn(),
 };
 vi.mock('../lib/db', () => ({ prisma }));
@@ -62,6 +63,7 @@ it('creates a paid period for every club in a network atomically', async () => {
     name: 'Мережа',
     clubs: [{
       id: clubId, paidUntil: null, billingPeriod: 'MONTH', planPrice: 50000, plan: null,
+      _count: { courts: 2 },
     }],
   });
   const response = await request(app)

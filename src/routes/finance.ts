@@ -11,14 +11,13 @@ import {
   findDebts,
   groupDebtors,
   ledgerRows,
-  limitUsage,
   onlineRows,
   passRows,
   summarize,
-  taxEstimate,
   type CashRow,
   type DebtInput,
 } from '../lib/cashbook';
+import { estimateTax, regimeLimitUsage, TAX_REGIMES, vatApplicable, type TaxRegime } from '../lib/taxRegime';
 import { breakEven, monthlyPnl, trainerPayouts } from '../lib/financeReports';
 import { loadLiabilityPasses } from '../lib/financeData';
 
@@ -127,7 +126,10 @@ financeRouter.get('/cashbook', async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
   const clubId = req.auth!.clubId;
-  const club = await prisma.club.findUnique({ where: { id: clubId }, select: { timezone: true } });
+  const club = await prisma.club.findUnique({
+    where: { id: clubId },
+    select: { timezone: true, taxRegime: true, vatPayer: true, taxFixedMonthly: true },
+  });
   if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
 
   const tz = club.timezone;
@@ -141,10 +143,29 @@ financeRouter.get('/cashbook', async (req, res) => {
      березні. */
   const yearStart = range.end.startOf('year').toJSDate();
 
-  const [rows, yearRows, since] = await Promise.all([
+  const regime = club.taxRegime as TaxRegime;
+  /* Витрати клубу читаємо лише для режимів «від прибутку»: фіксованим і
+     режимам «від доходу» вони не потрібні, а запит — зайвий похід у базу. */
+  const needsExpenses = regime === 'FOP_GENERAL' || regime === 'TOV_GENERAL';
+
+  const [rows, yearRows, since, expenseRows] = await Promise.all([
     loadCashRows(clubId, from, to, tz),
     loadCashRows(clubId, yearStart, to, tz),
     journalSince(clubId),
+    needsExpenses
+      ? prisma.clubExpense.findMany({
+        /* month — перше число місяця (@db.Date, UTC-північ): беремо всі
+           місяці, яких період зачепив хоч одним днем, як і в /pnl. */
+        where: {
+          clubId,
+          month: {
+            gte: new Date(`${range.start.toFormat('yyyy-MM')}-01T00:00:00Z`),
+            lte: new Date(`${range.end.toFormat('yyyy-MM')}-01T00:00:00Z`),
+          },
+        },
+        select: { category: true, amount: true },
+      })
+      : Promise.resolve([]),
   ]);
 
   const summary = summarize(rows, tz, from, to);
@@ -157,8 +178,23 @@ financeRouter.get('/cashbook', async (req, res) => {
     /* Період почався раніше, ніж журнал: готівка до цієї дати невідома. */
     partial: !since || since > from,
     summary,
-    tax: taxEstimate(summary.net),
-    limit: limitUsage(yearNet, range.end.year),
+    /* Сирі налаштування клубу — окремо від tax.regime/tax.vatPayer: ті вже
+       ефективні (vatPayer форсовано в false там, де він не застосовний),
+       а тут — те, що показати у формі редагування (FinanceSection для
+       бухгалтера, ClubTab для решти персоналу): включно з taxFixedMonthly,
+       якого в оцінці податку нема окремим полем. */
+    regimeSettings: { taxRegime: club.taxRegime, vatPayer: club.vatPayer, taxFixedMonthly: club.taxFixedMonthly },
+    tax: estimateTax({
+      regime,
+      vatPayer: club.vatPayer,
+      taxFixedMonthly: club.taxFixedMonthly,
+      income: summary.net,
+      expenses: expenseRows,
+      from,
+      to,
+      tz,
+    }),
+    limit: regimeLimitUsage(regime, yearNet, range.end.year),
     rows: [...rows].sort((a, b) => b.at.getTime() - a.at.getTime()).slice(0, 200),
   });
 });
@@ -205,6 +241,61 @@ financeRouter.get('/cashbook/export', requireRole('OWNER', 'ACCOUNTANT'), async 
   res.setHeader('Cache-Control', 'no-store');
   res.setHeader('Content-Type', XLSX_CONTENT_TYPE);
   return res.send(buildWorkbook(cashbookSheets(rows, summary, meta)));
+});
+
+const taxRegimeBody = z.object({
+  taxRegime: z.enum(TAX_REGIMES as [TaxRegime, ...TaxRegime[]]).optional(),
+  vatPayer: z.boolean().optional(),
+  /* Копійки. Стеля — 100 000 грн/міс: щедро понад будь-яку реальну ставку
+     ради, але не «довільне число» — захист від друкарської помилки на
+     порядок (ввели 3 328 000 замість 33 280). */
+  taxFixedMonthly: z.number().int().min(0).max(10_000_000).nullable().optional(),
+});
+
+/**
+ * PATCH /api/admin/finance/tax-regime
+ *
+ * Податковий режим клубу: хто платить, чи платник ПДВ, чи є своя фіксована
+ * ставка (для ФОП 1/2 групи — рада міняє її, типова цифра не завжди вірна).
+ *
+ * Доступ — ВЛАСНИК і БУХГАЛТЕР, не модератор: режим визначає бухгалтер
+ * клубу, а не той, хто веде зміну. Тому окремий вартовий тут, вужчий за
+ * router-рівневий requireRole('OWNER','ADMIN','ACCOUNTANT') вище —
+ * модератор до цього ендпоінта не проходить, хоч решту каси й бачить.
+ *
+ * ChangeLog тут навмисно не пишеться: клубні налаштування (routes/admin/
+ * club.ts, PATCH /club) його теж не пишуть — це не окрема поведінка для
+ * податків, а той самий вибір, що й для решти реквізитів клубу.
+ */
+financeRouter.patch('/tax-regime', requireRole('OWNER', 'ACCOUNTANT'), async (req, res) => {
+  const parsed = taxRegimeBody.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const clubId = req.auth!.clubId;
+  const current = await prisma.club.findUnique({
+    where: { id: clubId },
+    select: { taxRegime: true, vatPayer: true, taxFixedMonthly: true },
+  });
+  if (!current) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const regime = (parsed.data.taxRegime ?? current.taxRegime) as TaxRegime;
+  /* Платник ПДВ має сенс лише для трьох режимів — для решти скидаємо в
+     false примусово, а не 400-имо: клуб міг просто лишити стару галочку,
+     перемикаючи режим, і не мусить про неї згадувати окремо. */
+  const vatPayer = vatApplicable(regime) ? (parsed.data.vatPayer ?? current.vatPayer) : false;
+
+  const data: { taxRegime?: TaxRegime; vatPayer?: boolean; taxFixedMonthly?: number | null } = {};
+  if (parsed.data.taxRegime !== undefined) data.taxRegime = parsed.data.taxRegime;
+  if (vatPayer !== current.vatPayer) data.vatPayer = vatPayer;
+  if (parsed.data.taxFixedMonthly !== undefined) data.taxFixedMonthly = parsed.data.taxFixedMonthly;
+
+  const club = await prisma.club.update({ where: { id: clubId }, data });
+
+  res.json({
+    taxRegime: club.taxRegime,
+    vatPayer: club.vatPayer,
+    taxFixedMonthly: club.taxFixedMonthly,
+  });
 });
 
 const debtorsQuery = z.object({

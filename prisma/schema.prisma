@@ -82,6 +82,10 @@ enum UserRole {
 /// Спортивний клуб = один тенант SaaS
 model Club {
   settlementSettings Json                 @default("{}")
+  /// Налаштування клубу в спільному Telegram-боті: привітання, що показувати,
+  /// повернення тих, хто давно не грав. Форма — lib/clubBot.ts (BotSettings);
+  /// читати тільки через normalizeBotSettings: у базі може лежати що завгодно.
+  botSettings        Json                 @default("{}")
   ledgerEntries      BookingLedgerEntry[]
   id                 String               @id @default(uuid()) @db.Uuid
   name               String
@@ -174,6 +178,25 @@ model Club {
   /// інакше вимкнення заднім числом сховало б чинні залишки.
   passesEnabled Boolean @default(false)
 
+  // ── Податковий режим ────────────────────────────────────────────────
+  // Клуб сам обирає юридичну форму й систему оподаткування — раніше
+  // каса завжди рахувала ФОП 3 групи (src/lib/taxRegime.ts), і клубу на
+  // іншому режимі оцінка була просто невірною. FOP_3 типово — точно та
+  // поведінка, що була до появи поля, тож наявним клубам нічого не
+  // змінюється мовчки.
+  /// Юридична форма й система оподаткування. Визначає ставки й річний
+  /// ліміт у касовій книзі (src/lib/taxRegime.ts).
+  taxRegime       TaxRegime @default(FOP_3)
+  /// Платник ПДВ. Має сенс лише для FOP_3 / TOV_SINGLE_3 / TOV_GENERAL —
+  /// для решти режимів роут сам примусово скидає в false.
+  vatPayer        Boolean   @default(false)
+  /// Копійки. Фіксована сума єдиного податку на місяць для FOP_1/FOP_2,
+  /// якщо задана — перекриває типову ставку (0.1 і 0.2 прожиткового/
+  /// мінімальної зарплати): місцеві ради ставлять свою ставку в межах
+  /// закону, і типова цифра їй не завжди відповідає. null — типова ставка
+  /// року (src/lib/taxRegime.ts).
+  taxFixedMonthly Int?
+
   // ── Наше обслуговування ──────────────────────────────────────────────
   // Це НАШІ гроші з клубу, а не гроші гравців за корти. Гравці платять на
   // рахунок клубу через його ж еквайринг — ми в тих розрахунках не беремо
@@ -237,6 +260,19 @@ model Club {
   /// Впливає на віддачу даних для публічного віджета.
   approvedAt    DateTime?
   changeLogs    ChangeLog[]
+
+  // ── CRM оператора платформи ──────────────────────────────────────────
+  // Клуб їх не бачить: це наші мітки й наш журнал роботи з клієнтом.
+  /// Мітки оператора: «пілот», «мережа», «ризик відтоку», «Київ».
+  /// Вільний список, як Customer.tags.
+  crmTags       String[]      @default([])
+  /// Місто окремим полем — фільтр і групування в панелі оператора.
+  /// Адреса лишається вільним текстом для віджета.
+  city          String?
+  /// Лід, з якого клуб прийшов (після конверсії).
+  lead          Lead?
+  /// Журнал оператора: дзвінки, нотатки, задачі, системні події.
+  crmActivities CrmActivity[]
 
   @@index([groupId])
 }
@@ -394,6 +430,25 @@ enum BillingPeriod {
   MONTH
   QUARTER
   YEAR
+}
+
+/// Юридична форма й система оподаткування клубу. Визначає ставки й річний
+/// ліміт оцінки податку в касовій книзі (src/lib/taxRegime.ts). Оцінка,
+/// а не декларація — остаточну суму завжди рахує бухгалтер клубу.
+enum TaxRegime {
+  /// Фіксований єдиний податок (ставка ради) + військовий збір фіксовано.
+  FOP_1
+  /// Те саме, вища фіксована ставка.
+  FOP_2
+  /// Єдиний податок 5% доходу (3% для платника ПДВ) + військовий збір 1%.
+  FOP_3
+  /// ПДФО 18% + військовий збір 5% від прибутку. Ліміту доходу немає.
+  FOP_GENERAL
+  /// Юрособа на єдиному податку 3 групи: 5% (3% для платника ПДВ),
+  /// без військового збору.
+  TOV_SINGLE_3
+  /// Юрособа на загальній системі: податок на прибуток 18%. Ліміту немає.
+  TOV_GENERAL
 }
 
 enum InvoiceStatus {
@@ -743,7 +798,7 @@ model Booking {
   //
   /// true = відкрита гра. Разом із нею завжди заповнена capacity:
   /// за цим стежить CHECK booking_open_match_is_group.
-  isOpenMatch Boolean    @default(false)
+  isOpenMatch Boolean     @default(false)
   /// Діапазон рівня, на який збирається гра. null = будь-який рівень:
   /// гру видно всім, і підбір нікого не відсіює.
   levelMin    SkillLevel?
@@ -808,9 +863,34 @@ model Booking {
   /// Зафіксована ціна на момент броні, копійки
   priceTotal    Int      @default(0)
   /// Акції, що реально вплинули на ціну цієї броні.
+  ///
+  /// НЕ незмінний знімок: перенесення броні (PATCH /bookings/:id) рахує
+  /// акцію заново на НОВИЙ час і перезаписує це поле — так само, як
+  /// priceTotal. Для звіту про окупність акцій (яка акція подіяла в
+  /// момент СТВОРЕННЯ броні) дивись listPrice/promoIds нижче.
   promoNames    String[] @default([])
   /// Загальна економія від акцій клубу, копійки. Персональна знижка окремо.
+  /// Так само перераховується при перенесенні — див. коментар до promoNames.
   promoDiscount Int      @default(0)
+  /// Ціна корту й тренера ДО акції — знімок рівно на момент створення
+  /// броні, копійки. null — броні до появи цього поля, історію заднім
+  /// числом не відновити.
+  ///
+  /// Навіщо окремо від priceTotal + promoDiscount. Ця сума рахується
+  /// правильно лише доти, доки priceTotal не міняється — а він міняється:
+  /// перенесення, зміна тренера й додавання прокату переписують priceTotal
+  /// (і саме перенесення переписує ще й promoDiscount поверх). listPrice
+  /// пишеться РІВНО ОДИН раз при створенні і після цього ніким не
+  /// чіпається — тому звіт «скільки коштувала б бронь без акції» лишається
+  /// правильним, навіть якщо бронь потім переносили чи додавали прокат.
+  listPrice     Int?
+  /// Id акцій, застосованих САМЕ при створенні броні. Окремо від
+  /// promoNames: назву акції можна перейменувати пізніше (Promo.title
+  /// редагується в кабінеті), а акцію — видалити, тож id лишається єдиним
+  /// стабільним ключем для групування у звіті про окупність. Той самий
+  /// незмінний знімок, що й listPrice — не чіпається ні переносом, ні
+  /// іншими правками броні.
+  promoIds      String[] @default([]) @db.Uuid
   /// Токен для самостійного скасування клієнтом за посиланням.
   /// Ним же віджет питає статус оплати після повернення з платіжки.
   cancelToken   String   @unique @default(uuid())
@@ -1141,6 +1221,19 @@ model Customer {
   /// Одноразовий код привʼязки з профілю у віджеті, живе 15 хвилин.
   tgLinkCode     String?   @unique
   tgLinkUntil    DateTime?
+  /// Згода на акції й «повернення» в Telegram. null — нічого маркетингового
+  /// не надсилаємо. Ставиться кнопкою в боті, знімається кнопкою «Не
+  /// надсилати таке» або /stop.
+  tgMarketingAt      DateTime?
+  /// Коли про згоду вже питали — щоб не питати вдруге.
+  tgMarketingAskedAt DateTime?
+  /// Коли гравець востаннє відкривав клуб у боті: за цим вибираємо «свій»
+  /// клуб, коли карток із цього чату кілька.
+  tgLastActiveAt     DateTime?
+  /// Скільки листів «повернення» надіслано після останнього візиту й коли
+  /// останній. Лічильник скидається, коли зʼявляється новий візит.
+  winbackCount       Int       @default(0)
+  winbackLastAt      DateTime?
 
   /// Пароль профілю гравця на сайті клубу, bcrypt. null — картка без
   /// акаунта: заведена адміністратором, бронню гостя або до появи паролів.
@@ -1153,7 +1246,7 @@ model Customer {
   /// Ігровий рівень для відкритих ігор. null — не вказаний: гравця
   /// показуємо в підборі останнім, але не ховаємо. Порожній рівень — це
   /// «ще не спитали», а не «слабкий».
-  skillLevel     SkillLevel?
+  skillLevel SkillLevel?
 
   note           String?
   /// Чорний список: не пускати онлайн-бронювання
@@ -1305,7 +1398,7 @@ model Pass {
   validUntil DateTime @db.Timestamptz(3)
 
   /// Сплачено, копійки
-  price Int @default(0)
+  price      Int     @default(0)
   /// Як заплатили: CASH | CARD | TRANSFER | ONLINE. null — видано до того,
   /// як спосіб почали записувати; у касі такий абонемент іде як «не вказано».
   payMethod  String?
@@ -1676,4 +1769,128 @@ model ShiftClose {
 
   @@unique([clubId, requestId])
   @@index([clubId, closedAt])
+}
+
+/**
+ * ────────────────────────────────────────────────────────────────────────
+ * CRM ОПЕРАТОРА ПЛАТФОРМИ
+ * Ліди — клуби, яким ми ще продаємо (база з YouControl, вхідні, рекомендації).
+ * Коли лід купує, він звʼязується з Club через clubId і далі живе як клієнт.
+ * Журнал CrmActivity спільний для ліда й клубу: одна стрічка історії.
+ * ────────────────────────────────────────────────────────────────────────
+ */
+
+enum LeadStage {
+  /// Щойно імпортований / заведений, ще ніхто не дивився
+  NEW
+  /// Перевіряємо: чи є корти, чи живий номер, яка система запису
+  CHECKING
+  /// Був контакт, розмова йде
+  CONTACTED
+  /// Підтверджена проблема й особа рішення
+  QUALIFIED
+  /// Демо призначено або проведено
+  DEMO
+  /// Надіслано пропозицію
+  PROPOSAL
+  /// Купив — привʼязаний до Club
+  WON
+  /// Відмова (причина в lostReason)
+  LOST
+  /// Не наш клієнт: немає кортів, закрився, не той бізнес
+  NOT_FIT
+}
+
+enum CrmActivityKind {
+  NOTE
+  CALL
+  MESSAGE
+  MEETING
+  DEMO
+  /// Задача з dueAt; закривається doneAt
+  TASK
+  /// Автоматичний запис: зміна етапу, видача підписки, зміна плану
+  SYSTEM
+}
+
+model Lead {
+  id            String    @id @default(uuid()) @db.Uuid
+  /// Як клуб називають люди: «Padel Club Kyiv»
+  name          String
+  /// Юридична назва з реєстру: ТОВ «...», ФОП ...
+  legalName     String?
+  /// Код ЄДРПОУ / РНОКПП. Ключ дедуплікації при імпорті.
+  edrpou        String?   @unique
+  city          String?
+  region        String?
+  address       String?
+  /// падел | теніс | сквош | бадмінтон | мульти — вільний рядок
+  sport         String?
+  /// Нормалізований E.164, якщо вдалося
+  phone         String?
+  email         String?
+  website       String?
+  instagram     String?
+  /// Особа рішення: ПІБ і роль («власник», «керуючий»)
+  contactName   String?
+  contactRole   String?
+  /// Скільки кортів — головний вхід у ціну (lib/courtPricing.ts)
+  courtsCount   Int?
+  /// Чим записують зараз: «Instagram/Direct», «Appointer», «Playtomic», «зошит»
+  currentSystem String?
+  /// youcontrol | manual | registration | referral — вільний рядок
+  source        String    @default("manual")
+  /// A | B | C
+  priority      String    @default("B")
+  stage         LeadStage @default(NEW)
+  tags          String[]  @default([])
+  /// Кваліфікація: підтверджена проблема / говоримо з особою рішення
+  painConfirmed Boolean   @default(false)
+  decisionMaker Boolean   @default(false)
+  /// Plan.code, який обговорюємо
+  planInterest  String?
+  /// Наступний крок — у кожного активного ліда має бути дія і дата
+  nextAction    String?
+  nextActionAt  DateTime?
+  lastContactAt DateTime?
+  lostReason    String?
+  note          String?
+  /// З реєстру: дохід за рік, грн (не копійки — так у джерелі)
+  revenueYear   BigInt?
+  marketScore   String?
+  finScore      String?
+
+  clubId     String?       @unique @db.Uuid
+  club       Club?         @relation(fields: [clubId], references: [id], onDelete: SetNull)
+  activities CrmActivity[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([stage])
+  @@index([nextActionAt])
+  @@index([city])
+  @@index([phone])
+}
+
+model CrmActivity {
+  id     String          @id @default(uuid()) @db.Uuid
+  leadId String?         @db.Uuid
+  lead   Lead?           @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  clubId String?         @db.Uuid
+  club   Club?           @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  kind   CrmActivityKind @default(NOTE)
+  text   String
+  /// Для TASK — до коли зробити
+  dueAt  DateTime?
+  /// Для TASK — коли закрили. null = відкрита
+  doneAt DateTime?
+  /// Пошта оператора або 'system'
+  author String?
+
+  createdAt DateTime @default(now())
+
+  @@index([leadId, createdAt])
+  @@index([clubId, createdAt])
+  @@index([kind, doneAt, dueAt])
 }

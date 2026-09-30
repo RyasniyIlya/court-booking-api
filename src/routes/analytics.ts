@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { DateTime } from 'luxon';
 import { prisma } from '../lib/db';
@@ -20,6 +20,13 @@ import {
   type RosterRow,
 } from '../lib/customerRoster';
 import { buildWorkbook, XLSX_CONTENT_TYPE } from '../lib/xlsx';
+import {
+  loadBookingExport,
+  bookingExportCsv,
+  bookingExportWorkbookSheets,
+  bookingsFileName,
+  type BookingExportMeta,
+} from '../lib/bookingExport';
 
 /**
  * CRM-аналітика кабінету. Окремий файл, а не ще один розділ
@@ -975,11 +982,17 @@ function sortRoster(rows: RosterRow[], sort: RosterSort): RosterRow[] {
  * `clubId` береться лише з токена (`req.auth`) і ніколи з запиту. Тому
  * параметра «вивантажити інший клуб» не існує в принципі, і його не можна
  * підставити: база спільна, доступ — ні.
+ *
+ * Обробник винесено в іменовану функцію (`customersExportHandler`), а не
+ * лишено анонімним у `.get(...)`, — той самий код тепер висить і тут (старий
+ * шлях, під `requireFeature('analytics')` роутера), і на `exportRouter`
+ * (routes/export.ts), де цього вартового плану нема: вивантаження бази —
+ * не аналітика, а данні клубу, і власник має дійти до них на будь-якому
+ * тарифі. Дублювати логіку заради різних адрес — якраз те, чого тут
+ * уникаємо.
  */
-analyticsRouter.get(
-  '/customers/export',
-  requireRole('OWNER'),
-  async (req, res) => {
+export async function customersExportHandler(req: Request, res: Response) {
+  {
     const parsed = rosterQuery
       .extend({
         format: z.enum(['xlsx', 'csv']).default('xlsx'),
@@ -1046,8 +1059,126 @@ analyticsRouter.get(
 
     res.setHeader('Content-Type', XLSX_CONTENT_TYPE);
     return res.send(buildWorkbook(rosterWorkbookSheets(rows, meta)));
-  },
-);
+  }
+}
+
+analyticsRouter.get('/customers/export', requireRole('OWNER'), customersExportHandler);
+
+const bookingExportQuery = z.object({
+  format: z.enum(['xlsx', 'csv']).default('xlsx'),
+  /* Дати без часу, як і в periodBounds: години в такому запиті нічого не
+     уточнюють клубу, а от плутанину з таймзонами дають. Обидві опційні —
+     типове вивантаження це «весь час», не тиждень і не місяць. */
+  from: z.string().regex(DATE_ONLY).optional(),
+  to: z.string().regex(DATE_ONLY).optional(),
+});
+
+/**
+ * GET /api/admin/analytics/bookings/export?format=xlsx|csv&from=&to=
+ *
+ * Усі броні клубу файлом: приватні й групові, з оплатами, акціями,
+ * скасуваннями й відвідуваністю. Той самий чесний сценарій «а що, якщо ми
+ * зникнемо», що й /customers/export, тільки про записи, а не про людей —
+ * клуб має піти з системи з історією того, ХТО і КОЛИ грав, а не лише з
+ * телефонною книгою.
+ *
+ * ── Чому тільки OWNER ────────────────────────────────────────────────────
+ *
+ * Той самий аргумент, що й у customers/export: адміністратор бачить броні
+ * щодня, але по одній, через сітку дня. Уся історія одним файлом — це те,
+ * що виносять із клубу, і рішення про це лишається за власником.
+ *
+ * ── Період ────────────────────────────────────────────────────────────────
+ *
+ * from/to не мають типового значення — типове саме «весь час»: клубу, що
+ * питає «а що як ви зникнете», не можна відповісти файлом за останній
+ * тиждень. Межі, коли задані, читаються в таймзоні клубу через periodBounds
+ * — так само, як і решта звітів.
+ *
+ * Обробник, як і в customers/export, винесено в іменовану функцію
+ * (`bookingsExportHandler`): той самий код висить і на старому шляху (під
+ * `requireFeature('analytics')`), і на `exportRouter` (без нього) — див.
+ * коментар над `customersExportHandler`.
+ */
+export async function bookingsExportHandler(req: Request, res: Response) {
+  {
+    const parsed = bookingExportQuery.safeParse(req.query);
+    if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+    const { format, from, to } = parsed.data;
+
+    const [club, actor] = await Promise.all([
+      prisma.club.findUnique({
+        where: { id: req.auth!.clubId },
+        select: { name: true, timezone: true },
+      }),
+      prisma.user.findFirst({
+        where: { id: req.auth!.userId, clubId: req.auth!.clubId },
+        select: { email: true },
+      }),
+    ]);
+    if (!club || !actor) return res.status(404).json({ error: 'NOT_FOUND' });
+
+    const tz = club.timezone;
+    const fromBound = from ? DateTime.fromISO(from, { zone: tz }).startOf('day') : null;
+    const toBound = to ? DateTime.fromISO(to, { zone: tz }).endOf('day') : null;
+    if ((fromBound && !fromBound.isValid) || (toBound && !toBound.isValid)) {
+      return res.status(400).json({ error: 'BAD_REQUEST' });
+    }
+    if (fromBound && toBound && toBound < fromBound) {
+      return res.status(400).json({ error: 'BAD_REQUEST' });
+    }
+
+    const now = new Date();
+    const filterFrom = fromBound?.toJSDate();
+    const filterTo = toBound?.toJSDate();
+    const data = await loadBookingExport(req.auth!.clubId, { from: filterFrom, to: filterTo });
+
+    const meta: BookingExportMeta = {
+      clubName: club.name,
+      timezone: tz,
+      now,
+      from: filterFrom ?? null,
+      to: filterTo ?? null,
+    };
+
+    /* Журнал — до відправки файла, з тієї ж причини, що й у customers/export:
+       запис, що впав уже після відправки, лишив би вивантаження без сліду. */
+    await recordChanges(
+      prisma,
+      { clubId: req.auth!.clubId, entity: 'BookingExport', entityId: req.auth!.clubId },
+      { userId: req.auth!.userId, email: actor.email, role: req.auth!.role },
+      [{
+        field: 'export',
+        before: null,
+        after: {
+          format,
+          rows: data.bookings.length,
+          seatRows: data.seats.length,
+          from: from ?? null,
+          to: to ?? null,
+        },
+      }],
+    );
+
+    const fileName = bookingsFileName(meta, format);
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="bookings.${format}"; filename*=UTF-8''${encodeURIComponent(fileName)}`,
+    );
+    /* Броні — так само персональні дані, як і картотека: жодних кешів. */
+    res.setHeader('Cache-Control', 'no-store');
+
+    if (format === 'csv') {
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      return res.send(bookingExportCsv(data.bookings, meta));
+    }
+
+    res.setHeader('Content-Type', XLSX_CONTENT_TYPE);
+    return res.send(buildWorkbook(bookingExportWorkbookSheets(data, meta)));
+  }
+}
+
+analyticsRouter.get('/bookings/export', requireRole('OWNER'), bookingsExportHandler);
 
 /**
  * GET /api/admin/analytics/customers

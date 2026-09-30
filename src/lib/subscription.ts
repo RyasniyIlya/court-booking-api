@@ -1,4 +1,5 @@
 import { extendPaidUntil, PERIOD_PRICE } from './billing';
+import { courtPrice } from './courtPricing';
 import { clubPrice } from './plans';
 
 export type Period = 'MONTH' | 'QUARTER' | 'YEAR';
@@ -66,6 +67,13 @@ export const PERIOD_MONTHS: Record<Period, number> = { MONTH: 1, QUARTER: 3, YEA
  * Свій період плану повертається копійка в копійку, без множення й ділення:
  * округлення не має права зачепити суму, яку оператор бачить у каталозі.
  *
+ * КОРТИ. `courts` — кількість активних кортів клубу. Ціна плану за ЙОГО
+ * період множиться через courtPrice ДО перерахунку на інший період: рік
+ * для клубу з 7 кортами — це десять «семикортових» місяців, а не базова
+ * ціна року. Індивідуальна ціна не множиться ніколи. Без плану й без
+ * індивідуальної ціни множиться загальний прайс. `courts` не задано —
+ * поведінка та сама, що й до появи цінника за корти.
+ *
  * Оператор у будь-якому разі бачить суму на кнопці й може вписати свою — це
  * підказка, а не остаточне рішення.
  *
@@ -76,14 +84,15 @@ export function periodAmount(
   plan: { price: number; period: string } | null | undefined,
   planPriceOverride: number | null | undefined,
   period: Period,
+  courts?: number | null,
 ): number {
-  const own = clubPrice(plan, planPriceOverride);
+  const own = clubPrice(plan, planPriceOverride, courts);
 
   // Без плану — загальний прайс. Своя ціна без плану теж діє: домовленість є
   // домовленість, а от розтягнути її на інший період нема від чого.
-  if (!plan) return own ?? PERIOD_PRICE[period];
+  if (!plan) return own ?? courtPrice(PERIOD_PRICE[period], courts);
 
-  if (own === null) return PERIOD_PRICE[period];
+  if (own === null) return courtPrice(PERIOD_PRICE[period], courts);
   if (plan.period === period) return own;
 
   const planMonths = PERIOD_MONTHS[plan.period as Period] ?? 1;

@@ -32,11 +32,7 @@ import {
   settingsKeyboard,
   settingsText,
 } from './botSettings';
-import {
-  clubChoiceKeyboard,
-  openBookingKeyboard,
-  slugFromStartPayload,
-} from './botBooking';
+import { clubChoiceKeyboard, slugFromStartPayload } from './botBooking';
 import { codeFromStartPayload, handlePlayerCallback, handlePlayerCommand } from './playerBot';
 import {
   handlePlayerLoginMessage,
@@ -46,6 +42,7 @@ import {
   startLinkByCode,
   startPlayerLogin,
 } from './playerLogin';
+import { handleHomeCallback, loadClubHome, sendClubHome, sendOwnClubHome } from './playerHome';
 
 /**
  * Що бот відповідає на команди.
@@ -67,6 +64,7 @@ const HELP = [
   '',
   '<b>Для гравця</b>',
   'Натисніть /book, оберіть клуб і відкрийте його розклад.',
+  'Якщо ви підключили Telegram у профілі — бот одразу відкриває ваш клуб: акції, тренери на зміні, запис.',
   'Якщо клуб надіслав своє посилання на бота — вибирати клуб повторно не потрібно.',
   'Створіть профіль на сайті клубу. Тут натисніть «Увійти в профіль» — введіть телефон і пароль із сайту.',
   'Нагадування про ігри: профіль гравця на сторінці клубу → «Підключити Telegram».',
@@ -87,35 +85,37 @@ const HELP = [
 
 type Club = { id: string; name: string; timezone: string };
 
-const html = (value: string) => value
-  .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-
 async function bookingClub(slug: string) {
   return prisma.club.findFirst({
     where: { slug, isActive: true, approvedAt: { not: null } },
-    select: { slug: true, name: true },
+    select: { id: true, slug: true, name: true },
   });
 }
 
+/**
+ * Клуб за посиланням t.me/<бот>?start=club_<slug> або кнопкою зі списку.
+ *
+ * Гравцеві, чий чат уже привʼязаний до картки ЦЬОГО клубу, — його
+ * особиста головна (привітання за імʼям, «Мій профіль»). Решті — та сама
+ * головна, але без імені, і під нею кнопка входу в профіль: людина, що
+ * відкрила клуб у боті, саме тут і вирішує, чи підключати нагадування.
+ */
 async function showBookingClub(chatId: string, slug: string): Promise<boolean> {
   const club = await bookingClub(slug);
   if (!club) return false;
-  const markup = openBookingKeyboard(club.slug);
-  const setup = markup
-    ? 'Натисніть кнопку нижче — розклад відкриється прямо в Telegram.'
-    : 'Адреса онлайн-бронювання ще не налаштована. Попросіть клуб надіслати посилання.';
 
-  /* Вхід у профіль гравця — поруч із бронюванням, а не окремою командою,
-     яку треба знати: людина, що відкрила клуб у боті, саме тут і вирішує. */
+  const card = await prisma.customer.findFirst({
+    where: { clubId: club.id, telegramChatId: chatId },
+    select: { id: true },
+  });
+  if (card) return sendClubHome(chatId, club.id, card.id);
+
+  const view = await loadClubHome(club.id, null);
+  if (!view) return false;
+
   const login = await playerLoginButtonFor(chatId, club.slug);
-  const rows = [...(markup?.inline_keyboard ?? []), ...(login ? [[login]] : [])];
-  const hint = login ? '\n\nМаєте профіль гравця на сайті клубу? Увійдіть — і я нагадуватиму про ігри.' : '';
-
-  await sendMessage(
-    chatId,
-    `🎾 <b>${html(club.name)}</b>\n\n${setup}${hint}`,
-    rows.length ? { inline_keyboard: rows } : undefined,
-  );
+  const rows = [...view.keyboard, ...(login ? [[login]] : [])];
+  await sendMessage(chatId, view.text, rows.length ? { inline_keyboard: rows } : undefined);
   return true;
 }
 
@@ -339,6 +339,9 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
   /* Кнопки гравця (нагадування, черга) — першими: гравцем буває і той, хто
      в клубі працює, і його «Прийду» не має впиратись у перевірку ролі. */
   if (await handlePlayerCallback(q)) return;
+  /* Головна клубу, згода на акції, відписка від листів повернення — теж до
+     перевірки ролі: гравцем буває й людина з персоналу. */
+  if (await handleHomeCallback(q)) return;
 
   if (q.data?.startsWith('plogin:')) {
     if (!q.from || String(q.from.id) !== chatId) {
@@ -613,7 +616,9 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
   if (!me) {
     if (cmd === '/start' || cmd === '/book') {
       await setMyCommands(COMMANDS_GUEST, chatId);
-      await showClubChoice(chatId);
+      /* Підключений гравець одразу потрапляє у свій клуб — список усіх
+         клубів платформи йому не потрібен. */
+      if (!await sendOwnClubHome(chatId)) await showClubChoice(chatId);
       return;
     }
     /* Голий код без /start теж приймаємо: людина частіше просто вставляє
@@ -626,8 +631,10 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
     return;
   }
 
+  /* Персонал, який і сам грає: якщо в нього є картка гравця, /book веде в
+     головну її клубу, а не у список. */
   if (cmd === '/book') {
-    await showClubChoice(chatId);
+    if (!await sendOwnClubHome(chatId)) await showClubChoice(chatId);
     return;
   }
 

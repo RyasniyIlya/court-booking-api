@@ -11,7 +11,7 @@ import request from 'supertest';
  */
 
 const prisma = {
-  club: { findUnique: vi.fn() },
+  club: { findUnique: vi.fn(), update: vi.fn() },
   user: { findFirst: vi.fn() },
   bookingLedgerEntry: { findMany: vi.fn(), findFirst: vi.fn() },
   payment: { findMany: vi.fn() },
@@ -20,6 +20,7 @@ const prisma = {
   bookingSeat: { findMany: vi.fn() },
   passUsage: { findMany: vi.fn() },
   changeLog: { createMany: vi.fn() },
+  clubExpense: { findMany: vi.fn() },
 };
 
 vi.mock('../lib/db', () => ({ prisma }));
@@ -38,12 +39,15 @@ vi.mock('./admin', async () => {
 });
 
 const { financeRouter, cashRange } = await import('./finance');
-const app = express().use(financeRouter);
+const app = express().use(express.json()).use(financeRouter);
 
 beforeEach(() => {
   role = 'OWNER';
   vi.resetAllMocks();
-  prisma.club.findUnique.mockResolvedValue({ name: 'Клуб', timezone: 'Europe/Kyiv' });
+  prisma.club.findUnique.mockResolvedValue({
+    name: 'Клуб', timezone: 'Europe/Kyiv', taxRegime: 'FOP_3', vatPayer: false, taxFixedMonthly: null,
+  });
+  prisma.clubExpense.findMany.mockResolvedValue([]);
   prisma.user.findFirst.mockResolvedValue({ email: 'owner@club.test' });
   prisma.bookingLedgerEntry.findMany.mockResolvedValue([{
     id: 'l1', createdAt: new Date('2026-05-10T09:00:00Z'), kind: 'PAYMENT', method: 'CASH', amount: 60000,
@@ -100,6 +104,66 @@ describe('GET /cashbook', () => {
 
   it('поганий період — 400', async () => {
     expect((await request(app).get('/cashbook?from=2026-05-01')).status).toBe(400);
+  });
+
+  it('за замовчуванням (FOP_3) ClubExpense не читається — зайвий похід у базу', async () => {
+    await request(app).get('/cashbook?from=2026-05-01&to=2026-05-31');
+    expect(prisma.clubExpense.findMany).not.toHaveBeenCalled();
+  });
+
+  it('режим FOP_GENERAL: прибуток мінус витрати клубу (без TAX)', async () => {
+    prisma.club.findUnique.mockResolvedValue({
+      name: 'Клуб', timezone: 'Europe/Kyiv', taxRegime: 'FOP_GENERAL', vatPayer: false, taxFixedMonthly: null,
+    });
+    prisma.clubExpense.findMany.mockResolvedValue([
+      { category: 'RENT', amount: 10000 },
+      { category: 'TAX', amount: 999999 },
+    ]);
+    const res = await request(app).get('/cashbook?from=2026-05-01&to=2026-05-31');
+    expect(res.status).toBe(200);
+    expect(res.body.tax.regime).toBe('FOP_GENERAL');
+    expect(res.body.tax.base).toBe(50000); // 60000 − 10000, TAX виключено
+    expect(res.body.tax.total).toBe(50000 * 0.23); // 18% ПДФО + 5% збору
+    expect(res.body.limit).toBeNull();
+  });
+});
+
+describe('PATCH /tax-regime', () => {
+  it('власник міняє режим', async () => {
+    prisma.club.findUnique.mockResolvedValue({ taxRegime: 'FOP_3', vatPayer: false, taxFixedMonthly: null });
+    prisma.club.update.mockResolvedValue({ taxRegime: 'TOV_GENERAL', vatPayer: false, taxFixedMonthly: null });
+    const res = await request(app).patch('/tax-regime').send({ taxRegime: 'TOV_GENERAL' });
+    expect(res.status).toBe(200);
+    expect(res.body.taxRegime).toBe('TOV_GENERAL');
+    expect(prisma.club.update.mock.calls[0][0].where.id).toBe('club-1');
+  });
+
+  it('бухгалтер теж може — саме він знає режим', async () => {
+    role = 'ACCOUNTANT';
+    prisma.club.findUnique.mockResolvedValue({ taxRegime: 'FOP_3', vatPayer: false, taxFixedMonthly: null });
+    prisma.club.update.mockResolvedValue({ taxRegime: 'FOP_2', vatPayer: false, taxFixedMonthly: null });
+    const res = await request(app).patch('/tax-regime').send({ taxRegime: 'FOP_2' });
+    expect(res.status).toBe(200);
+  });
+
+  it('модератор — 403, хоча касу він і бачить', async () => {
+    role = 'ADMIN';
+    const res = await request(app).patch('/tax-regime').send({ taxRegime: 'FOP_2' });
+    expect(res.status).toBe(403);
+    expect(prisma.club.update).not.toHaveBeenCalled();
+  });
+
+  it('платник ПДВ примусово скидається там, де він не застосовний', async () => {
+    prisma.club.findUnique.mockResolvedValue({ taxRegime: 'FOP_3', vatPayer: true, taxFixedMonthly: null });
+    prisma.club.update.mockResolvedValue({ taxRegime: 'FOP_1', vatPayer: false, taxFixedMonthly: null });
+    await request(app).patch('/tax-regime').send({ taxRegime: 'FOP_1' });
+    expect(prisma.club.update.mock.calls[0][0].data.vatPayer).toBe(false);
+  });
+
+  it('невідомий режим і задовга фіксована ставка — 400', async () => {
+    expect((await request(app).patch('/tax-regime').send({ taxRegime: 'FOP_9' })).status).toBe(400);
+    expect((await request(app).patch('/tax-regime').send({ taxFixedMonthly: -1 })).status).toBe(400);
+    expect((await request(app).patch('/tax-regime').send({ taxFixedMonthly: 50_000_000 })).status).toBe(400);
   });
 });
 

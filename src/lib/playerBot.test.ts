@@ -164,6 +164,20 @@ describe('привʼязка чату до картки', () => {
   });
 });
 
+describe('/stop', () => {
+  it('відвʼязує чат і знімає згоду на акції, щоб після повторного підключення спитали заново', async () => {
+    prisma.customer.findMany.mockResolvedValue([{ id: 'c1' }, { id: 'c2' }]);
+    expect(await bot.handlePlayerCommand('111', '/stop', [])).toBe(true);
+    expect(prisma.customer.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['c1', 'c2'] } },
+      data: {
+        telegramChatId: null, tgLinkCode: null, tgLinkUntil: null,
+        tgMarketingAt: null, tgMarketingAskedAt: null,
+      },
+    });
+  });
+});
+
 it.each(['retry', 'permanent'])('reminder handles %s without claiming delivery', async outcome => {
   prisma.booking.findMany.mockResolvedValue([{ id: BOOKING_ID, club: { plan: 'max' } }]);
   prisma.bookingSeat.findMany.mockResolvedValue([]);

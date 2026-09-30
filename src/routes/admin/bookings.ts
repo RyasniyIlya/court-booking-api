@@ -624,6 +624,10 @@ bookingsRouter.post(
               startTime: start,
               endTime: end,
               priceTotal,
+              /* Ручне створення адміністратором акцій не рахує — ціну він
+                 вводить сам або бере пряму ціну корту. Тому знімок «до
+                 акції» дорівнює самій ціні: акції тут просто немає. */
+              listPrice: priceTotal,
               status: initialStatus,
               source: 'ADMIN',
               /* Те саме правило, що й у PATCH: план оплати дозволений
@@ -1630,6 +1634,8 @@ bookingsRouter.post(
               startTime: s,
               endTime: e,
               priceTotal,
+              /* Серія — те саме ручне створення, акцій тут не рахуємо. */
+              listPrice: priceTotal,
               status:
                 initialStatus,
               source:

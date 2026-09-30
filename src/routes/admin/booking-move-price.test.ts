@@ -88,6 +88,29 @@ it('applies club promos, trainer and discount, and adds rentals on top undiscoun
   });
 });
 
+/* Ф-7: перенесення перераховує "поточну" акцію (promoNames/promoDiscount —
+   бо ціна рахується заново на НОВИЙ час), але знімок на момент СТВОРЕННЯ
+   броні (listPrice/promoIds) для звіту про окупність акцій має лишитись
+   незайманим — інакше перенесена бронь "забула" б, яка акція діяла, коли
+   клієнт її оформлював. */
+it('does not touch the creation-time promo snapshot when a move recomputes the current promo', async () => {
+  given({
+    trainerId: TRAINER, trainerPrice: 10000, rentalTotal: 5000, promoNames: [], promoDiscount: 0,
+    listPrice: 36000, promoIds: ['old-promo-id'],
+    rentals: [{ id: 'line', itemId: 'racket', quantity: 1, amount: 5000 }],
+  });
+  recalcRentalsForMove.mockResolvedValue({ lines: [], shortages: [], rentalTotal: 5000, delta: 0 });
+
+  const res = await move({ start: '2030-01-01T08:00:00Z', end: '2030-01-01T09:00:00Z' });
+
+  expect(res.status).toBe(200);
+  /* Поточна акція перерахована (як і в сусідньому тесті)... */
+  expect(updated()).toMatchObject({ promoNames: ['Ранок'], promoDiscount: 20000 });
+  /* ...а знімок створення в data взагалі не зʼявляється — update() його не чіпає. */
+  expect(updated()).not.toHaveProperty('listPrice');
+  expect(updated()).not.toHaveProperty('promoIds');
+});
+
 it('prices a trainer changed in the same request with the discount', async () => {
   given({ payment: null, status: 'PENDING' });
 

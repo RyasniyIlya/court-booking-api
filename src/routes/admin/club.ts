@@ -92,6 +92,18 @@ clubRouter.get(
 
       isActive:
         club.isActive,
+
+      /* Податковий режим — тільки перегляд тут. Міняють його лише власник
+         і бухгалтер через PATCH /api/admin/finance/tax-regime: модератор
+         клуб веде, але режим оподаткування визначає той, хто рахує
+         податок, а не той, хто веде зміну. Кабінет показує кнопку
+         редагування лише a.editTaxRegime. */
+      taxRegime:
+        club.taxRegime,
+      vatPayer:
+        club.vatPayer,
+      taxFixedMonthly:
+        club.taxFixedMonthly,
     });
   },
 );

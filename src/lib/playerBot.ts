@@ -435,7 +435,13 @@ export async function unlinkPlayers(customerIds: string[]) {
     }),
     prisma.customer.updateMany({
       where: { id: { in: customerIds } },
-      data: { telegramChatId: null, tgLinkCode: null, tgLinkUntil: null },
+      /* Разом із чатом іде й згода на акції: без Telegram її нікуди слати,
+         а після повторного підключення людину спитають заново (тому
+         скидаємо й мітку «питали»). */
+      data: {
+        telegramChatId: null, tgLinkCode: null, tgLinkUntil: null,
+        tgMarketingAt: null, tgMarketingAskedAt: null,
+      },
     }),
   ]);
 }

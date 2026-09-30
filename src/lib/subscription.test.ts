@@ -83,3 +83,40 @@ describe('periodAmount', () => {
     expect(periodAmount(yearPlan, null, 'MONTH')).toBe(1_200_00);
   });
 });
+
+describe('periodAmount — корти', () => {
+  const plan = { price: 1000_00, period: 'MONTH' };
+
+  it('кортів не задано — суми ті самі, що й до цінника за корти', () => {
+    expect(periodAmount(plan, null, 'MONTH', undefined)).toBe(1000_00);
+    expect(periodAmount(null, null, 'YEAR', undefined)).toBe(PERIOD_PRICE.YEAR);
+  });
+
+  it('до трьох кортів без змін', () => {
+    expect(periodAmount(plan, null, 'MONTH', 3)).toBe(1000_00);
+  });
+
+  it('7 кортів: місяць 1700 грн', () => {
+    expect(periodAmount(plan, null, 'MONTH', 7)).toBe(1700_00);
+  });
+
+  it('множиться ціна плану за свій період, далі — звичайний перерахунок', () => {
+    expect(periodAmount(plan, null, 'QUARTER', 7)).toBe(5100_00);
+    expect(periodAmount(plan, null, 'YEAR', 7)).toBe(17_000_00);
+  });
+
+  it('індивідуальна ціна не множиться, у тому числі на інший період', () => {
+    expect(periodAmount(plan, 250_00, 'MONTH', 7)).toBe(250_00);
+    expect(periodAmount(plan, 250_00, 'YEAR', 7)).toBe(2_500_00);
+    expect(periodAmount(null, 250_00, 'MONTH', 7)).toBe(250_00);
+  });
+
+  it('без плану й без своєї ціни множиться загальний прайс', () => {
+    expect(periodAmount(null, null, 'MONTH', 7)).toBe(1700_00);
+    expect(periodAmount(null, null, 'MONTH', 2)).toBe(PERIOD_PRICE.MONTH);
+  });
+
+  it('нуль-ціна плану лишається нулем', () => {
+    expect(periodAmount({ price: 0, period: 'MONTH' }, null, 'MONTH', 9)).toBe(0);
+  });
+});

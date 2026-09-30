@@ -42,6 +42,17 @@ billingRouter.get(
     const info =
       clubBilling(club);
 
+    /* Ціна залежить від кількості АКТИВНИХ кортів (lib/courtPricing.ts):
+       кабінет має показати ту суму, яку клубу справді виставлять. */
+    const activeCourts =
+      await prisma.court.count({
+        where: {
+          clubId:
+            req.auth!.clubId,
+          isActive: true,
+        },
+      });
+
     /* Каталог планів — щоб кабінет показав усі тарифи, а не лише свій.
        Тільки активні: знятий з продажу план лишається у клуба, якому вже
        призначений (він приходить окремо в `plan`), але пропонувати його
@@ -113,6 +124,7 @@ billingRouter.get(
         PERIOD_PRICE,
       since:
         club.createdAt,
+      activeCourts,
 
       /* План клуб тільки ДИВИТЬСЯ. Обирає й призначає оператор платформи
          після оплати, тому жодного PATCH на план з боку кабінету немає —
@@ -130,7 +142,7 @@ billingRouter.get(
           ? {
               ...club.plan,
               /* Ціна саме для цього клубу: індивідуальна б'є ціну плану */
-              price: clubPrice(club.plan, club.planPrice),
+              price: clubPrice(club.plan, club.planPrice, activeCourts),
               /* Чи відрізняється від каталожної — кабінету знати корисно,
                  щоб не показувати «знижка» там, де її немає */
               customPrice: club.planPrice !== null,

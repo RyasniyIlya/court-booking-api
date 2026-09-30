@@ -4,8 +4,9 @@ import { sendMessage, deleteMessage, type TgUpdate } from './telegram';
 import { verifyCustomerPassword } from './customerPassword';
 import { playerKeyboard } from './botKeyboard';
 import { normalizePhone } from './phone';
-import { bookingUrl, openProfileKeyboard } from './botBooking';
+import { bookingUrl } from './botBooking';
 import { html, linkChatToCustomer, PLAYER_LINK_MINUTES } from './playerBot';
+import { askMarketingConsent, sendClubHome } from './playerHome';
 
 /**
  * Основний вхід: телефон і пароль профілю, створеного на сайті клубу.
@@ -114,16 +115,12 @@ export async function startPlayerLogin(chatId: string, slug: string): Promise<vo
 
   const existing = await prisma.customer.findFirst({
     where: { clubId: club.id, telegramChatId: chatId },
-    select: { name: true },
+    select: { id: true },
   });
   if (existing) {
-    await sendMessage(
-      chatId,
-      `Ви вже увійшли в клубі <b>${html(club.name)}</b> як <b>${html(existing.name)}</b>.\n\n/my — ваші записи · /stop — вийти`,
-      playerKeyboard(),
-    );
-    const profile = openProfileKeyboard(club.slug);
-    if (profile) await sendMessage(chatId, 'Відкрити особистий кабінет без повторного входу:', profile);
+    /* Уже в профілі — нічого не перепитуємо, а показуємо клуб: саме цього
+       людина чекає від кнопки «Мій профіль». */
+    await sendClubHome(chatId, club.id, existing.id);
     return;
   }
 
@@ -143,7 +140,7 @@ export async function startPlayerLogin(chatId: string, slug: string): Promise<vo
 export async function startLinkByCode(chatId: string, code: string): Promise<void> {
   const customer = await prisma.customer.findUnique({
     where: { tgLinkCode: code },
-    select: { id: true, clubId: true, tgLinkUntil: true, club: { select: { slug: true, name: true } } },
+    select: { id: true, clubId: true, telegramChatId: true, tgLinkUntil: true, club: { select: { slug: true, name: true } } },
   });
 
   if (!customer) {
@@ -164,6 +161,13 @@ export async function startLinkByCode(chatId: string, code: string): Promise<voi
   const club = await loginClub({ id: customer.clubId });
   if (!club) {
     await sendMessage(chatId, 'Цей клуб поки не надсилає сповіщення в Telegram.');
+    return;
+  }
+
+  /* Цей чат уже привʼязаний до цієї картки (людина натиснула посилання з
+     профілю вдруге): номер уже підтверджено, повторювати нічого. */
+  if (customer.telegramChatId === chatId) {
+    await sendClubHome(chatId, club.id, customer.id);
     return;
   }
 
@@ -338,29 +342,26 @@ async function loginByPhone(chatId: string, club: Club, phone: string, pretty: s
   return true;
 }
 
-/** Вхід вдався: привʼязати чат (див. linkChatToCustomer) і розповісти, що далі. */
+/**
+ * Вхід вдався: привʼязати чат (див. linkChatToCustomer), коротко підтвердити
+ * й одразу відкрити клуб — людина прийшла по нього, а не по інструкцію.
+ * Згоду на акції питаємо останньою й лише раз.
+ */
 async function finish(chatId: string, club: Club, customerId: string, name: string) {
   await linkChatToCustomer(chatId, club.id, customerId);
   await dropDialog(chatId);
 
+  /* Постійна клавіатура їде з цим коротким повідомленням: Telegram не
+     дозволяє в одному повідомленні дати і її, і inline-кнопки — вони
+     прийдуть у головній клубу. */
   await sendMessage(
     chatId,
-    [
-      `✅ <b>${html(name)}</b>, Telegram підключено до профілю гравця клубу <b>${html(club.name)}</b>.`,
-      '',
-      'Що я надсилатиму:',
-      '⏰ нагадування за 3 години до гри — з кнопками «Прийду» і «Скасувати»;',
-      '🔔 повідомлення, коли звільниться час, на який ви чекаєте в черзі.',
-      '',
-      'Ваші записи та профіль — у кнопках меню нижче.',
-    ].join('\n'),
+    `✅ <b>Telegram підключено</b>\n\n${html(name)}, нагадаємо про гру за 3 години до початку.`,
     playerKeyboard(),
   );
 
-  /* Inline-кнопка окремим повідомленням: Telegram не дозволяє в одному
-     повідомленні і прибрати клавіатуру під полем вводу, і дати кнопку. */
-  const markup = openProfileKeyboard(club.slug);
-  if (markup) await sendMessage(chatId, 'Відкрити особистий кабінет без повторного входу:', markup);
+  await sendClubHome(chatId, club.id, customerId);
+  await askMarketingConsent(chatId, customerId);
 }
 
 /* ── Точки входу з обробника ───────────────────────────────────────────── */

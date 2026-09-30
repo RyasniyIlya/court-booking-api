@@ -45,3 +45,30 @@ describe('subscription packages', () => {
  expect(f.ai).toBe(false);
  });
 });
+
+describe('clubPrice — множник за корти', () => {
+  const plan = { price: 1000_00 };
+
+  it('до трьох кортів ціна плану без змін', () => {
+    expect(clubPrice(plan, null, 1)).toBe(1000_00);
+    expect(clubPrice(plan, null, 3)).toBe(1000_00);
+  });
+
+  it('кортів не задано — те саме, що й раніше', () => {
+    expect(clubPrice(plan, null, undefined)).toBe(1000_00);
+    expect(clubPrice(plan, null, null)).toBe(1000_00);
+  });
+
+  it('7 кортів: 1000 грн -> 1700 грн', () => {
+    expect(clubPrice(plan, null, 7)).toBe(1700_00);
+  });
+
+  it('індивідуальна ціна корти ігнорує', () => {
+    expect(clubPrice(plan, 700_00, 7)).toBe(700_00);
+    expect(clubPrice(plan, 0, 12)).toBe(0);
+  });
+
+  it('без плану й без своєї ціни ціни немає навіть із кортами', () => {
+    expect(clubPrice(null, null, 7)).toBeNull();
+  });
+});

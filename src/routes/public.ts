@@ -797,6 +797,9 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
     birthDate: body.birthDate,
   });
   const courtPrice = courtPricing.price;
+  /* Одна й та сама цифра йде і в promoDiscount (поточний стан), і в
+     listPrice нижче (незмінний знімок на момент створення) — рахуємо раз. */
+  const promoDiscountKop = Math.max(0, courtPricing.basePrice - courtPricing.price);
 
   // Тренер: перевіряємо, що він цього клубу, активний і не зайнятий.
   // Friendly pre-check; trainer_no_overlap is the final concurrent-write guard.
@@ -934,7 +937,14 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
           promoNames: courtPricing.applied
             .map((promo) => promo.title?.trim())
             .filter((title): title is string => Boolean(title)),
-          promoDiscount: Math.max(0, courtPricing.basePrice - courtPricing.price),
+          promoDiscount: promoDiscountKop,
+          /* Знімок для звіту про окупність акцій: ціна ДО акції й id акцій,
+             застосованих САМЕ зараз. На відміну від promoNames/promoDiscount
+             вище, перенесення броні це поле більше не чіпає. */
+          listPrice: priceTotal + promoDiscountKop,
+          promoIds: courtPricing.applied
+            .map((promo) => promo.id)
+            .filter((id): id is string => Boolean(id)),
           trainerId: trainer?.id ?? null,
           trainerPrice,
           /* Платна бронь підтверджується тільки фактом повної оплати.
@@ -1668,7 +1678,7 @@ publicRouter.get('/customer/me', async (req, res) => {
     }),
     prisma.club.findUnique({
       where: { id: customer.clubId },
-      select: { timezone: true, cancelCutoffMinutes: true, passesEnabled: true, plan: true },
+      select: { slug: true, timezone: true, cancelCutoffMinutes: true, passesEnabled: true, plan: true },
     }),
     /* Минулі відвідування — тільки для підсумку в картці гравця.
        Беремо обидва джерела й лише поля, потрібні для статистики:
@@ -1823,6 +1833,11 @@ publicRouter.get('/customer/me', async (req, res) => {
          список ігор одразу, без блукання по меню. */
       gamesUrl: playerTelegramReady(club?.plan) && customer.telegramChatId
         ? `https://t.me/${process.env.TELEGRAM_BOT_USERNAME}?start=games`
+        : null,
+      /* Головна клубу в боті: гравець, який уже підключив Telegram, одним
+         дотиком потрапляє в бот одразу на свій клуб, а не на список клубів. */
+      homeUrl: playerTelegramReady(club?.plan) && customer.telegramChatId && club?.slug
+        ? `https://t.me/${process.env.TELEGRAM_BOT_USERNAME}?start=club_${club.slug}`
         : null,
     },
     waitlist: waitlist.map((w) => ({

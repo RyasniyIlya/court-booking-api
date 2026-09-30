@@ -14,6 +14,7 @@ import { hoursRouter } from './hours';
 import { clubRouter } from './club';
 import { logoRouter } from './logo';
 import { telegramRouter } from './telegram';
+import { botSettingsRouter } from './botSettings';
 import { billingRouter } from './billing';
 import { blocksRouter } from './blocks';
 import { customersRouter } from './customers';
@@ -62,6 +63,7 @@ adminRouter.use(clubRouter);
    парсер на власному шляху, тож глобальний express.json його не чіпає. */
 adminRouter.use(logoRouter);
 adminRouter.use(telegramRouter);
+adminRouter.use(botSettingsRouter);
 adminRouter.use(billingRouter);
 adminRouter.use(blocksRouter);
 adminRouter.use(customersRouter);

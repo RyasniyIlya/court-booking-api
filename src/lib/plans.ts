@@ -1,3 +1,5 @@
+import { courtPrice } from './courtPricing';
+
 export type PlanFeatures = {
   /** Тренери: картки, ціни, прив'язка до броні */
   trainers: boolean;
@@ -52,13 +54,20 @@ export function planFeatures(plan: PlanLike): PlanFeatures {
  * Індивідуальна ціна б'є ціну плану — продаємо поштучно, і домовленості
  * різні. `0` — валідна ціна (безкоштовне впровадження, перший клуб у місті),
  * тому перевірка саме на null/undefined, а не на істинність.
+ *
+ * `courts` — кількість АКТИВНИХ кортів. Ціна плану множиться параболою від
+ * кортів (lib/courtPricing.ts), а індивідуальна — ні: це домовленість про
+ * весь клуб, а не ставка за корт. Без `courts` поведінка та сама, що була
+ * до появи цінника за корти, — старі виклики не зсуваються ні на копійку.
  */
 export function clubPrice(
   plan: { price: number } | null | undefined,
   override: number | null | undefined,
+  courts?: number | null,
 ): number | null {
   if (override !== null && override !== undefined) return override;
-  return plan?.price ?? null;
+  if (!plan) return null;
+  return courtPrice(plan.price, courts);
 }
 
 /** Що вибрати в запиті до бази, щоб порахувати права. Щоб не розходилось. */

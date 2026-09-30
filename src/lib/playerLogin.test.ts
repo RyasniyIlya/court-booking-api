@@ -33,10 +33,15 @@ const prisma = {
 const sendMessage = vi.fn();
 const deleteMessage = vi.fn(async () => true);
 const verifyCustomerPassword = vi.fn();
+const sendClubHome = vi.fn(async () => true);
+const askMarketingConsent = vi.fn(async () => {});
 
 vi.mock('./db', () => ({ prisma }));
 vi.mock('./telegram', () => ({ sendMessage, deleteMessage, answerCallback: vi.fn(), editMessageText: vi.fn(), botReady: () => true }));
 vi.mock('./customerPassword', () => ({ verifyCustomerPassword }));
+/* Головну клубу й питання про згоду перевіряє playerHome.test.ts; тут важливо
+   лише те, що вхід їх викликає і в якому порядку. */
+vi.mock('./playerHome', () => ({ sendClubHome, askMarketingConsent }));
 vi.mock('./plans', () => ({ planFeatures: (plan: unknown) => ({ telegram: plan === 'max' }) }));
 vi.mock('./botBooking', () => ({
   openBookingKeyboard: () => ({ inline_keyboard: [[{ text: 'Обрати час', url: 'https://x' }]] }),
@@ -108,6 +113,21 @@ describe('/profile — телефон і пароль із сайту', () => {
     expect(linkedTo()).toEqual(['cust-1']);
     expect(dialogs.has(CHAT)).toBe(false);
     expect(JSON.stringify(sendMessage.mock.calls)).toContain('📋 Мої записи');
+    /* Замість довгої інструкції — коротке підтвердження, головна клубу й згода. */
+    expect(texts()).toContain('Telegram підключено');
+    expect(sendClubHome).toHaveBeenCalledWith(CHAT, 'club-1', 'cust-1');
+    expect(askMarketingConsent).toHaveBeenCalledWith(CHAT, 'cust-1');
+    expect(sendClubHome.mock.invocationCallOrder[0]).toBeLessThan(askMarketingConsent.mock.invocationCallOrder[0]);
+  });
+
+  it('уже підключений профіль: замість «Ви вже увійшли» — головна клубу', async () => {
+    dialogs.clear();
+    sendMessage.mockClear();
+    prisma.customer.findFirst.mockResolvedValue({ id: 'cust-1' });
+    await login.startPlayerLogin(CHAT, 'squash');
+    expect(sendClubHome).toHaveBeenCalledWith(CHAT, 'club-1', 'cust-1');
+    expect(dialogs.has(CHAT)).toBe(false);
+    expect(texts()).not.toContain('Ви вже увійшли');
   });
 
   it('профілю з таким номером немає — на сайт, нічого не створює', async () => {
@@ -190,6 +210,22 @@ describe('«Підключити Telegram» з профілю — код + пі�
     expect(texts()).toContain('•• 33');
     expect(texts()).not.toContain('+380671112233');
     expect(dialogs.has(CHAT)).toBe(false);
+  });
+
+  it('чат уже привʼязаний до цієї картки — одразу головна, без запиту номера', async () => {
+    prisma.customer.findUnique.mockResolvedValueOnce(codeRow({ telegramChatId: CHAT }));
+    await login.startLinkByCode(CHAT, 'code');
+    expect(sendClubHome).toHaveBeenCalledWith(CHAT, 'club-1', 'cust-1');
+    expect(dialogs.has(CHAT)).toBe(false);
+    expect(texts()).not.toContain('Надіслати мій номер');
+    expect(JSON.stringify(sendMessage.mock.calls)).not.toContain('request_contact');
+  });
+
+  it('код від картки, привʼязаної до ІНШОГО чату, номер усе одно питає', async () => {
+    prisma.customer.findUnique.mockResolvedValueOnce(codeRow({ telegramChatId: '999' }));
+    await login.startLinkByCode(CHAT, 'code');
+    expect(sendClubHome).not.toHaveBeenCalled();
+    expect(dialogs.get(CHAT)?.data).toEqual({ clubId: 'club-1', customerId: 'cust-1' });
   });
 
   it('протухлий код — ні діалогу, ні привʼязки', async () => {

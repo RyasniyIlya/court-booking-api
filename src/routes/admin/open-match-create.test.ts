@@ -145,3 +145,13 @@ it('leaves a private booking alone', async () => {
   expect(created()).toMatchObject({ isOpenMatch: false, capacity: null });
   expect(inviteMatch).not.toHaveBeenCalled();
 });
+
+/* Ф-7: ручне створення в кабінеті акцій не рахує, тож знімок «до акції»
+   дорівнює самій ціні — інакше звіт про окупність акцій вважав би це
+   акційною бронню без жодної акції. */
+it('records listPrice equal to priceTotal: the admin route never applies a promo', async () => {
+  await create({ customerName: 'Гравець', customerPhone: '+380671112233' });
+
+  const data = created();
+  expect(data.listPrice).toBe(data.priceTotal);
+});
