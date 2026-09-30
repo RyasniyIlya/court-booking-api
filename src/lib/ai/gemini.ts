@@ -13,6 +13,8 @@
  *   GEMINI_MODEL    — типово gemini-flash-latest (аліас на актуальну flash: конкретні версії Google знімає з обігу — 2.5-flash уже закрита для нових ключів). Швидка й дешева, для
  *                     консультацій гравцям цього вистачає; для звітів
  *                     власнику можна поставити pro.
+ *   GEMINI_FALLBACK_MODELS — запасні моделі через кому, типово
+ *                     gemini-flash-lite-latest (див. aiFallbackModels).
  */
 
 export type GeminiPart = {
@@ -94,28 +96,70 @@ export async function postWithRetry(
   }
 }
 
+/**
+ * Запасні моделі — на випадок, коли основна перевантажена (503), вичерпала
+ * квоту (429) або Google її зняв (404). Так уже було: flash-latest віддавала
+ * 503 «high demand» годинами, і ШІ-чат лежав увесь цей час, хоча lite-модель
+ * на тому ж ключі відповідала. GEMINI_FALLBACK_MODELS — через кому; порожній
+ * рядок вимикає запасні зовсім.
+ */
+export const aiFallbackModels = () => {
+  const raw = process.env.GEMINI_FALLBACK_MODELS;
+  const list = raw === undefined ? ['gemini-flash-lite-latest'] : raw.split(',');
+  return list.map((m) => m.trim()).filter((m) => m && m !== aiModel());
+};
+
+const FALLBACK_ON = new Set([404, 429, 503]);
+
+/**
+ * Скільки тримати основну модель «на лаві» після збою. Без паузи кожне
+ * питання спершу чекало б ~2 с повторів на мертвій моделі, а в циклі
+ * інструментів — на кожному кроці, і різні кроки однієї відповіді
+ * ходили б у різні моделі.
+ */
+const BENCH_MS = 5 * 60_000;
+const benchedUntil = new Map<string, number>();
+
+/** Для тестів: забути, які моделі відпочивають. */
+export const resetModelBench = () => benchedUntil.clear();
+
 /** Один запит до Gemini. Ключ іде заголовком, а не в адресі — адреси потрапляють у логи. */
 export const callGemini: GenerateFn = async (body) => {
   const key = process.env.GEMINI_API_KEY?.trim();
   if (!key) throw new AiError('AI_NOT_CONFIGURED');
 
-  const res = await postWithRetry(
-    `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(aiModel())}:generateContent`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(45_000),
-    },
-  );
+  const now = Date.now();
+  const models = [aiModel(), ...aiFallbackModels()];
+  const ready = models.filter((m) => (benchedUntil.get(m) ?? 0) <= now);
+  /* Якщо на лаві всі — пробуємо всіх: краще зайвий запит, ніж відмова без спроби. */
+  const order = ready.length ? ready : models;
 
-  if (!res.ok) {
+  let lastStatus = 0;
+  for (const model of order) {
+    const res = await postWithRetry(
+      `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(45_000),
+      },
+    );
+
+    if (res.ok) {
+      benchedUntil.delete(model);
+      return (await res.json()) as GeminiResponse;
+    }
+
     /* Тіло помилки не пробрасуємо нагору: у ньому бувають фрагменти запиту,
        а значить — чужі повідомлення гравця. У лог іде тільки статус. */
-    console.error(`[ai] gemini responded ${res.status}`);
-    throw new AiError('AI_UNAVAILABLE', String(res.status));
+    console.error(`[ai] gemini ${model} responded ${res.status}`);
+    lastStatus = res.status;
+    if (!FALLBACK_ON.has(res.status)) break;
+    benchedUntil.set(model, Date.now() + BENCH_MS);
   }
-  return (await res.json()) as GeminiResponse;
+
+  throw new AiError('AI_UNAVAILABLE', String(lastStatus));
 };
 
 /** Скільки символів відповіді інструмента віддаємо моделі. Більше — це вже дамп, а не відповідь. */
