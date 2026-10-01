@@ -7,6 +7,8 @@ import { encryptSecret, paymentsSecretReady } from '../../lib/crypto';
 import { requireAuth, requireStaff, requireRole } from './shared';
 import { logoSrcOf } from '../public';
 import { liqPayKeys } from '../../lib/payments/liqpay';
+import { wayForPayKeys } from '../../lib/payments/wayforpay';
+import { stripeKeys } from '../../lib/payments/stripe';
 import { BACKDROP_STYLES } from '../../lib/backdrop';
 
 export const clubRouter = Router();
@@ -82,6 +84,9 @@ clubRouter.get(
         ),
 
       webhookUrl:
+        `${publicBase()}/api/pay/webhook/${club.id}`,
+      /* Власнику Stripe цю адресу треба вставити в Dashboard самому. */
+      paymentWebhookUrl:
         `${publicBase()}/api/pay/webhook/${club.id}`,
 
       approvedAt:
@@ -262,7 +267,7 @@ clubRouter.patch(
           z.string()
             .trim()
             .min(10)
-            .max(400)
+            .max(600)
             .nullable()
             .optional(),
       })
@@ -317,8 +322,10 @@ clubRouter.patch(
 
     const enabled = rest.prepayEnabled ?? current?.prepayEnabled;
     const provider = rest.paymentProvider !== undefined ? rest.paymentProvider : current?.paymentProvider;
-    if (provider === 'liqpay' && paymentToken) {
-      try { liqPayKeys(paymentToken); }
+    // Ці провайдери беруть набір ключів JSON-рядком; одинокий старий токен їм не підходить.
+    const credentialCheck = { liqpay: liqPayKeys, wayforpay: wayForPayKeys, stripe: stripeKeys }[provider as string];
+    if (credentialCheck && paymentToken) {
+      try { credentialCheck(paymentToken); }
       catch { return res.status(400).json({ error: 'PAYMENT_CREDENTIALS_INVALID' }); }
     }
     // One credential set per club: keep it available to outstanding callbacks
@@ -452,6 +459,8 @@ clubRouter.patch(
           club.paymentTokenEnc,
         ),
       webhookUrl:
+        `${publicBase()}/api/pay/webhook/${club.id}`,
+      paymentWebhookUrl:
         `${publicBase()}/api/pay/webhook/${club.id}`,
     });
   },

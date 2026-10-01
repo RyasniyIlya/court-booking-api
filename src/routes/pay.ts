@@ -3,6 +3,7 @@ import { prisma } from '../lib/db';
 import { providerFor, publicBase } from '../lib/payments';
 import { applyPayEvent } from '../lib/payments/apply';
 import { LiqPayProvider } from '../lib/payments/liqpay';
+import { WayForPayProvider, WAYFORPAY_PAY_URL } from '../lib/payments/wayforpay';
 import { randomUUID } from 'node:crypto';
 import { mockPaymentsEnabled } from '../lib/payments/demo';
 
@@ -55,7 +56,8 @@ payRouter.post('/webhook/:clubId', async (req, res) => {
     return res.status(500).json({ error: 'INTERNAL' });
   }
 
-  res.json({ ok: true });
+  // Більшість банків задовольняє будь-який 200; WayForPay вимагає підписану відповідь.
+  res.json(provider.webhookAck?.(event) ?? { ok: true });
 });
 
 /* ── Куди повертається гравець ───────────────────────────────────────────── */
@@ -100,6 +102,73 @@ payRouter.get('/liqpay/checkout', async (req, res) => {
     <input type="hidden" name="data" value="${esc(data)}"><input type="hidden" name="signature" value="${esc(signature)}">
     <button type="submit">Перейти до оплати</button></form>
     <script nonce="${nonce}">document.getElementById('checkout').submit()</script></body></html>`);
+});
+
+const noStore = { 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer', 'X-Content-Type-Options': 'nosniff' };
+const UUID36 = /^[a-f0-9-]{36}$/;
+
+/**
+ * GET /api/pay/wayforpay/checkout — проміжна сторінка: браузер не вміє POST із посилання,
+ * а форма Purchase приймає лише POST. Поля форми лежать у d і підписані міткою t
+ * ключем клубу, тож підробити суму чи мерчанта в посиланні не вийде.
+ */
+payRouter.get('/wayforpay/checkout', async (req, res) => {
+  res.set(noStore);
+  const { ref, d, t } = req.query;
+  if (typeof ref !== 'string' || typeof d !== 'string' || typeof t !== 'string' || d.length > 8000 || t.length > 200 || !UUID36.test(ref)) {
+    return res.sendStatus(400);
+  }
+  // Невіримий ref слугує лише для пошуку ключів; нічого не йде до банку, доки не перевірено мітку й живу бронь.
+  const payment = await prisma.payment.findUnique({
+    where: { provider_providerRef: { provider: 'wayforpay', providerRef: ref } },
+    include: { club: true, booking: true, seat: { include: { booking: true } } },
+  });
+  if (!payment) return res.sendStatus(404);
+  const provider = providerFor(payment.club);
+  if (!(provider instanceof WayForPayProvider)) return res.sendStatus(409);
+  let fields;
+  try { fields = provider.readCheckout(ref, d, t); }
+  catch { return res.sendStatus(400); }
+  if (Math.round(Number(fields.amount) * 100) !== payment.amount) return res.sendStatus(400);
+  const target = payment.seat ?? payment.booking;
+  const expires = (Number(fields.orderDate) + Number(fields.orderTimeout)) * 1000;
+  if (payment.status !== 'PENDING' || !target || target.status !== 'PENDING'
+    || !target.expiresAt || target.expiresAt.getTime() <= Date.now()
+    || !Number.isFinite(expires) || expires <= Date.now()
+    || (payment.seat && ['CANCELLED', 'EXPIRED'].includes(payment.seat.booking.status))) {
+    return res.status(410).type('text').send('Ця оплата вже завершена або час бронювання минув. Поверніться до розкладу.');
+  }
+  const inputs = Object.entries(fields).flatMap(([name, value]) =>
+    (Array.isArray(value) ? value : [value]).map((v) => `<input type="hidden" name="${esc(name)}" value="${esc(v)}">`)).join('');
+  const nonce = randomUUID();
+  res.set('Content-Security-Policy', `default-src 'none'; script-src 'nonce-${nonce}'; form-action ${new URL(WAYFORPAY_PAY_URL).origin}; base-uri 'none'; frame-ancestors 'none'`);
+  return res.type('html').send(`<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Оплата WayForPay</title></head><body>
+    <p>Переходимо до безпечної оплати WayForPay…</p>
+    <form id="checkout" method="POST" action="${WAYFORPAY_PAY_URL}" accept-charset="utf-8">
+    ${inputs}<button type="submit">Перейти до оплати</button></form>
+    <script nonce="${nonce}">document.getElementById('checkout').submit()</script></body></html>`);
+});
+
+/**
+ * ALL /api/pay/wayforpay/return — сюди WayForPay повертає гравця (за документацією — returnUrl; метод
+ * не зазначено, тож приймаємо будь-який). Ми лише відправляємо його далі на підписану адресу сайту клубу.
+ * Тіло ігнорується: статус платежу береться тільки з підписаного вебхука serviceUrl.
+ * Без дійсної мітки — 400, тож це не відкритий редірект.
+ */
+payRouter.all('/wayforpay/return', async (req, res) => {
+  res.set(noStore);
+  const { ref, to, t } = req.query;
+  if (typeof ref !== 'string' || typeof to !== 'string' || typeof t !== 'string' || to.length > 4000 || t.length > 200 || !UUID36.test(ref)) {
+    return res.sendStatus(400);
+  }
+  const payment = await prisma.payment.findUnique({
+    where: { provider_providerRef: { provider: 'wayforpay', providerRef: ref } },
+    include: { club: true },
+  });
+  if (!payment) return res.sendStatus(400);
+  const provider = providerFor(payment.club);
+  if (!(provider instanceof WayForPayProvider) || !provider.verifyReturn(ref, to, t)) return res.sendStatus(400);
+  return res.redirect(303, to);
 });
 
 const page = (title: string, body: string) => `<!doctype html>

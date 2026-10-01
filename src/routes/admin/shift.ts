@@ -5,6 +5,7 @@ import { prisma } from '../../lib/db';
 import { planFeatures } from '../../lib/plans';
 import { sendMessage } from '../../lib/telegram';
 import { needsNote, shiftByAccount, shiftStart, shiftText, shiftTotals } from '../../lib/shift';
+import { LEDGER_ENTRY_SELECT, dayRange, pageAfter, shiftPeriodTotals } from '../../lib/cashdesk';
 import { requireAuth, requireStaff } from './shared';
 
 export const shiftRouter = Router();
@@ -174,13 +175,93 @@ shiftRouter.post('/shift/close', requireAuth, requireStaff, async (req, res) => 
   }
 });
 
-/** GET /api/admin/shifts — останні закриті зміни, найновіші зверху. */
+const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
+/** Операцій у деталях однієї зміни: більше за зміну не набирається, а це захист від аварії. */
+const DETAIL_MAX = 1000;
+
+const shiftsQuery = z.object({
+  from: z.string().regex(DATE_ONLY).optional(),
+  to: z.string().regex(DATE_ONLY).optional(),
+  cursor: z.string().uuid().optional(),
+  limit: z.coerce.number().int().min(1).max(100).catch(30),
+});
+
+/**
+ * GET /api/admin/shifts — закриті зміни, найновіші зверху.
+ *
+ * Без `from`/`to` — як і раніше: масив останніх змін (`?limit` до 60), на цьому
+ * тримається вікно закриття зміни. З періодом — обʼєкт: сторінка змін за
+ * курсором і підсумок по ВСІХ змінах періоду, не лише по сторінці.
+ *
+ * Період — локальні дати клубу, `to` включно; межі доби беруться в таймзоні
+ * клубу, а не сервера. Зміну відносимо до періоду за моментом закриття:
+ * вона «належить» вечору, коли її звірили.
+ */
 shiftRouter.get('/shifts', requireAuth, requireStaff, async (req, res) => {
-  const limit = z.coerce.number().int().min(1).max(60).catch(20).parse(req.query.limit);
-  const items = await prisma.shiftClose.findMany({
-    where: { clubId: req.auth!.clubId },
-    orderBy: { closedAt: 'desc' },
-    take: limit,
+  const clubId = req.auth!.clubId;
+
+  if (req.query.from === undefined && req.query.to === undefined) {
+    const limit = z.coerce.number().int().min(1).max(60).catch(20).parse(req.query.limit);
+    const items = await prisma.shiftClose.findMany({
+      where: { clubId },
+      orderBy: { closedAt: 'desc' },
+      take: limit,
+    });
+    return res.json(items);
+  }
+
+  const parsed = shiftsQuery.safeParse(req.query);
+  if (!parsed.success || !parsed.data.from || !parsed.data.to) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const q = parsed.data;
+
+  const club = await prisma.club.findUniqueOrThrow({ where: { id: clubId }, select: { timezone: true } });
+  const range = dayRange(q.from!, q.to!, club.timezone);
+  if (!range) return res.status(400).json({ error: 'BAD_PERIOD' });
+
+  /* Увесь період одним читанням: підсумок однаково потребує всіх змін, а
+     їх за рік — кілька сотень рядків. Сторінка — зріз цього ж списку. */
+  const all = await prisma.shiftClose.findMany({
+    where: { clubId, closedAt: { gte: range.start, lt: range.endExclusive } },
+    orderBy: [{ closedAt: 'desc' }, { id: 'desc' }],
   });
-  res.json(items);
+  const page = pageAfter(all, q.cursor, q.limit);
+  if (!page) return res.status(400).json({ error: 'BAD_CURSOR' });
+
+  res.json({ items: page.items, totals: shiftPeriodTotals(all), nextCursor: page.nextCursor });
+});
+
+/**
+ * GET /api/admin/shifts/:id — закрита зміна з усіма операціями.
+ *
+ * Операції зміни — ті, що лягли в журнал після відкриття й до закриття
+ * включно (так само, як їх рахувало закриття). Підсумки тут — по
+ * операціях, а не копія полів закриття: якщо вони розійшлися, розбіжність
+ * видно, а не сховано.
+ *
+ * Чужа зміна — 404, а не 403: клуб не повинен дізнаватись, що такий id існує.
+ */
+shiftRouter.get('/shifts/:id', requireAuth, requireStaff, async (req, res) => {
+  const id = z.string().uuid().safeParse(req.params.id);
+  if (!id.success) return res.status(404).json({ error: 'NOT_FOUND' });
+  const clubId = req.auth!.clubId;
+
+  const close = await prisma.shiftClose.findFirst({ where: { id: id.data, clubId } });
+  if (!close) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const found = await prisma.bookingLedgerEntry.findMany({
+    where: { clubId, createdAt: { gt: close.openedAt, lte: close.closedAt } },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: DETAIL_MAX + 1,
+    select: LEDGER_ENTRY_SELECT,
+  });
+  const truncated = found.length > DETAIL_MAX;
+  const entries = truncated ? found.slice(0, DETAIL_MAX) : found;
+
+  res.json({
+    close,
+    totals: shiftTotals(entries),
+    byAccount: shiftByAccount(entries),
+    entries,
+    truncated,
+  });
 });

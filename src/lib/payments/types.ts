@@ -55,6 +55,8 @@ export interface PayProvider {
    * Кидає помилку, якщо підпис не збігся.
    */
   parseWebhook(rawBody: Buffer, headers: NodeJS.Dict<string | string[]>): Promise<WebhookEvent>;
+  /** Тіло відповіді на вебхук, якщо провайдер вимагає власний формат підтвердження. */
+  webhookAck?(event: WebhookEvent): unknown;
   /** Повернення грошей за оплаченою бронню */
   refund(providerRef: string, amountKop: number): Promise<void>;
   /** Погасити невикористаний рахунок, щоб не висів у клуба в кабінеті банку */

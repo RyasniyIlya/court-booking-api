@@ -1508,6 +1508,8 @@ model BookingLedgerEntry {
   @@unique([clubId, requestId])
   @@index([clubId, bookingId, seatId])
   @@index([originalId])
+  /// Журнал каси за період і закриття зміни (createdAt > openedAt).
+  @@index([clubId, createdAt])
 }
 
 /// Подарунки й ручні коригування бонусів у картці клієнта.

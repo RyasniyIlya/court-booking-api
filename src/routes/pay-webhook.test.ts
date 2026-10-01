@@ -203,3 +203,49 @@ describe('POST /api/pay/webhook/:clubId', () => {
     expect(applyPayEvent).not.toHaveBeenCalled();
   });
 });
+
+describe('webhook acknowledgement', () => {
+  /* Провайдер із власним форматом підтвердження (WayForPay) отримує його
+     замість стандартного { ok: true } — інакше банк повторював би вебхук
+     до 4 діб. Решта провайдерів лишається на { ok: true }. */
+  it('віддає тіло з webhookAck, якщо провайдер його має', async () => {
+    const event = { providerRef: 'ord_1', status: 'paid' as const, amountKop: 100 };
+    const webhookAck = vi.fn(() => ({ accept: 'custom' }));
+    providerFor.mockReturnValue({ name: 'custom', parseWebhook: async () => event, webhookAck });
+
+    const res = await request(appRaw).post(`/api/pay/webhook/${CLUB_ID}`).set('Content-Type', 'application/json').send('{}');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ accept: 'custom' });
+    expect(webhookAck).toHaveBeenCalledWith(event);
+    expect(applyPayEvent).toHaveBeenCalledWith('custom', event, CLUB_ID);
+  });
+
+  it('без webhookAck відповідь лишається { ok: true }', async () => {
+    providerFor.mockReturnValue({ name: 'plain', parseWebhook: async () => ({ providerRef: 'ord_1', status: 'paid' }) });
+
+    const res = await request(appRaw).post(`/api/pay/webhook/${CLUB_ID}`).set('Content-Type', 'application/json').send('{}');
+
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true });
+  });
+
+  it('справжній WayForPay: підписаний вебхук дає підписане підтвердження', async () => {
+    const { createHmac } = await import('node:crypto');
+    const { WayForPayProvider } = await import('../lib/payments/wayforpay');
+    const creds = { merchantAccount: 'club_example_com', secretKey: 'secret_key_12345', domain: 'club.example.com' };
+    providerFor.mockImplementation(() => new WayForPayProvider(JSON.stringify(creds)));
+    const md5 = (f: string[]) => createHmac('md5', creds.secretKey).update(f.join(';')).digest('hex');
+    const body = {
+      merchantAccount: creds.merchantAccount, orderReference: 'ord_1', amount: 450, currency: 'UAH', authCode: '1', cardPan: '41****1111',
+      transactionStatus: 'Approved', reasonCode: 1100, merchantSignature: md5([creds.merchantAccount, 'ord_1', '450', 'UAH', '1', '41****1111', 'Approved', '1100']),
+    };
+
+    const res = await request(appRaw).post(`/api/pay/webhook/${CLUB_ID}`).set('Content-Type', 'application/json').send(JSON.stringify(body));
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ orderReference: 'ord_1', status: 'accept' });
+    expect(res.body.signature).toBe(md5(['ord_1', 'accept', String(res.body.time)]));
+    expect(applyPayEvent).toHaveBeenCalledWith('wayforpay', expect.objectContaining({ providerRef: 'ord_1', status: 'paid', amountKop: 45000 }), CLUB_ID);
+  });
+});
