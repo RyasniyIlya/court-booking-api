@@ -27,6 +27,7 @@ import { birthDateText, birthDateValue, dateOnly } from '../lib/birthday';
 import { isRegistrationOpen, registrationClosesAt } from '../lib/registrationCutoff';
 import { resolveJoinPayment, tournamentPayMode } from '../lib/tournamentPay';
 import { courtPriceWithPromos, bestPromo, promoPrice } from '../lib/promo';
+import { courtPhotoUrl } from '../lib/courtMedia';
 import { canCancelNow, cancelBookingByCustomer, cancelSeatByCustomer } from '../lib/customerCancel';
 import { botReady } from '../lib/telegram';
 import { planFeatures } from '../lib/plans';
@@ -152,7 +153,12 @@ async function loadClub(slug: string) {
       hours: true,
       /* Тільки заради «чи шле клуб гравцям у Telegram» — рядок плану крихітний. */
       plan: true,
-      courts: { where: { isActive: true }, orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }] },
+      courts: {
+        where: { isActive: true },
+        orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
+        /* Тільки id знімків: байти віддає окремий роут, який браузер кешує. */
+        include: { photos: { select: { id: true }, orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }] } },
+      },
       /* Тільки увімкнені: правило, яке клуб вимкнув, не має ні рахувати
          ціну, ні їхати в кожну відповідь віджета. Рядків одиниці. */
       promos: { where: { isActive: true } },
@@ -252,6 +258,10 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
       name: c.name,
       pricePerHour: c.pricePerHour,
       slotMinutes: c.slotMinutes ?? club.slotMinutes,
+      /* Обкладинка перша. Порожній список і null — віджет малює рядок
+         корту як раніше, без галереї. */
+      photos: c.photos.map((p) => courtPhotoUrl(p.id)),
+      videoUrl: c.videoUrl,
     })),
     // Чи є сенс показувати вибір тренера. Сам список тягнемо окремо —
     // він залежить від обраної години.
@@ -322,6 +332,30 @@ publicRouter.get('/clubs/:slug/logo', async (req, res) => {
   }
 
   res.send(club.logoData);
+});
+
+/**
+ * GET /api/public/courts/photos/:id — знімок корту для галереї віджета.
+ *
+ * Адреса незмінна: знімок не перезаписується, а видаляється й заводиться
+ * новим рядком, тож кеш на рік безпечний і без мітки часу в адресі.
+ */
+publicRouter.get('/courts/photos/:id', async (req, res) => {
+  const id = z.string().uuid().safeParse(req.params.id);
+  if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const photo = await prisma.courtPhoto.findUnique({
+    where: { id: id.data },
+    select: { data: true, mime: true },
+  });
+  if (!photo) return res.status(404).json({ error: 'NO_PHOTO' });
+
+  res.setHeader('Content-Type', photo.mime);
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', 'inline');
+
+  res.send(photo.data);
 });
 
 /**

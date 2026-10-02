@@ -741,13 +741,36 @@ model Court {
   slotMinutes  Int?
   sortOrder    Int     @default(0)
   isActive     Boolean @default(true)
+  /// Ролик про корт — канонічне посилання на YouTube або Vimeo. Саме відео
+  /// в базі не лежить: це десятки мегабайт, і роздавати їх із Postgres нічим.
+  videoUrl     String?
 
   bookings Booking[]
   blocks   Block[]
   notes    Note[]
   waitlist WaitlistEntry[]
+  photos   CourtPhoto[]
 
   @@index([clubId, isActive])
+}
+
+/// Знімок корту для віджета. Окремою таблицею, а не колонками в Court:
+/// корт читається десятками запитів без select, і байти в тому ж рядку
+/// їхали б із бази на кожну бронь. Тут вони дістаються тільки тоді, коли
+/// браузер просить саме картинку.
+model CourtPhoto {
+  id        String   @id @default(uuid()) @db.Uuid
+  courtId   String   @db.Uuid
+  court     Court    @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  /// Денормалізовано: межа клубу перевіряється одним where, без join.
+  clubId    String   @db.Uuid
+  data      Bytes
+  mime      String
+  /// Найменший номер — обкладинка: саме її видно в рядку корту у віджеті.
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([courtId, sortOrder])
 }
 
 model Booking {
