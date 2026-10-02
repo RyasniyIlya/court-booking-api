@@ -44,7 +44,7 @@ describe('buildCustomerHealth', () => {
     expect(s.last30d.reactivated).toBe(0);
   });
 
-  it('at-risk value — гроші тих, хто був у попередньому вікні (31-60 днів) і зник у поточному', () => {
+  it('at-risk value — гроші FADING-клієнтів за 30 днів до їхнього останнього візиту', () => {
     const customers = [
       { id: 'atrisk', createdAt: daysAgo(200) },
       { id: 'safe', createdAt: daysAgo(200) },
@@ -55,7 +55,8 @@ describe('buildCustomerHealth', () => {
       { customerId: 'safe', at: daysAgo(5), price: 20000 },    // і в поточному теж -> не at-risk
     ];
     const s = buildCustomerHealth({ customers, allVisits }, NOW);
-    expect(s.last30d.atRisk).toBe(1);
+    expect(s.atRisk).toBe(1);
+    expect(s.atRisk).toBe(s.segments.FADING);
     expect(s.atRiskValueUah).toBe(300); // 30000 коп -> 300 грн, гроші тільки atrisk
   });
 

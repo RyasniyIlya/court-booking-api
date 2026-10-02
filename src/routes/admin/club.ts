@@ -10,6 +10,8 @@ import { liqPayKeys } from '../../lib/payments/liqpay';
 import { wayForPayKeys } from '../../lib/payments/wayforpay';
 import { stripeKeys } from '../../lib/payments/stripe';
 import { BACKDROP_STYLES } from '../../lib/backdrop';
+import { Prisma } from '@prisma/client';
+import { analyticsThresholdsSchema, readAnalyticsThresholds } from '../../lib/analyticsThresholds';
 
 export const clubRouter = Router();
 
@@ -109,6 +111,10 @@ clubRouter.get(
         club.vatPayer,
       taxFixedMonthly:
         club.taxFixedMonthly,
+
+      /* Цілі аналітики: бачить увесь персонал, міняє лише власник. */
+      analyticsThresholds:
+        readAnalyticsThresholds(club.analyticsThresholds),
     });
   },
 );
@@ -270,6 +276,12 @@ clubRouter.patch(
             .max(600)
             .nullable()
             .optional(),
+
+        /* null скидає до дефолтів веб-клієнта. */
+        analyticsThresholds:
+          analyticsThresholdsSchema
+            .nullable()
+            .optional(),
       })
       .safeParse(
         req.body,
@@ -283,8 +295,17 @@ clubRouter.patch(
 
     const {
       paymentToken,
+      analyticsThresholds,
       ...rest
     } = parsed.data;
+
+    // Цілі аналітики міняє тільки власник; модератор їх лише бачить.
+    if (analyticsThresholds !== undefined && req.auth!.role !== 'OWNER') {
+      return res.status(403).json({
+        error: 'FORBIDDEN',
+        requiredRole: ['OWNER'],
+      });
+    }
 
     // Порівнюємо зі СПРАВЖНІМИ значеннями в базі, а не з тим, чи поле
     // взагалі є в тілі запиту: майстер клубу (ClubSetupWizard) шле club
@@ -352,6 +373,10 @@ clubRouter.patch(
     > = {
       ...rest,
     };
+
+    if (analyticsThresholds !== undefined) {
+      data.analyticsThresholds = analyticsThresholds === null ? Prisma.DbNull : analyticsThresholds;
+    }
 
     if (provider !== current?.paymentProvider && paymentToken === undefined) {
       data.paymentTokenEnc = null;
@@ -462,6 +487,8 @@ clubRouter.patch(
         `${publicBase()}/api/pay/webhook/${club.id}`,
       paymentWebhookUrl:
         `${publicBase()}/api/pay/webhook/${club.id}`,
+      analyticsThresholds:
+        readAnalyticsThresholds(club.analyticsThresholds),
     });
   },
 );

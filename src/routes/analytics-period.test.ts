@@ -17,7 +17,7 @@ vi.mock('./admin', () => ({
   requireFeature: () => vi.fn(),
 }));
 
-const { periodBounds } = await import('./analytics');
+const { periodBounds, deepOperationalWindow } = await import('./analytics');
 
 const TZ = 'Europe/Kyiv';
 const anchor = DateTime.fromISO('2026-09-12T12:00:00', { zone: TZ });
@@ -83,5 +83,29 @@ describe('готові періоди не змінились', () => {
 
     expect(kyiv(b.current.start)).toBe('2026-09-01T00:00:00.000+03:00');
     expect(kyiv(b.previous.start)).toBe('2026-08-01T00:00:00.000+03:00');
+  });
+});
+
+describe('операційне вікно /deep', () => {
+  it('custom дає вікно рівно з вибраних дат у таймзоні клубу', () => {
+    const w = deepOperationalWindow({ period: 'custom', from: '2026-08-24', to: '2026-09-02' }, TZ, anchor)!;
+
+    expect(kyiv(w.from)).toBe('2026-08-24T00:00:00.000+03:00');
+    expect(kyiv(w.to)).toBe('2026-09-02T23:59:59.999+03:00');
+  });
+
+  it('custom без дат або перевернутий — null (400)', () => {
+    expect(deepOperationalWindow({ period: 'custom' }, TZ, anchor)).toBeNull();
+    expect(deepOperationalWindow({ period: 'custom', from: '2026-09-10', to: '2026-09-01' }, TZ, anchor)).toBeNull();
+  });
+
+  it('week і month — від початку періоду до зараз, як раніше', () => {
+    const wk = deepOperationalWindow({ period: 'week' }, TZ, anchor)!;
+    expect(kyiv(wk.from)).toBe('2026-09-07T00:00:00.000+03:00');
+    expect(wk.to.getTime()).toBe(anchor.toMillis());
+
+    const mo = deepOperationalWindow({ period: 'month' }, TZ, anchor)!;
+    expect(kyiv(mo.from)).toBe('2026-09-01T00:00:00.000+03:00');
+    expect(mo.to.getTime()).toBe(anchor.toMillis());
   });
 });

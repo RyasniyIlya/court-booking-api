@@ -41,7 +41,8 @@ describe('get_customer_health', () => {
     totalCustomers: 40,
     segments: { NEW: 5, ACTIVE: 20, FADING: 10, LOST: 5 },
     thresholds: { activeDays: 30, fadingDays: 90, newVisits: 5 },
-    last30d: { active: 25, new: 5, returning: 15, reactivated: 2, atRisk: 8, retentionPct: 60 },
+    last30d: { active: 25, new: 5, returning: 15, reactivated: 2, retentionPct: 60 },
+    atRisk: 10,
     atRiskValueUah: 12000,
   };
 
@@ -51,7 +52,8 @@ describe('get_customer_health', () => {
     expect(out).toMatchObject({
       total_customers: 40,
       segments: { NEW: 5, ACTIVE: 20, FADING: 10, LOST: 5 },
-      last_30d: { active: 25, new: 5, returning: 15, reactivated: 2, at_risk: 8, retention_pct: 60 },
+      last_30d: { active: 25, new: 5, returning: 15, reactivated: 2, retention_pct: 60 },
+      at_risk: 10,
       at_risk_value_uah: 12000,
     });
     expect(out.how_to_see_names).toMatch(/Клієнти/);

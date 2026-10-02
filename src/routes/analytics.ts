@@ -119,18 +119,69 @@ export function periodBounds(q: PeriodQuery, tz: string, anchor: DateTime) {
   };
 }
 
-async function periodStats(clubId: string, start: Date, end: Date) {
+/**
+ * Візити клубу за період: ті самі два джерела, що в картотеці
+ * (`loadRoster`) і в Deep (`retentionFromVisits`).
+ *
+ * Людина в груповому занятті — це BookingSeat, а не Booking.customerId
+ * (у контейнера групи він порожній), тому раніше «різні клієнти» і топ
+ * її не бачили. Рішення, як у картотеці: місце зі статусом BOOKED у
+ * підтвердженій броні — це один візит на ціну місця (`seat.price`); бронь
+ * корту — один візит на `priceTotal`. Дубля однієї людини немає: різних
+ * клієнтів рахуємо за Set по customerId, а візити й гроші складаються.
+ */
+export async function loadPeriodVisits(clubId: string, start: Date, end: Date) {
+  const [bookings, seats] = await Promise.all([
+    prisma.booking.findMany({
+      where: {
+        clubId,
+        status: 'CONFIRMED',
+        startTime: { gte: start, lte: end },
+        customerId: { not: null },
+      },
+      select: { customerId: true, priceTotal: true },
+    }),
+    prisma.bookingSeat.findMany({
+      where: {
+        status: 'BOOKED',
+        customerId: { not: null },
+        /* clubId через контейнер: у місця свого немає. */
+        booking: { clubId, status: 'CONFIRMED', startTime: { gte: start, lte: end } },
+      },
+      select: { customerId: true, price: true },
+    }),
+  ]);
+  return [
+    ...bookings.map((b) => ({ customerId: b.customerId as string, money: b.priceTotal })),
+    ...seats.map((s) => ({ customerId: s.customerId as string, money: s.price })),
+  ];
+}
+
+/** Візити -> по людині: скільки разів і на яку суму. */
+export function tallyVisits(visits: { customerId: string; money: number }[]) {
+  const byCustomer = new Map<string, { visits: number; spend: number }>();
+  for (const v of visits) {
+    const row = byCustomer.get(v.customerId) ?? { visits: 0, spend: 0 };
+    row.visits += 1;
+    row.spend += v.money;
+    byCustomer.set(v.customerId, row);
+  }
+  return byCustomer;
+}
+
+export async function periodStats(clubId: string, start: Date, end: Date) {
   const bookings = await prisma.booking.findMany({
     where: {
       clubId,
       status: 'CONFIRMED',
       startTime: { gte: start, lte: end },
     },
-    select: { priceTotal: true, customerId: true },
+    select: { priceTotal: true },
   });
 
   const revenue = bookings.reduce((s, b) => s + b.priceTotal, 0);
-  const uniqueCustomers = new Set(bookings.map((b) => b.customerId).filter(Boolean)).size;
+  /* Різні клієнти — і власники броней, і учасники місць групових занять. */
+  const uniqueCustomers = tallyVisits(await loadPeriodVisits(clubId, start, end)).size;
 
   return { bookings: bookings.length, revenue, uniqueCustomers };
 }
@@ -206,24 +257,7 @@ analyticsRouter.get('/customers/top', async (req, res) => {
   if (!bounds) return res.status(400).json({ error: 'BAD_PERIOD' });
   const { current } = bounds;
 
-  const bookings = await prisma.booking.findMany({
-    where: {
-      clubId: req.auth!.clubId,
-      status: 'CONFIRMED',
-      startTime: { gte: current.start, lte: current.end },
-      customerId: { not: null },
-    },
-    select: { customerId: true, priceTotal: true },
-  });
-
-  const byCustomer = new Map<string, { visits: number; spend: number }>();
-  for (const b of bookings) {
-    const id = b.customerId!;
-    const row = byCustomer.get(id) ?? { visits: 0, spend: 0 };
-    row.visits += 1;
-    row.spend += b.priceTotal;
-    byCustomer.set(id, row);
-  }
+  const byCustomer = tallyVisits(await loadPeriodVisits(req.auth!.clubId, current.start, current.end));
 
   const top = [...byCustomer.entries()]
     .sort((a, b) => b[1].visits - a[1].visits)
@@ -429,7 +463,23 @@ analyticsRouter.get('/load', async (req, res) => {
 /* -------------------------------------------------------------------------- */
 
 /**
- * GET /api/admin/analytics/deep?period=week|month
+ * Операційне вікно /deep (воронка, утримання).
+ *
+ * week/month — від початку періоду до «зараз», як і було. custom — рівно
+ * від from до кінця to в таймзоні клубу (ті самі межі й ліміт 366 днів, що
+ * у решти звітів через periodBounds); null — діапазон нечитабельний (400).
+ */
+export function deepOperationalWindow(q: PeriodQuery, tz: string, now: DateTime) {
+  if (q.period === 'custom') {
+    const bounds = periodBounds(q, tz, now);
+    return bounds ? { from: bounds.current.start, to: bounds.current.end } : null;
+  }
+  const unit = q.period === 'week' ? 'week' : 'month';
+  return { from: now.setZone(tz).startOf(unit).toJSDate(), to: now.toJSDate() };
+}
+
+/**
+ * GET /api/admin/analytics/deep?period=week|month|custom&from=&to=
  *
  * Дорогий, але один агрегований зріз для найвищого пакета. Він навмисно
  * об'єднує три різні питання власника:
@@ -458,9 +508,9 @@ analyticsRouter.get('/deep', async (req, res) => {
 
   const now = DateTime.now().setZone(club.timezone);
   const period = parsed.data.period;
-  const unit = period === 'week' ? 'week' : 'month';
-  const operationalFrom = now.startOf(unit as 'week' | 'month').toJSDate();
-  const operationalTo = now.toJSDate();
+  const window = deepOperationalWindow(parsed.data, club.timezone, now);
+  if (!window) return res.status(400).json({ error: 'BAD_PERIOD' });
+  const { from: operationalFrom, to: operationalTo } = window;
 
   // Рівно вісім завершених тижнів — для змінного попиту це достатньо
   // згладжує випадковість, але ще не перетворює літні дані на «норму» зими.
@@ -579,8 +629,8 @@ analyticsRouter.get('/deep', async (req, res) => {
   }
   if (retention.atRiskIds.length >= 3) {
     insights.push({
-      tone: 'watch', title: `${retention.atRiskIds.length} клієнтів під ризиком відтоку`,
-      body: 'Вони приходили у попередні 30 днів, але не повернулися в останні 30. Нижче є контакти для персонального нагадування.',
+      tone: 'watch', title: `${retention.atRiskIds.length} клієнтів під ризиком`,
+      body: 'Останній візит 30–90 днів тому — це сегмент «Згасає» в картотеці (те саме число). Нижче є контакти для персонального нагадування, повний список — у «Клієнти → Під ризиком».',
     });
   }
   if (funnel.conversionRate !== null && funnel.conversionRate >= 85 && load.totals.occupancy >= 0.65) {

@@ -169,7 +169,7 @@ financeRouter.get('/cashbook', async (req, res) => {
   ]);
 
   const summary = summarize(rows, tz, from, to);
-  const yearNet = summarize(yearRows, tz, yearStart, yearStart).net;
+  const yearNet = summarize(yearRows, tz, yearStart, to).net;
 
   res.json({
     from: range.start.toFormat('yyyy-MM-dd'),

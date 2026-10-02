@@ -6,6 +6,8 @@
  * контроллеру и UI.
  */
 
+import { tierOf } from './customerRoster';
+
 export type Visit = { customerId: string; at: Date };
 
 export type Retention = {
@@ -21,6 +23,17 @@ export type Retention = {
 const unique = (values: string[]) => new Set(values);
 
 /**
+ * ── «Під ризиком» тут і скрізь — це FADING з картотеки ───────────────────
+ *
+ * Раніше `atRiskIds` мав власне вікно «був 30–60 днів тому, не був за
+ * останні 30». Хто не заходив понад 60 днів, зникав зі списку, хоча в
+ * картотеці лишався «Згасає» (до 90). Тепер одне означення на весь
+ * продукт: `tierOf` дає FADING — останній візит TIER_ACTIVE_DAYS…
+ * TIER_FADING_DAYS днів тому. Другого обчислення відтоку немає.
+ * `windowDays` на це не впливає: вікно потрібне лише для
+ * active/new/returning/reactivated/retentionRate — вони описують рух за
+ * період і відтоком не називаються.
+ *
  * Повернення вважаємо тільки для клієнта, що був у попередньому такому ж
  * вікні. Новий — це той, чий перший підтверджений візит припав на поточне
  * вікно. Той, хто прийшов після паузи, не губиться між ними: це reactivated.
@@ -61,7 +74,11 @@ export function retentionFromVisits(
   const returning = active.filter((id) => previousSet.has(id));
   const fresh = active.filter((id) => (first.get(id) ?? 0) >= currentFrom);
   const reactivated = active.filter((id) => !previousSet.has(id) && olderSet.has(id));
-  const atRiskIds = previous.filter((id) => !activeSet.has(id));
+  const atRiskIds: string[] = [];
+  for (const [id, dates] of byCustomer) {
+    const last = new Date(Math.max(...dates));
+    if (tierOf(last, last, now) === 'FADING') atRiskIds.push(id);
+  }
 
   return {
     windowDays,

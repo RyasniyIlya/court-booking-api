@@ -82,6 +82,9 @@ enum UserRole {
 /// Спортивний клуб = один тенант SaaS
 model Club {
   settlementSettings Json                 @default("{}")
+  /// Цілі й пороги екрана аналітики: { occupancy, cancellation, retention }, %.
+  /// null = дефолти веб-клієнта. Форма — lib/analyticsThresholds.ts.
+  analyticsThresholds Json?
   /// Налаштування клубу в спільному Telegram-боті: привітання, що показувати,
   /// повернення тих, хто давно не грав. Форма — lib/clubBot.ts (BotSettings);
   /// читати тільки через normalizeBotSettings: у базі може лежати що завгодно.

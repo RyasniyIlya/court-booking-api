@@ -1,6 +1,6 @@
 import { prisma } from '../db';
 import { TIER_ACTIVE_DAYS, TIER_FADING_DAYS, TIER_NEW_VISITS, tierOf, type CustomerTier } from '../customerRoster';
-import { retentionFromVisits, type Visit } from '../deepAnalytics';
+import { retentionFromVisits } from '../deepAnalytics';
 
 /**
  * «Здоров'я» клієнтської бази для нейроаналітика власника: скільки людей у
@@ -16,16 +16,14 @@ import { retentionFromVisits, type Visit } from '../deepAnalytics';
  * дата+ціна візиту, з тих самих двох джерел (Booking, BookingSeat), що й
  * картотека, — щоб сегменти тут і на екрані «Клієнти» не розійшлись.
  *
- * ── Синтетична точка «перший візит за все життя» ─────────────────────────
+ * ── Одне число «під ризиком» ─────────────────────────────────────────────
  *
- * `retentionFromVisits` бачить лише те, що йому передали. Дай їй тільки
- * останні 60 днів — і клієнт, який ходив рік тому й повернувся цього
- * місяця, стане «новачком», а не «поверненцем»: усередині вікна це його
- * єдиний відомий візит. Тому до реальних візитів за 60 днів додаємо по
- * одній синтетичній точці на клієнта — дату його найпершого відомого
- * візиту за всю історію. Для вже активних цього тижня це нічого не міняє
- * (точка або дублює вже наявну, або старіша за обидва вікна), а для
- * поверненців рятує правильну класифікацію.
+ * «Під ризиком» = сегмент FADING з `tierOf` (останній візит 30–90 днів
+ * тому), рівно як у картотеці й Deep. Окремого вікна 30+30 тут більше
+ * немає: `last30d` описує рух за період (active/new/returning/…) і
+ * відтоком не називається. Усі візити віддаємо в `retentionFromVisits`
+ * цілком, без обрізання до 60 днів, — тоді клієнт, який ходив рік тому й
+ * повернувся, лишається «поверненцем» без жодних синтетичних точок.
  */
 
 const WINDOW_DAYS = 30;
@@ -38,9 +36,11 @@ export type CustomerHealth = {
   thresholds: { activeDays: number; fadingDays: number; newVisits: number };
   last30d: {
     active: number; new: number; returning: number; reactivated: number;
-    atRisk: number; retentionPct: number | null;
+    retentionPct: number | null;
   };
-  /** Скільки грошей на місяць під ризиком: витрати клієнтів із at-risk у попередньому 30-денному вікні. */
+  /** «Під ризиком» = сегмент FADING (те саме число, що в картотеці й Deep). */
+  atRisk: number;
+  /** Скільки грошей на місяць під ризиком: витрати FADING-клієнтів за 30 днів до їхнього останнього візиту. */
   atRiskValueUah: number;
 };
 
@@ -79,25 +79,29 @@ export function buildCustomerHealth(
   }
 
   const segments: Record<CustomerTier, number> = { NEW: 0, ACTIVE: 0, FADING: 0, LOST: 0 };
+  const fading = new Set<string>();
   for (const c of src.customers) {
     const r = byCustomer.get(c.id);
-    segments[tierOf(r?.last ?? null, c.createdAt, now, r?.visits ?? 0)] += 1;
+    const tier = tierOf(r?.last ?? null, c.createdAt, now, r?.visits ?? 0);
+    segments[tier] += 1;
+    if (tier === 'FADING') fading.add(c.id);
   }
 
+  const retention = retentionFromVisits(
+    src.allVisits.map((v) => ({ customerId: v.customerId, at: v.at })),
+    now,
+    WINDOW_DAYS,
+  );
+
+  /* Гроші під ризиком: що FADING-клієнти витрачали за 30 днів до свого
+     останнього візиту — це «місяць», який ми можемо втратити. */
   const dayMs = 86_400_000;
-  const currentFrom = new Date(now.getTime() - WINDOW_DAYS * dayMs);
-  const previousFrom = new Date(now.getTime() - WINDOW_DAYS * 2 * dayMs);
-
-  const visits: Visit[] = src.allVisits
-    .filter((v) => v.at >= previousFrom)
-    .map((v) => ({ customerId: v.customerId, at: v.at }));
-  for (const [id, r] of byCustomer) if (r.first) visits.push({ customerId: id, at: r.first });
-
-  const retention = retentionFromVisits(visits, now, WINDOW_DAYS);
-
-  const atRiskSet = new Set(retention.atRiskIds);
   const atRiskValueKop = src.allVisits
-    .filter((v) => atRiskSet.has(v.customerId) && v.at >= previousFrom && v.at < currentFrom)
+    .filter((v) => {
+      const last = byCustomer.get(v.customerId)?.last;
+      return fading.has(v.customerId) && last !== null && last !== undefined
+        && v.at.getTime() > last.getTime() - WINDOW_DAYS * dayMs;
+    })
     .reduce((sum, v) => sum + v.price, 0);
 
   return {
@@ -106,8 +110,9 @@ export function buildCustomerHealth(
     thresholds: { activeDays: TIER_ACTIVE_DAYS, fadingDays: TIER_FADING_DAYS, newVisits: TIER_NEW_VISITS },
     last30d: {
       active: retention.active, new: retention.new, returning: retention.returning,
-      reactivated: retention.reactivated, atRisk: retention.atRiskIds.length, retentionPct: retention.retentionRate,
+      reactivated: retention.reactivated, retentionPct: retention.retentionRate,
     },
+    atRisk: segments.FADING,
     atRiskValueUah: Math.round(atRiskValueKop / 100),
   };
 }
