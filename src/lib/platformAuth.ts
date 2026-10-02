@@ -1,5 +1,6 @@
 import type { Request, Response, NextFunction } from 'express';
 import jwt from 'jsonwebtoken';
+import { createHmac } from 'node:crypto';
 
 import { JWT_SECRET } from './authSecret';
 
@@ -13,6 +14,15 @@ import { JWT_SECRET } from './authSecret';
  * випадково: обидва підписані тим самим JWT_SECRET.
  */
 export type PlatformAuth = { scope: 'platform'; email: string };
+
+export function platformCredentialVersion(
+  email = process.env.PLATFORM_ADMIN_EMAIL,
+  hash = process.env.PLATFORM_ADMIN_PASSWORD_HASH,
+): string | null {
+  email = email?.trim().toLowerCase();
+  if (!email || !hash) return null;
+  return createHmac('sha256', JWT_SECRET).update(JSON.stringify([email, hash])).digest('hex');
+}
 
 declare global {
   namespace Express {
@@ -29,8 +39,10 @@ export function requirePlatformAuth(req: Request, res: Response, next: NextFunct
   }
 
   try {
-    const payload = jwt.verify(header.slice(7), JWT_SECRET) as Partial<PlatformAuth>;
-    if (payload.scope !== 'platform' || typeof payload.email !== 'string') {
+    const payload = jwt.verify(header.slice(7), JWT_SECRET, { algorithms: ['HS256'] }) as Partial<PlatformAuth> & { credentialVersion?: string };
+    const currentVersion = platformCredentialVersion();
+    if (payload.scope !== 'platform' || typeof payload.email !== 'string' || !currentVersion ||
+        payload.credentialVersion !== currentVersion || payload.email !== process.env.PLATFORM_ADMIN_EMAIL?.trim().toLowerCase()) {
       return res.status(401).json({ error: 'INVALID_TOKEN' });
     }
     req.platformAuth = { scope: 'platform', email: payload.email };

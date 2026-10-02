@@ -8,6 +8,7 @@ import {
   shouldSetFirstTouch,
 } from '../lib/attribution';
 import rateLimit from 'express-rate-limit';
+import { publicWriteLimiter } from '../lib/rateLimits';
 import { DateTime } from 'luxon';
 import { prisma, isSlotTakenError } from '../lib/db';
 import { buildSlots, isAlignedToGrid, type Interval } from '../lib/slots';
@@ -45,7 +46,7 @@ const playerTelegramReady = (plan: Parameters<typeof planFeatures>[0]) =>
 export const publicRouter = Router();
 
 // Попередній розрахунок та остаточний перенос використовують одну перевірку.
-publicRouter.post('/customer/bookings/:id/reschedule', async (req, res) => {
+publicRouter.post('/customer/bookings/:id/reschedule', publicWriteLimiter, async (req, res) => {
   const auth = requireCustomerAuth(req, res);
   if (!auth) return;
   const parsed = z.object({
@@ -701,7 +702,7 @@ function safeReturnUrl(raw: string | undefined, origin: string | undefined): str
 }
 
 /** POST /api/public/clubs/:slug/bookings */
-publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
+publicRouter.post('/clubs/:slug/bookings', publicWriteLimiter, async (req, res) => {
   const parsed = bookingSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST', details: parsed.error.flatten() });
   const body = parsed.data;
@@ -760,6 +761,14 @@ publicRouter.post('/clubs/:slug/bookings', async (req, res) => {
      входу її не має права міняти ніхто. */
   const guard = await accountGuard(req, club.id, phone.e164);
   if (guard.blocked) return res.status(401).json({ error: 'LOGIN_REQUIRED' });
+
+  /* Дату народження звіряємо ДО запису: findOrCreateCustomer перезаписує
+     пошту картки, і без цього будь-хто, хто знає номер, міняв би її на чужій
+     картці без пароля, а вже потім діставав BIRTH_DATE_MISMATCH. Картка без
+     дати лишається як було — дата заповнюється першою бронню. */
+  if (!guard.signedIn && guard.owner?.birthDate && dateOnly(guard.owner.birthDate) !== body.birthDate) {
+    return res.status(403).json({ error: 'BIRTH_DATE_MISMATCH' });
+  }
 
   const customer = await findOrCreateCustomer({
     clubId: club.id,
@@ -1093,7 +1102,7 @@ export { canCancelNow };
  * оплати (lib/payments/apply.ts). Інакше покинутий кошик на чверть години
  * додавав би клубу грошей, яких він не бачив.
  */
-publicRouter.post('/clubs/:slug/bookings/:id/join', async (req, res) => {
+publicRouter.post('/clubs/:slug/bookings/:id/join', publicWriteLimiter, async (req, res) => {
   const parsed = joinSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
   const body = parsed.data;
@@ -1378,7 +1387,7 @@ publicRouter.get('/bookings/:token/status', async (req, res) => {
 });
 
 /** POST /api/public/bookings/:id/cancel  { token } — скасування клієнтом за посиланням */
-publicRouter.post('/bookings/:id/cancel', async (req, res) => {
+publicRouter.post('/bookings/:id/cancel', publicWriteLimiter, async (req, res) => {
   const parsed = z.object({ token: z.string().uuid() }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
@@ -1431,12 +1440,12 @@ const telegramSessionLimiter = rateLimit({
 async function accountGuard(req: import('express').Request, clubId: string, phone: string) {
   const owner = await prisma.customer.findUnique({
     where: { clubId_phone: { clubId, phone } },
-    select: { id: true, passwordHash: true },
+    select: { id: true, passwordHash: true, birthDate: true },
   });
   const header = req.headers.authorization;
   const viewer = header?.startsWith('Bearer ') ? verifyCustomerToken(header.slice(7)) : null;
   const signedIn = Boolean(owner && viewer && viewer.clubId === clubId && viewer.customerId === owner.id);
-  return { blocked: Boolean(owner?.passwordHash) && !signedIn, signedIn };
+  return { blocked: Boolean(owner?.passwordHash) && !signedIn, signedIn, owner };
 }
 
 /**
@@ -1490,11 +1499,9 @@ publicRouter.post('/clubs/:slug/customer/login', customerLoginLimiter, async (re
  * Номер, у якого акаунт уже є, — 409, а не тихий вхід: інакше форма
  * реєстрації стала б другою формою входу без пароля.
  *
- * Картку без пароля (заведену адміністратором, бронню гостя чи до появи
- * паролів) можна перетворити на акаунт. Якщо в картці вже є дата
- * народження, вона мусить збігтися — хоч якийсь доказ, що картка твоя.
- * Пароль ставиться умовним оновленням «де пароля ще немає»: двоє, що
- * одночасно реєструють той самий номер, не перезапишуть одне одного.
+ * Існуючу картку не можна привласнити телефоном/датою народження.
+ * Вона потребує окремого підтвердженого доступу через клуб або Telegram.
+ * Новий акаунт створюється атомарно разом із паролем.
  */
 publicRouter.post('/clubs/:slug/customer/register', customerLoginLimiter, async (req, res) => {
   const parsed = z
@@ -1520,27 +1527,24 @@ publicRouter.post('/clubs/:slug/customer/register', customerLoginLimiter, async 
     select: { birthDate: true, passwordHash: true },
   });
   if (existing?.passwordHash) return res.status(409).json({ error: 'ALREADY_REGISTERED' });
-  if (existing?.birthDate && dateOnly(existing.birthDate) !== parsed.data.birthDate) {
-    return res.status(403).json({ error: 'BIRTH_DATE_MISMATCH' });
+  if (existing) return res.status(409).json({ error: 'CUSTOMER_VERIFICATION_REQUIRED' });
+
+  const passwordHash = await hashCustomerPassword(parsed.data.password);
+  let customer;
+  try {
+    customer = await prisma.customer.create({
+      data: {
+        clubId: club.id, name, phone: phone.e164, phoneTail: phone.tail,
+        birthDate: birthDateValue(parsed.data.birthDate), passwordHash,
+        passwordFails: 0, passwordLockedUntil: null,
+      },
+    });
+  } catch (error) {
+    if ((error as { code?: string }).code === 'P2002') {
+      return res.status(409).json({ error: 'CUSTOMER_VERIFICATION_REQUIRED' });
+    }
+    throw error;
   }
-
-  const customer = await findOrCreateCustomer({
-    clubId: club.id,
-    name,
-    rawPhone: phone.e164,
-    birthDate: birthDateValue(parsed.data.birthDate),
-  });
-  if (!customer) return res.status(400).json({ error: 'BAD_PHONE' });
-
-  const claimed = await prisma.customer.updateMany({
-    where: { id: customer.id, passwordHash: null },
-    data: {
-      passwordHash: await hashCustomerPassword(parsed.data.password),
-      passwordFails: 0,
-      passwordLockedUntil: null,
-    },
-  });
-  if (claimed.count !== 1) return res.status(409).json({ error: 'ALREADY_REGISTERED' });
 
   res.status(201).json({
     token: signCustomerToken({ customerId: customer.id, clubId: club.id }),
@@ -1950,7 +1954,7 @@ async function customerWithClub(auth: { customerId: string; clubId: string }) {
  * Посилання t.me/<бот>?start=p_<код>. Гравець відкриває його, Telegram сам
  * надсилає боту /start з кодом — нічого переписувати не треба.
  */
-publicRouter.post('/customer/telegram/link', async (req, res) => {
+publicRouter.post('/customer/telegram/link', publicWriteLimiter, async (req, res) => {
   const auth = requireCustomerAuth(req, res);
   if (!auth) return;
 
@@ -2003,7 +2007,7 @@ const JOIN_STATUS: Record<JoinError, number> = {
  * Стати в чергу на зайнятий слот. Тільки з кабінету гравця й тільки з
  * підключеним Telegram — див. lib/waitlist.ts.
  */
-publicRouter.post('/clubs/:slug/waitlist', async (req, res) => {
+publicRouter.post('/clubs/:slug/waitlist', publicWriteLimiter, async (req, res) => {
   const auth = requireCustomerAuth(req, res);
   if (!auth) return;
 
@@ -2048,7 +2052,7 @@ publicRouter.delete('/customer/waitlist/:id', async (req, res) => {
   res.json({ ok: true });
 });
 
-publicRouter.post('/seats/:id/cancel', async (req, res) => {
+publicRouter.post('/seats/:id/cancel', publicWriteLimiter, async (req, res) => {
   const id = z.string().uuid().safeParse(req.params.id);
   if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 

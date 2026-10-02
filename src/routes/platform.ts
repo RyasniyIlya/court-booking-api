@@ -15,7 +15,8 @@ import { EMPTY_BUNDLE, clubListPrice, healthOf, loadClubMetrics } from '../lib/p
 import { fmtDate, fmtUah, systemNote } from '../lib/platformJournal';
 import { nextPeriod, periodAmount } from '../lib/subscription';
 import { sendMessage } from '../lib/telegram';
-import { requirePlatformAuth } from '../lib/platformAuth';
+import { telegramHtml } from '../lib/telegramHtml';
+import { requirePlatformAuth, platformCredentialVersion } from '../lib/platformAuth';
 
 export const platformRouter = Router();
 
@@ -39,7 +40,7 @@ const loginLimiter = rateLimit({
  */
 platformRouter.post('/login', loginLimiter, async (req, res) => {
   const parsed = z
-    .object({ email: z.string().email(), password: z.string().min(1) })
+    .object({ email: z.string().email(), password: z.string().min(1).max(128) })
     .safeParse(req.body);
 
   if (!parsed.success) {
@@ -67,7 +68,7 @@ platformRouter.post('/login', loginLimiter, async (req, res) => {
     return res.status(401).json({ error: 'INVALID_CREDENTIALS' });
   }
 
-  const token = jwt.sign({ scope: 'platform', email }, JWT_SECRET, { expiresIn: '12h' });
+  const token = jwt.sign({ scope: 'platform', email, credentialVersion: platformCredentialVersion(expectedEmail, expectedHash) }, JWT_SECRET, { expiresIn: '12h' });
   res.json({ token });
 });
 
@@ -891,7 +892,7 @@ platformRouter.post('/clubs/:id/owner-password', requirePlatformAuth, async (req
   const passwordHash = await hashPassword(parsed.data.password, 12);
 
   await prisma.$transaction(async (tx) => {
-    await tx.user.update({ where: { id: owner.id }, data: { passwordHash } });
+    await tx.user.update({ where: { id: owner.id }, data: { passwordHash, tgLinkCode: null, tgLinkUntil: null } });
 
     /* Сам пароль у журнал не йде ніколи — лише факт і кому. */
     await tx.crmActivity.create(
@@ -1051,7 +1052,7 @@ platformRouter.post('/clubs/:id/subscription', requirePlatformAuth, async (req, 
   if (tgChatId) {
     await sendMessage(
       tgChatId,
-      `✅ Оплату зараховано. Обслуговування ${club.name} діє до ${to.toLocaleDateString('uk-UA')}.`,
+      `✅ Оплату зараховано. Обслуговування ${telegramHtml(club.name)} діє до ${to.toLocaleDateString('uk-UA')}.`,
     ).catch(() => {
       /* Бот вимкнений або чат заблокований. Гроші вже зараховані, і валити
          через це відповідь оператору не можна. */

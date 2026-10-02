@@ -4,6 +4,7 @@ import { prisma } from './db';
 import { barChart } from './charts';
 import { header, hrn, kopShort, periodBounds, periodSub } from './digest';
 import { BOOKINGS, count, SESSIONS } from './plural';
+import { telegramHtml } from './telegramHtml';
 
 /**
  * Два розділи бота поверх тих самих броней: хто заробив і звідки гроші.
@@ -96,13 +97,13 @@ export function staffText(clubName: string, r: StaffReport, days: number, timezo
   return [
     head,
     '',
-    `<pre>${chart}</pre>`,
+    `<pre>${telegramHtml(chart)}</pre>`,
     `Разом <b>${hrn(r.revenue)}</b> · ${count(r.sessions, SESSIONS)}`,
     /* Імʼя лишається в називному відмінку: «у Іван» різало б око, а
        відмінювати імена бот не вміє й не має — на прізвищах і жіночих
        іменах будь-яке правило рано чи пізно помиляється. */
     r.rows.length > 1
-      ? `Найбільше занять: ${busiest.name} — ${count(busiest.sessions, SESSIONS)}`
+      ? `Найбільше занять: ${telegramHtml(busiest.name)} — ${count(busiest.sessions, SESSIONS)}`
       : '',
   ].filter(Boolean).join('\n');
 }
@@ -203,7 +204,7 @@ export function revenueText(
   return [
     head,
     '',
-    `<pre>${chart}</pre>`,
+    `<pre>${telegramHtml(chart)}</pre>`,
     `💰 Разом <b>${hrn(r.total)}</b> · ${count(r.bookings, BOOKINGS)}`,
     `🎾 Оренда кортів ${share(courtsPart, r.total)}`,
     r.trainerPart > 0 ? `🧑‍🏫 Робота тренерів ${share(r.trainerPart, r.total)}` : '',

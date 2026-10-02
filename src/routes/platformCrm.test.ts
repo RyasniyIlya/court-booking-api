@@ -21,7 +21,10 @@ const { JWT_SECRET } = await import('../lib/authSecret');
 const { platformCrmRouter, kyivBounds } = await import('./platformCrm');
 
 const app = express().use(express.json()).use(platformCrmRouter);
-const auth = `Bearer ${jwt.sign({ scope: 'platform', email: 'op@test.local' }, JWT_SECRET)}`;
+vi.stubEnv('PLATFORM_ADMIN_EMAIL', 'op@test.local');
+vi.stubEnv('PLATFORM_ADMIN_PASSWORD_HASH', 'isolated-platform-fixture');
+const { platformCredentialVersion } = await import('../lib/platformAuth');
+const auth = `Bearer ${jwt.sign({ scope: 'platform', email: 'op@test.local', credentialVersion: platformCredentialVersion() }, JWT_SECRET)}`;
 
 const LEAD_ID = '11111111-1111-4111-8111-111111111111';
 const OTHER_LEAD_ID = '44444444-4444-4444-8444-444444444444';

@@ -1,4 +1,5 @@
 import { DateTime } from 'luxon';
+import { telegramHtml as html } from './telegramHtml';
 
 import { prisma } from './db';
 import { planFeatures } from './plans';
@@ -71,8 +72,6 @@ const SEAT_HEAD: Record<BookingEvent, { club: string; trainer: string }> = {
 };
 
 /** HTML-розмітку Telegram ставимо ми, а не імена клієнтів. */
-const html = (v: string) => v
-  .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 
 const hrn = (kop: number) => `${(kop / 100).toFixed(2)} грн`;
 

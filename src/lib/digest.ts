@@ -1,6 +1,7 @@
 import { DateTime } from 'luxon';
 
 import { prisma } from './db';
+import { telegramHtml } from './telegramHtml';
 import { barChart, groupBars } from './charts';
 import { BOOKINGS, count, CUSTOMERS, DAYS, WEEKS } from './plural';
 
@@ -126,7 +127,7 @@ export const WEEKDAY_FULL = [
  * карткою це й є.
  */
 export const header = (clubName: string, sub: string) =>
-  `🎾 <b>${clubName}</b>\n<i>${sub}</i>`;
+  `🎾 <b>${telegramHtml(clubName)}</b>\n<i>${sub}</i>`;
 
 /**
  * Підзаголовок періоду: «останні 4 тижні · 03.08 – 30.08».
@@ -180,7 +181,7 @@ export function digestText(clubName: string, d: DayDigest, timezone: string): st
     `📋 ${count(d.bookings, BOOKINGS)}`,
     d.newCustomers > 0 ? `👤 ${count(d.newCustomers, CUSTOMERS)}` : '',
     d.topCourt
-      ? `🏟 ${d.topCourt.name} — ${count(d.topCourt.bookings, BOOKINGS)}`
+      ? `🏟 ${telegramHtml(d.topCourt.name)} — ${count(d.topCourt.bookings, BOOKINGS)}`
       : '',
   ].filter(Boolean).join('\n');
 }
@@ -349,7 +350,7 @@ export function weekText(clubName: string, r: WeekReport, days = 7): string {
   return [
     header(clubName, sub),
     '',
-    `<pre>${chart}</pre>`,
+    `<pre>${telegramHtml(chart)}</pre>`,
     `Разом <b>${hrn(r.total)}</b> · ${count(r.bookings, BOOKINGS)}`,
     `У середньому ${hrn(avg)} за день · найкращий ${best.label} (${hrn(best.revenue)})`,
     change ? `До попереднього періоду: <b>${change}</b>` : '',

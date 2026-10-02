@@ -7,3 +7,9 @@ if (!process.env.JWT_SECRET && process.env.NODE_ENV === 'production') {
 }
 
 export const JWT_SECRET = process.env.JWT_SECRET ?? 'dev-secret-change-me';
+
+// Слабкий секрет не валить старт (це поклало б прод на деплої), але гучно
+// попереджає: HS256 з коротким ключем підбирається офлайн.
+if (process.env.NODE_ENV === 'production' && JWT_SECRET.length < 32) {
+  console.warn('[auth] JWT_SECRET коротший за 32 символи — замініть його довгим випадковим значенням.');
+}

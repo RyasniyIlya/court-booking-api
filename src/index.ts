@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import { timingSafeEqual } from 'node:crypto';
 import cors from 'cors';
 import { publicRouter } from './routes/public';
 import { assistantRouter } from './routes/assistant';
@@ -20,6 +21,7 @@ import { startWinbackScheduler } from './lib/winback';
 import { handleUpdate } from './lib/botHandlers';
 import { processTelegramUpdate } from './lib/telegramReceipt';
 import { paymentsSecretReady } from './lib/crypto';
+import { payGeneralLimiter, publicGeneralLimiter } from './lib/rateLimits';
 
 const app = express();
 
@@ -28,9 +30,35 @@ const app = express();
 // IP, або сам відмовляється працювати, помітивши недовірений X-Forwarded-For.
 app.set('trust proxy', 1);
 
+// Не підказуємо стек сервера у кожній відповіді.
+app.disable('x-powered-by');
+
+// Базові заголовки безпеки. CSP 'none' годиться для JSON-API, але /api/pay
+// віддає HTML-сторінки (демо-оплата, повернення з банку) — їм CSP не ставимо.
+// Cross-Origin-Resource-Policy свідомо не чіпаємо: логотипи клубів вантажить
+// віджет з чужих доменів.
+app.use((req, res, next) => {
+  res.set('X-Content-Type-Options', 'nosniff');
+  res.set('X-Frame-Options', 'DENY');
+  res.set('Referrer-Policy', 'no-referrer');
+  if (process.env.NODE_ENV === 'production') {
+    res.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+  if (!req.path.startsWith('/api/pay')) {
+    res.set('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'");
+  }
+  // Персональні дані не мають осідати в спільних кешах. Це лише значення
+  // за замовчуванням: маршрут, що ставить свій Cache-Control, перекриє його.
+  if (req.path.startsWith('/api/admin') || req.path.startsWith('/api/platform')) {
+    res.set('Cache-Control', 'no-store');
+  }
+  next();
+});
+
 // Платіжка монтується ПЕРШОЮ і читає сире тіло: підпис вебхука рахується
 // від байтів. Якщо тіло пройде через express.json(), підпис не збіжиться.
-app.use('/api/pay', express.raw({ type: '*/*', limit: '100kb' }), payRouter);
+// Вебхуки банку ліміт не душить (див. payGeneralLimiter).
+app.use('/api/pay', payGeneralLimiter, express.raw({ type: '*/*', limit: '100kb' }), payRouter);
 
 // Імпорт лідів з реєстру — до 1000 рядків за раз (~1 МБ). Тільки цей шлях
 // і тільки для оператора: загальні 100 КБ лишаються для всього іншого.
@@ -46,6 +74,7 @@ app.use(express.json({ limit: '100kb' }));
 
 // Віджет вантажиться на чужих доменах — публічне API відкрите для всіх
 app.use('/api/public', cors({ origin: true }));
+app.use('/api/public', publicGeneralLimiter);
 
 /**
  * Кабінет живе на іншому домені (Vercel), а API на Render — без CORS
@@ -89,13 +118,13 @@ app.use('/api/platform', cors({
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/public', publicRouter);
 app.use('/api/public', assistantRouter);
+app.use('/api/admin/finance', financeRouter);
 app.use('/api/admin', adminRouter);
 app.use('/api/admin/analytics', analyticsRouter);
 /* Вивантаження бази клубу — окремо від analyticsRouter і без
    requireFeature('analytics'): дані клубу (броні, клієнти) належать
    власнику на будь-якому тарифі, див. коментар у routes/export.ts. */
 app.use('/api/admin/export', exportRouter);
-app.use('/api/admin/finance', financeRouter);
 app.use('/api/platform', platformRouter);
 app.use('/api/platform', platformCrmRouter);
 
@@ -114,7 +143,12 @@ app.use('/api/platform', platformCrmRouter);
 app.post('/api/telegram/webhook', async (req, res) => {
   const secret = telegramWebhookSecret();
 
-  if (!secret || req.get('X-Telegram-Bot-Api-Secret-Token') !== secret) {
+  const sent = req.get('X-Telegram-Bot-Api-Secret-Token');
+  // Порівняння за сталий час; різна довжина — одразу відмова (timingSafeEqual кидає).
+  const secretOk = Boolean(secret && sent) &&
+    Buffer.byteLength(sent!) === Buffer.byteLength(secret!) &&
+    timingSafeEqual(Buffer.from(sent!), Buffer.from(secret!));
+  if (!secretOk) {
     return res.status(401).json({ error: 'UNAUTHORIZED' });
   }
 

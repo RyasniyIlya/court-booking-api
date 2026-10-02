@@ -87,8 +87,9 @@ const fmt = (d: Date) =>
 export async function getActivePass(
   customerId: string,
   on: Date = new Date(),
+  db: Pick<typeof prisma, 'pass'> = prisma,
 ): Promise<PassBalance | null> {
-  const passes = await prisma.pass.findMany({
+  const passes = await db.pass.findMany({
     where: {
       customerId,
       revokedAt: null,

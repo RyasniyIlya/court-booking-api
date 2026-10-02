@@ -1,4 +1,5 @@
 import { planFeatures } from './plans';
+import { telegramHtml } from './telegramHtml';
 import bcrypt from 'bcryptjs';
 import { checkPassword } from './passwordCheck';
 
@@ -172,7 +173,7 @@ export async function loginByPassword(
 
   return [
     `✅ Вхід виконано`,
-    `🎾 <b>${user.club.name}</b>`,
+    `🎾 <b>${telegramHtml(user.club.name)}</b>`,
     '',
     menuFor(user.role),
   ].join('\n');

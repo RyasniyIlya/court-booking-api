@@ -284,7 +284,7 @@ payRouter.get('/done', async (req, res) => {
 /* ── Заглушка для локальної розробки ──────────────────────────────────────
    Дві кнопки замість сторінки банку. Дьоргає той самий вебхук, що й моно,
    тому перевіряється весь ланцюжок, а не лише редірект.
-   На проді провайдер mock вимкнено (див. lib/payments/index.ts).       */
+   Працює там, де клуб сам обрав mock; DEMO_PAYMENTS=false закриває повністю. */
 
 payRouter.get('/mock/:ref', async (req, res) => {
   if (!mockPaymentsEnabled()) return res.status(404).end();
@@ -317,11 +317,13 @@ payRouter.get('/mock/:ref', async (req, res) => {
  .ok{background:#0F7A5A;color:#fff}
  .no{background:#FCF0ED;color:#8F3624;border:1px solid #F0D6CF}
  .n{font-size:12px;color:#6E7671;margin:12px 0 0}
+ .warn{background:#FFF4CC;border:2px solid #E0A800;color:#5C4400;border-radius:10px;padding:10px 12px;margin:0 0 14px;font-size:13px;font-weight:500}
 </style></head><body>
 <div class="c">
   <div class="t"><p>Тестова платіжка</p><h1>${(amount / 100).toFixed(2)} грн</h1></div>
   <div class="b">
     <p class="w">${esc(what)}</p>
+    <div class="warn"><b>Це тестова оплата.</b> Гроші не справжні: з картки нічого не списується, і клуб нічого не отримує. Бронь при цьому створюється по-справжньому.</div>
     <form method="post" action="${esc(link('success'))}"><button class="btn ok" type="submit">Підтвердити тестову оплату</button></form>
     <form method="post" action="${esc(link('failure'))}"><button class="btn no" type="submit">Відхилити оплату</button></form>
     <p class="n">Демонстраційна оплата. Гроші не списуються. Дані картки не потрібні.</p>

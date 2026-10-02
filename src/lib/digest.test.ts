@@ -108,3 +108,48 @@ describe('digestText — що бачить власник', () => {
     expect(t).toContain('7 броней');
   });
 });
+
+describe('Telegram HTML — назви клубу й корту екрануються окремо', () => {
+  const club = '<b>Club & Co';
+  const clubEsc = '&lt;b&gt;Club &amp; Co';
+
+  it('digestText екранує назву клубу й назву корту', async () => {
+    const text = digestText(club, {
+      from: new Date('2026-08-27T00:00:00Z'), to: new Date('2026-08-27T23:59:00Z'),
+      bookings: 2, revenue: 100000, newCustomers: 0,
+      topCourt: { name: '<i>Court', bookings: 2 },
+    }, 'Europe/Kyiv');
+    expect(text).toContain(clubEsc);
+    expect(text).toContain('&lt;i&gt;Court');
+    expect(text).not.toContain('<i>Court');
+  });
+
+  it('weekText екранує назву клубу', async () => {
+    const { weekText } = await import('./digest');
+    const text = weekText(club, { points: [], total: 0, bookings: 0, prevTotal: 0 });
+    expect(text).toContain(clubEsc);
+    expect(text).not.toContain('<b>Club');
+  });
+
+  it('staffText екранує клуб і тренера (і в графіку, і в рядку «найбільше»)', async () => {
+    const { staffText } = await import('./sections');
+    const text = staffText(club, {
+      rows: [{ name: '<i>Coach', sessions: 3, revenue: 5000 }, { name: 'Anna', sessions: 1, revenue: 1000 }],
+      sessions: 4, revenue: 6000,
+    }, 7, 'Europe/Kyiv');
+    expect(text).toContain(clubEsc);
+    expect(text).toContain('&lt;i&gt;Coach');
+    expect(text).not.toContain('<i>Coach');
+  });
+
+  it('revenueText екранує клуб і назву корту в графіку', async () => {
+    const { revenueText } = await import('./sections');
+    const text = revenueText(club, {
+      total: 5000, bookings: 1, byCourt: [{ name: '<i>Court', revenue: 5000 }],
+      trainerPart: 0, group: { bookings: 0, revenue: 0 },
+    }, 7, 'Europe/Kyiv');
+    expect(text).toContain(clubEsc);
+    expect(text).toContain('&lt;i&gt;Court');
+    expect(text).not.toContain('<i>Court');
+  });
+});

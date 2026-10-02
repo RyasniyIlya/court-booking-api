@@ -1,6 +1,7 @@
 import { hashPassword } from './passwordHash';
 
 import { prisma } from './db';
+import { telegramHtml } from './telegramHtml';
 
 /**
  * Зміна пароля кабінету з привʼязаного чату.
@@ -76,11 +77,11 @@ export async function changePassword(chatId: string, password: string): Promise<
      створюється пароль, який людина вводить руками, і здешевлювати його
      тут не можна: хеш той самий, вхід той самий. */
   const passwordHash = await hashPassword(password, 12);
-  await prisma.user.update({ where: { id: user.id }, data: { passwordHash, pinFails: 0, pinLockedUntil: null } });
+  await prisma.user.update({ where: { id: user.id }, data: { passwordHash, pinFails: 0, pinLockedUntil: null, tgLinkCode: null, tgLinkUntil: null } });
 
   return [
     '✅ Пароль змінено',
-    `Кабінет: <code>${user.email}</code>`,
+    `Кабінет: <code>${telegramHtml(user.email)}</code>`,
     '',
     '<i>Повідомлення з паролем я вже видалив.</i>',
     '<i>Це єдиний пароль акаунта: він діє і в кабінеті, і для наступного входу в бот.</i>',

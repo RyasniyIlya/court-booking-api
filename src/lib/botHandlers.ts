@@ -1,5 +1,6 @@
 import { planFeatures } from './plans';
 import { DateTime } from 'luxon';
+import { telegramHtml } from './telegramHtml';
 
 import { prisma } from './db';
 import {
@@ -234,7 +235,7 @@ async function periodMessage(
 async function linkByCode(chatId: string, code: string): Promise<string> {
   const user = await prisma.user.findUnique({
     where: { tgLinkCode: code },
-    select: { id: true, role: true, tgLinkUntil: true, club: { select: { name: true, plan: true } } },
+    select: { id: true, role: true, passwordHash: true, tgLinkUntil: true, club: { select: { name: true, plan: true } } },
   });
 
   if (!user) {
@@ -247,13 +248,19 @@ async function linkByCode(chatId: string, code: string): Promise<string> {
 
   if (!planFeatures(user.club.plan).telegram) return 'Telegram-бот доступний лише в максимальному пакеті.';
 
-  await prisma.user.updateMany({ where: { tgChatId: chatId }, data: { tgChatId: null } });
-  await prisma.user.update({
-    where: { id: user.id },
-    data: { tgChatId: chatId, tgLinkCode: null, tgLinkUntil: null },
+  const linked = await prisma.$transaction(async tx => {
+    const consumed = await tx.user.updateMany({
+      where: { id: user.id, tgLinkCode: code, tgLinkUntil: { gte: new Date() }, passwordHash: user.passwordHash },
+      data: { tgLinkCode: null, tgLinkUntil: null },
+    });
+    if (consumed.count !== 1) return false;
+    await tx.user.updateMany({ where: { tgChatId: chatId, id: { not: user.id } }, data: { tgChatId: null } });
+    await tx.user.update({ where: { id: user.id }, data: { tgChatId: chatId } });
+    return true;
   });
+  if (!linked) return 'Код уже використаний або протух. Отримайте новий код у кабінеті.';
 
-  return `Підключено до клубу <b>${user.club.name}</b>.\n\n${menuFor(user.role)}`;
+  return `Підключено до клубу <b>${telegramHtml(user.club.name)}</b>.\n\n${menuFor(user.role)}`;
 }
 
 /**
@@ -284,7 +291,7 @@ async function trainerToday(trainerId: string, timezone: string, clubName: strin
     },
   });
 
-  const head = `🎾 <b>${clubName}</b>\n<i>${WEEKDAY_FULL[local.weekday - 1]}, ${local.toFormat('dd.MM')}</i>`;
+  const head = `🎾 <b>${telegramHtml(clubName)}</b>\n<i>${WEEKDAY_FULL[local.weekday - 1]}, ${local.toFormat('dd.MM')}</i>`;
 
   if (rows.length === 0) return `${head}\n\nСьогодні занять немає.`;
 
@@ -294,7 +301,7 @@ async function trainerToday(trainerId: string, timezone: string, clubName: strin
     /* Очікування підтвердження — окремим значком, а не хвостом тексту:
        у списку з десяти рядків його треба помітити, не читаючи. */
     const wait = b.status === 'PENDING' ? ' ⏳' : '';
-    return `<code>${s}–${e}</code>  ${b.court?.name ?? 'корт'} · ${b.customerName ?? 'без імені'}${wait}`;
+    return `<code>${s}–${e}</code>  ${telegramHtml(b.court?.name ?? 'корт')} · ${telegramHtml(b.customerName ?? 'без імені')}${wait}`;
   });
 
   const pending = rows.filter((b) => b.status === 'PENDING').length;
@@ -667,7 +674,7 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
 
   if (cmd === '/help' || cmd === '/start') {
     await setMyCommands(commandsFor(me.role), chatId);
-    await sendMessage(chatId, `Клуб <b>${me.club.name}</b>.\n\n${menu}`, keyboard);
+    await sendMessage(chatId, `Клуб <b>${telegramHtml(me.club.name)}</b>.\n\n${menu}`, keyboard);
     return;
   }
 

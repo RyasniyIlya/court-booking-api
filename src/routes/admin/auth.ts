@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
-import { hashPassword } from '../../lib/passwordHash';
+import { comparePassword, hashPassword } from '../../lib/passwordHash';
 import rateLimit from 'express-rate-limit';
 
 import { prisma } from '../../lib/db';
@@ -20,6 +20,11 @@ export const authRouter = Router();
  * адреси. standardHeaders: додає RateLimit-* у відповідь, щоб фронт міг
  * колись показати «спробуйте пізніше», а не просто ловити 429.
  */
+/* Фіктивний хеш для гілки «пошти немає»: без нього невідомий email
+   відповідає миттєво, відомий — після bcrypt, і час видає, хто зареєстрований. */
+let dummyHash: Promise<string> | null = null;
+const getDummyHash = () => (dummyHash ??= hashPassword('dummy-password-for-timing', 12));
+
 const loginLimiter = rateLimit({
   windowMs: 15 * 60_000,
   limit: 10,
@@ -231,6 +236,7 @@ authRouter.post('/login', loginLimiter, async (req, res) => {
   });
 
   if (!user) {
+    await comparePassword(parsed.data.password, await getDummyHash());
     return res.status(401).json({
       error: 'INVALID_CREDENTIALS',
     });
@@ -334,6 +340,7 @@ authRouter.post(
   async (req, res) => {
     const parsed = z
       .object({
+        currentPassword: z.string().min(1).max(128),
         password: z.string().min(8).max(128),
       })
       .safeParse(req.body);
@@ -344,17 +351,32 @@ authRouter.post(
       });
     }
 
+    /* Крадений 7-денний токен сам по собі не має давати змогу перепризначити
+       пароль: вимагаємо поточний (з тим самим лічильником невдалих спроб). */
+    const valid = await verifyAccountPassword(req.auth!.userId, parsed.data.currentPassword);
+    if (!valid.ok) {
+      return res.status(valid.reason === 'LOCKED' ? 423 : 403).json({
+        error: valid.reason === 'LOCKED' ? 'PASSWORD_LOCKED' : 'INVALID_PASSWORD',
+      });
+    }
+
     const passwordHash = await hashPassword(parsed.data.password, 12);
 
     await prisma.user.update({
       where: {
         id: req.auth!.userId,
       },
-      data: { passwordHash, pinFails: 0, pinLockedUntil: null },
+      data: { passwordHash, pinFails: 0, pinLockedUntil: null, tgLinkCode: null, tgLinkUntil: null },
     });
+
+    /* Старий токен після зміни пароля відкликається (credentialVersion від
+       хешу) — віддаємо свіжий, щоб користувача не викинуло з кабінету. */
+    const { userId, clubId, role, trainerId } = req.auth!;
+    const token = signToken({ userId, clubId, role, trainerId }, '7d', passwordHash);
 
     res.json({
       ok: true,
+      token,
     });
   },
 );

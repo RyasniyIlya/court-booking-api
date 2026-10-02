@@ -371,171 +371,72 @@ customersRouter.post(
 /* USE PASS                                                                   */
 /* -------------------------------------------------------------------------- */
 
-customersRouter.post(
-  '/bookings/:id/use-pass',
-  requireAuth,
-  requireStaff,
-  async (req, res) => {
-    const booking =
-      await prisma.booking.findFirst({
+class PassConflict extends Error {
+  constructor(public code: string, public status = 409) { super(code); }
+}
+
+customersRouter.post('/bookings/:id/use-pass', requireAuth, requireStaff, async (req, res) => {
+  try {
+    const left = await prisma.$transaction(async tx => {
+      const booking = await tx.booking.findFirst({ where: { id: param(req, 'id'), clubId: req.auth!.clubId } });
+      if (!booking?.customerId) throw new PassConflict('NOT_FOUND', 404);
+      const existing = await tx.passUsage.findUnique({ where: { bookingId: booking.id } });
+      if (existing && !existing.revertedAt) throw new PassConflict('ALREADY_USED');
+      const balance = await getActivePass(booking.customerId, booking.startTime, tx);
+      if (!balance) throw new PassConflict('NO_ACTIVE_PASS');
+      // Pass precedes PassUsage in both operations; conflicts throw to roll back.
+      const spent = await tx.pass.updateMany({
         where: {
-          id: param(
-            req,
-            'id',
-          ),
-
-          clubId:
-            req.auth!.clubId,
+          id: balance.passId, clubId: req.auth!.clubId, customerId: booking.customerId,
+          revokedAt: null, type: balance.type, totalSessions: balance.total,
+          validFrom: { lte: booking.startTime }, validUntil: { gte: booking.startTime },
+          ...(balance.type === 'PACKAGE' ? { usedSessions: { lt: balance.total ?? 0 } } : {}),
         },
+        data: { usedSessions: { increment: 1 } },
       });
-
-    if (
-      !booking ||
-      !booking.customerId
-    ) {
-      return res.status(404).json({
-        error:
-          'NOT_FOUND',
-      });
-    }
-
-    const existing =
-      await prisma.passUsage.findUnique({
-        where: {
-          bookingId:
-            booking.id,
-        },
-      });
-
-    if (
-      existing &&
-      !existing.revertedAt
-    ) {
-      return res.status(409).json({
-        error:
-          'ALREADY_USED',
-      });
-    }
-
-    const balance =
-      await getActivePass(
-        booking.customerId,
-        booking.startTime,
-      );
-
-    if (!balance) {
-      return res.status(409).json({
-        error:
-          'NO_ACTIVE_PASS',
-      });
-    }
-
-    await prisma.$transaction([
-      prisma.pass.update({
-        where: {
-          id:
-            balance.passId,
-        },
-
-        data: {
-          usedSessions: {
-            increment:
-              1,
-          },
-        },
-      }),
-
-      prisma.passUsage.create({
-        data: {
-          passId:
-            balance.passId,
-
-          bookingId:
-            booking.id,
-
-          by:
-            req.auth!.userId,
-        },
-      }),
-    ]);
-
-    res.json({
-      ok: true,
-      left:
-        balance.left === null
-          ? null
-          : balance.left - 1,
+      if (spent.count !== 1) throw new PassConflict('NO_ACTIVE_PASS');
+      if (existing) {
+        const reapplied = await tx.passUsage.updateMany({
+          where: { id: existing.id, passId: existing.passId, revertedAt: existing.revertedAt },
+          data: { passId: balance.passId, by: req.auth!.userId, revertedAt: null },
+        });
+        if (reapplied.count !== 1) throw new PassConflict('ALREADY_USED');
+      } else {
+        await tx.passUsage.create({ data: { passId: balance.passId, bookingId: booking.id, by: req.auth!.userId } });
+      }
+      const current = await tx.pass.findUnique({ where: { id: balance.passId }, select: { type: true, usedSessions: true, totalSessions: true } });
+      return current?.type === 'PACKAGE' ? (current.totalSessions ?? 0) - current.usedSessions : null;
     });
-  },
-);
+    res.json({ ok: true, left });
+  } catch (error) {
+    if (error instanceof PassConflict) return res.status(error.status).json({ error: error.code });
+    if (['P2002', 'P2034'].includes((error as { code?: string }).code ?? '')) return res.status(409).json({ error: 'PASS_CONFLICT' });
+    throw error;
+  }
+});
 
-customersRouter.delete(
-  '/bookings/:id/use-pass',
-  requireAuth,
-  requireStaff,
-  async (req, res) => {
-    const usage =
-      await prisma.passUsage.findUnique({
-        where: {
-          bookingId:
-            param(
-              req,
-              'id',
-            ),
-        },
-
-        include: {
-          pass: true,
-        },
+customersRouter.delete('/bookings/:id/use-pass', requireAuth, requireStaff, async (req, res) => {
+  try {
+    await prisma.$transaction(async tx => {
+      const usage = await tx.passUsage.findUnique({ where: { bookingId: param(req, 'id') }, include: { pass: true } });
+      if (!usage || usage.revertedAt || usage.pass.clubId !== req.auth!.clubId) throw new PassConflict('NOT_FOUND', 404);
+      const returned = await tx.pass.updateMany({
+        where: { id: usage.passId, clubId: req.auth!.clubId, usedSessions: { gt: 0 } },
+        data: { usedSessions: { decrement: 1 } },
       });
-
-    if (
-      !usage ||
-      usage.revertedAt ||
-      usage.pass.clubId !==
-        req.auth!.clubId
-    ) {
-      return res.status(404).json({
-        error:
-          'NOT_FOUND',
+      if (returned.count !== 1) throw new PassConflict('PASS_CONFLICT');
+      const reverted = await tx.passUsage.updateMany({
+        where: { id: usage.id, passId: usage.passId, revertedAt: null }, data: { revertedAt: new Date() },
       });
-    }
-
-    await prisma.$transaction([
-      prisma.pass.update({
-        where: {
-          id:
-            usage.passId,
-        },
-
-        data: {
-          usedSessions: {
-            decrement:
-              1,
-          },
-        },
-      }),
-
-      prisma.passUsage.update({
-        where: {
-          id:
-            usage.id,
-        },
-
-        data: {
-          revertedAt:
-            new Date(),
-        },
-      }),
-    ]);
-
-    res.json({
-      ok: true,
+      if (reverted.count !== 1) throw new PassConflict('NOT_FOUND', 404);
     });
-  },
-);
-
-
+    res.json({ ok: true });
+  } catch (error) {
+    if (error instanceof PassConflict) return res.status(error.status).json({ error: error.code });
+    if ((error as { code?: string }).code === 'P2034') return res.status(409).json({ error: 'PASS_CONFLICT' });
+    throw error;
+  }
+});
 /**
  * PATCH /api/admin/customers/:id — картка клієнта: мітки, замітка, чорний список.
  *

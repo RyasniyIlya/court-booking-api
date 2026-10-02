@@ -1,4 +1,5 @@
 import { DateTime } from 'luxon';
+import { telegramHtml } from './telegramHtml';
 
 import { prisma } from './db';
 import { planFeatures } from './plans';
@@ -92,12 +93,12 @@ function textFor(
     ? '⏰ <b>Скоро ваше заняття</b>'
     : kind === 'tournament' ? '⏰ <b>Скоро турнір</b>' : '⏰ <b>Скоро групове заняття</b>';
 
-  const lines = [head, '', time, b.court.name];
+  const lines = [head, '', time, telegramHtml(b.court.name)];
 
   if (kind === 'private') {
-    if (b.customerName) lines.push(b.customerName);
+    if (b.customerName) lines.push(telegramHtml(b.customerName));
   } else {
-    if (b.title) lines.push(b.title);
+    if (b.title) lines.push(telegramHtml(b.title));
     /* Скільки людей прийде — головне число перед груповим: під нього
        готують інвентар і рахують мʼячі. */
     lines.push(`Учасників: ${b.seats}${b.capacity ? ` з ${b.capacity}` : ''}`);

@@ -10,7 +10,7 @@ export function signCustomerToken(auth: Omit<CustomerAuth, 'scope'>) {
 
 export function verifyCustomerToken(token: string): CustomerAuth | null {
   try {
-    const payload = jwt.verify(token, JWT_SECRET) as Partial<CustomerAuth>;
+    const payload = jwt.verify(token, JWT_SECRET, { algorithms: ['HS256'] }) as Partial<CustomerAuth>;
     if (
       payload.scope !== 'customer' ||
       typeof payload.customerId !== 'string' ||

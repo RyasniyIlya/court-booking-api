@@ -74,6 +74,7 @@ export async function requireAuth(
     const payload = jwt.verify(
       header.slice(7),
       SECRET,
+      { algorithms: ['HS256'] },
     ) as Partial<Auth> & { credentialVersion?: string };
 
     if (

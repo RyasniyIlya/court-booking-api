@@ -12,7 +12,7 @@ import request from 'supertest';
 
 const prisma = {
   club: { findFirst: vi.fn() },
-  customer: { findUnique: vi.fn(), findFirst: vi.fn(), updateMany: vi.fn() },
+  customer: { findUnique: vi.fn(), findFirst: vi.fn(), create: vi.fn(), updateMany: vi.fn() },
 };
 const findOrCreateCustomer = vi.fn();
 const signCustomerToken = vi.fn(() => 'token-1');
@@ -62,6 +62,7 @@ beforeEach(() => {
   prisma.customer.findUnique.mockResolvedValue(null);
   prisma.customer.updateMany.mockResolvedValue({ count: 1 });
   findOrCreateCustomer.mockResolvedValue(card);
+  prisma.customer.create.mockResolvedValue(card);
   verifyCustomerToken.mockReturnValue(null);
 });
 
@@ -114,14 +115,12 @@ describe('POST /clubs/:slug/customer/register', () => {
     const res = await register(valid);
     expect(res.status).toBe(201);
     expect(res.body.token).toBe('token-1');
-    expect(findOrCreateCustomer).toHaveBeenCalledWith({
-      clubId: 'club-1', name: 'Ілля Рясний', rawPhone: '+380671112233',
-      birthDate: new Date('1990-03-15T00:00:00.000Z'),
+    expect(prisma.customer.create).toHaveBeenCalledWith({ data: {
+      clubId: 'club-1', name: 'Ілля Рясний', phone: '+380671112233', phoneTail: '1112233',
+      birthDate: new Date('1990-03-15T00:00:00.000Z'), passwordHash: 'hash-1', passwordFails: 0, passwordLockedUntil: null,
+    }
     });
-    expect(prisma.customer.updateMany).toHaveBeenCalledWith({
-      where: { id: 'cust-1', passwordHash: null },
-      data: { passwordHash: 'hash-1', passwordFails: 0, passwordLockedUntil: null },
-    });
+    expect(findOrCreateCustomer).not.toHaveBeenCalled();
   });
 
   it('без пароля або з коротким паролем акаунт не створюється', async () => {
@@ -139,21 +138,22 @@ describe('POST /clubs/:slug/customer/register', () => {
     expect(findOrCreateCustomer).not.toHaveBeenCalled();
   });
 
-  it('стара картка без пароля стає акаунтом, якщо дата збігається', async () => {
+  it('стара картка без пароля потребує підтвердження навіть зі збігом дати', async () => {
     prisma.customer.findUnique.mockResolvedValue({ birthDate: card.birthDate, passwordHash: null });
-    expect((await register(valid)).status).toBe(201);
+    expect((await register(valid)).body).toEqual({ error: 'CUSTOMER_VERIFICATION_REQUIRED' });
+    expect(prisma.customer.create).not.toHaveBeenCalled();
   });
 
   it('стара картка з іншою датою — чужу картку не забрати', async () => {
     prisma.customer.findUnique.mockResolvedValue({ birthDate: new Date('1985-01-01'), passwordHash: null });
     const res = await register(valid);
-    expect(res.status).toBe(403);
-    expect(res.body).toEqual({ error: 'BIRTH_DATE_MISMATCH' });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ error: 'CUSTOMER_VERIFICATION_REQUIRED' });
     expect(prisma.customer.updateMany).not.toHaveBeenCalled();
   });
 
   it('двоє реєструють той самий номер одночасно — другий отримує 409', async () => {
-    prisma.customer.updateMany.mockResolvedValue({ count: 0 });
+    prisma.customer.create.mockRejectedValueOnce({ code: 'P2002' });
     const res = await register(valid);
     expect(res.status).toBe(409);
     expect(signCustomerToken).not.toHaveBeenCalled();
