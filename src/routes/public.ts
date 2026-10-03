@@ -30,6 +30,7 @@ import { courtPriceWithPromos, bestPromo, promoPrice } from '../lib/promo';
 import { courtPhotoUrl } from '../lib/courtMedia';
 import { canCancelNow, cancelBookingByCustomer, cancelSeatByCustomer } from '../lib/customerCancel';
 import { botReady } from '../lib/telegram';
+import { consentUpdate, LEGAL_VERSION } from '../lib/legal';
 import { planFeatures } from '../lib/plans';
 import { createPlayerLinkCode, PLAYER_LINK_MINUTES, playerStartPayload, unlinkPlayers } from '../lib/playerBot';
 import { joinWaitlist, type JoinError } from '../lib/waitlist';
@@ -222,6 +223,10 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
       timezone: club.timezone,
       phone: club.phone,
       address: club.address,
+      legalName: club.legalName,
+      legalCode: club.legalCode,
+      legalAddress: club.legalAddress,
+      email: club.email,
       logoUrl: logoSrcOf(club),
       brandColor: club.brandColor,
       pageBackdrop: club.pageBackdrop,
@@ -240,6 +245,14 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
     // логотипа чи адреси віджет лишається таким, як був.
     phone: club.phone,
     address: club.address,
+    /* Реквізити виконавця для Правил клубу й Політики (docs/legal). */
+    legalName: club.legalName,
+    legalCode: club.legalCode,
+    legalAddress: club.legalAddress,
+    email: club.email,
+    lateCancelFeePercent: club.lateCancelFeePercent,
+    refundDays: club.refundDays,
+    extraRules: club.extraRules,
     logoUrl: logoSrcOf(club),
     brandColor: club.brandColor,
     pageBackdrop: club.pageBackdrop,
@@ -697,6 +710,9 @@ const bookingSchema = z.object({
    */
   payChoice: z.enum(['online', 'onsite']).optional(),
   birthDate: birthDateText,
+  /** Галочки під кнопкою «Забронювати». Необовʼязкові: старі клієнти їх не шлють. */
+  acceptedTerms: z.boolean().optional(),
+  marketingConsent: z.boolean().optional(),
   /**
    * Звідки прийшов гравець: мітки з посилання і домен переходу.
    *
@@ -814,6 +830,13 @@ publicRouter.post('/clubs/:slug/bookings', publicWriteLimiter, async (req, res) 
   if (customer?.isBlocked) return res.status(403).json({ error: 'CUSTOMER_BLOCKED' });
   if (customer && !guard.signedIn && dateOnly(customer.birthDate) !== body.birthDate) {
     return res.status(403).json({ error: 'BIRTH_DATE_MISMATCH' });
+  }
+
+  /* Згода з Правилами клубу й Політикою (docs/legal): дата й версія, коли
+     порожні або застарілі. Не вимагається — старі віджети галочок не шлють. */
+  if (customer) {
+    const consent = consentUpdate(customer, body);
+    if (consent) await prisma.customer.update({ where: { id: customer.id }, data: consent });
   }
 
   /* Токен профілю бронь більше не видає: профіль відчиняє тільки пароль.
@@ -1539,12 +1562,18 @@ publicRouter.post('/clubs/:slug/customer/login', customerLoginLimiter, async (re
  */
 publicRouter.post('/clubs/:slug/customer/register', customerLoginLimiter, async (req, res) => {
   const parsed = z
-    .object({ phone: z.string().trim(), name: z.string(), birthDate: birthDateText, password: passwordText })
+    .object({
+      phone: z.string().trim(), name: z.string(), birthDate: birthDateText, password: passwordText,
+      acceptedTerms: z.unknown().optional(), marketingConsent: z.unknown().optional(),
+    })
     .safeParse(req.body);
   if (!parsed.success) {
     const weak = parsed.error.issues.some((i) => i.path[0] === 'password');
     return res.status(400).json({ error: weak ? 'WEAK_PASSWORD' : 'BAD_REQUEST' });
   }
+
+  /* Без галочки Правил і Політики акаунт не створюється (docs/legal, Ю-4). */
+  if (parsed.data.acceptedTerms !== true) return res.status(400).json({ error: 'TERMS_REQUIRED' });
 
   const slug = Array.isArray(req.params.slug) ? req.params.slug[0] : req.params.slug;
   const club = await loadClub(slug);
@@ -1564,6 +1593,7 @@ publicRouter.post('/clubs/:slug/customer/register', customerLoginLimiter, async 
   if (existing) return res.status(409).json({ error: 'CUSTOMER_VERIFICATION_REQUIRED' });
 
   const passwordHash = await hashCustomerPassword(parsed.data.password);
+  const acceptedAt = new Date();
   let customer;
   try {
     customer = await prisma.customer.create({
@@ -1571,6 +1601,8 @@ publicRouter.post('/clubs/:slug/customer/register', customerLoginLimiter, async 
         clubId: club.id, name, phone: phone.e164, phoneTail: phone.tail,
         birthDate: birthDateValue(parsed.data.birthDate), passwordHash,
         passwordFails: 0, passwordLockedUntil: null,
+        termsAcceptedAt: acceptedAt, termsVersion: LEGAL_VERSION,
+        marketingConsentAt: parsed.data.marketingConsent === true ? acceptedAt : null,
       },
     });
   } catch (error) {

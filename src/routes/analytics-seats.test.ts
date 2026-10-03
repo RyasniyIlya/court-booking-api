@@ -10,6 +10,7 @@ vi.mock('../lib/db', () => ({
   prisma: {
     booking: { findMany: (a: unknown) => findMany.booking(a) },
     bookingSeat: { findMany: (a: unknown) => findMany.bookingSeat(a) },
+    passUsage: { findMany: async () => [] },
   },
 }));
 vi.mock('./admin', () => ({

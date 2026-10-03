@@ -45,8 +45,11 @@ export type BookingRow = {
   courtId: string;
   startTime: Date;
   endTime: Date;
-  /** Копійки, зафіксовані на момент броні */
+  /** Копійки, зафіксовані на момент броні (повна сума клієнта) */
   priceTotal: number;
+  /** Виручка КОРТУ без тренера/прокату й за вартістю абонемента
+      (lib/serviceValue.ts courtValueOf). Немає — береться priceTotal. */
+  courtValue?: number;
 };
 
 export type LoadCell = {
@@ -268,7 +271,7 @@ export function buildLoadProfile(input: LoadProfileInput): LoadProfile {
          бронь порахувалась би двічі, а виручка клубу подвоїлась би. */
       if (first && startedInside) {
         cell.bookings += 1;
-        cell.revenue += b.priceTotal;
+        cell.revenue += b.courtValue ?? b.priceTotal;
       }
     });
   }

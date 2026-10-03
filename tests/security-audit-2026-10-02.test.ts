@@ -78,7 +78,7 @@ it.each([null, new Date('1990-01-01')])('existing legacy card DOB %s cannot be c
   prisma.club.findFirst.mockResolvedValue({ id: cid });
   prisma.customer.findUnique.mockResolvedValue({ id: uid, passwordHash: null, birthDate, name: 'Victim', email: 'victim@example.test' });
   const response = await request(express().use(express.json()).use('/api/public', publicRouter))
-    .post('/api/public/clubs/audit/customer/register').send({ phone: '+380671112233', name: 'Attacker', birthDate: '1990-01-01', password: 'attacker-password' });
+    .post('/api/public/clubs/audit/customer/register').send({ phone: '+380671112233', name: 'Attacker', birthDate: '1990-01-01', password: 'attacker-password', acceptedTerms: true });
   expect(response.status).toBe(409);
   expect(response.body).toEqual({ error: 'CUSTOMER_VERIFICATION_REQUIRED' });
   expect(prisma.customer.upsert).not.toHaveBeenCalled();

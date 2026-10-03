@@ -1,3 +1,4 @@
+import { withSendSummary } from './telegramSafety';
 import { planFeatures } from './plans';
 import { DateTime } from 'luxon';
 
@@ -42,13 +43,15 @@ let timer: NodeJS.Timeout | null = null;
 /**
  * Кому взагалі йде зведення.
  *
- * Тільки OWNER і ADMIN: у тренера в кабінеті виручки клубу немає, і бот не
+ * Тільки OWNER (рішення власника 2026-09-28: модератор не бачить
+ * прибутку/виручки клубу, а окремого варіанта без грошей немає — простіше
+ * й безпечніше не слати). У тренера в кабінеті виручки клубу немає, і бот не
  * має ставати обхідним шляхом до неї. Тренерські /today лишаються на
  * запит — розкладом його ніхто не питав завалювати.
  */
 async function recipients() {
   return prisma.user.findMany({
-    where: { tgChatId: { not: null }, role: { in: ['OWNER', 'ADMIN'] } },
+    where: { tgChatId: { not: null }, role: 'OWNER' },
     select: {
       id: true,
       tgChatId: true,
@@ -58,7 +61,8 @@ async function recipients() {
 }
 
 /** Один прохід. Винесено з інтервалу, щоб тест міг покликати напряму. */
-export async function runDigestTick(now: DateTime = DateTime.now()): Promise<number> {
+export const runDigestTick = (now?: DateTime) => withSendSummary('digest', () => runDigestTickInner(now));
+async function runDigestTickInner(now: DateTime = DateTime.now()): Promise<number> {
   const target = hour();
   const people = await recipients();
   let delivered = 0;

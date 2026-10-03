@@ -75,15 +75,15 @@ describe('get_day_summary / get_revenue_trend — копійки в гривні
       topCourt: { name: 'Корт 1', bookings: 2 }, prevRevenue: 9999,
     });
     const out: any = await tool('get_day_summary').run({});
-    expect(out.revenue_uah).toBe(123); // 12345 коп round -> 123
-    expect(out.prev_day_revenue_uah).toBe(100); // 9999 коп round -> 100
+    expect(out.court_revenue_uah).toBe(123); // 12345 коп round -> 123
+    expect(out.prev_day_court_revenue_uah).toBe(100); // 9999 коп round -> 100
   });
 
   it('revenue_trend округлює суми періоду', async () => {
     vi.mocked(weekReport).mockResolvedValue({ points: [{ day: '2026-09-01', label: '01.09', revenue: 5050, bookings: 2 }], total: 10050, bookings: 5, prevTotal: 8000 });
     const out: any = await tool('get_revenue_trend').run({ days: 7 });
-    expect(out.total_uah).toBe(101);
-    expect(out.by_day[0].revenue_uah).toBe(51);
+    expect(out.court_revenue_total_uah).toBe(101);
+    expect(out.by_day[0].court_revenue_uah).toBe(51);
   });
 });
 
@@ -97,7 +97,7 @@ describe('get_court_report', () => {
     expect(out.period_label).toBe('01.09.2026 — 02.09.2026');
     expect(out.courts[0]).toEqual({
       court: 'Корт 1', confirmed: 3, pending: 1, cancelled: 0, expired: 0,
-      revenue_uah: 150, occupancy_pct: 56.3, booked_hours: 4.5, free_hours: 3.5,
+      court_revenue_uah: 150, occupancy_pct: 56.3, booked_hours: 4.5, free_hours: 3.5,
       paid_online: 2, payment_pending: 1, refunded: 0,
     });
     expect(JSON.stringify(out)).not.toMatch(/<[a-z]/i); // жодного HTML/Telegram-тега

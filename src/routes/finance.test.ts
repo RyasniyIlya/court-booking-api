@@ -256,3 +256,16 @@ describe('нові звіти', () => {
     expect((await request(app).get('/pnl?month=2026-13')).status).toBe(400);
   });
 });
+
+describe('модератор (ADMIN) не бачить фінанси — рішення власника 2026-09-28', () => {
+  it.each(['/cashbook', '/debtors', '/passes', '/trainers', '/pnl'])('GET %s — 403 для ADMIN, не 403 для OWNER і ACCOUNTANT', async (path) => {
+    role = 'ADMIN';
+    const denied = await request(app).get(path);
+    expect(denied.status).toBe(403);
+    expect(prisma.bookingLedgerEntry.findMany).not.toHaveBeenCalled();
+    for (const r of ['OWNER', 'ACCOUNTANT']) {
+      role = r;
+      expect((await request(app).get(path)).status, `${r} ${path}`).not.toBe(403);
+    }
+  });
+});

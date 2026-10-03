@@ -4,7 +4,8 @@ import { DateTime } from 'luxon';
 import { prisma } from './db';
 import { planFeatures } from './plans';
 import { answerCallback, editMessageText, sendMessage, type TgUpdate } from './telegram';
-import { bookingUrl } from './botBooking';
+import { bookingUrl, publicWebBase } from './botBooking';
+import { telegramHtml } from './telegramHtml';
 import { canReschedule } from './reschedule';
 import {
   canCancelNow,
@@ -95,6 +96,35 @@ export async function linkChatToCustomer(chatId: string, clubId: string, custome
       data: { telegramChatId: chatId, tgLinkCode: null, tgLinkUntil: null },
     }),
   ]);
+}
+
+/**
+ * Один рядок із посиланням на Політику конфіденційності — при першому
+ * /start і першій привʼязці. Без кнопок і блокувань.
+ *
+ * «Вже показували» = у привʼязаної картки заповнено privacyNoticeAt: показ
+ * повідомлення фіксуємо окремим полем (це НЕ згода: termsAcceptedAt не чіпаємо), тож повторний /start
+ * нічого не дублює. Якщо адреси сайту нема в налаштуваннях — мовчимо:
+ * повідомлення без посилання нічого не повідомляє.
+ */
+export async function sendPrivacyNoticeOnce(chatId: string): Promise<boolean> {
+  const base = publicWebBase();
+  if (!base) return false;
+  const fresh = await prisma.customer.findMany({
+    where: { telegramChatId: chatId, privacyNoticeAt: null },
+    select: { id: true },
+  });
+  if (fresh.length === 0) return false;
+  await prisma.customer.updateMany({
+    where: { id: { in: fresh.map((c) => c.id) }, privacyNoticeAt: null },
+    data: { privacyNoticeAt: new Date() },
+  });
+  const url = telegramHtml(`${base}/legal/privacy`);
+  await sendMessage(
+    chatId,
+    `Продовжуючи, ви погоджуєтеся з <a href="${url}">Політикою конфіденційності</a> клубу.`,
+  );
+  return true;
 }
 
 /* Код із профілю привʼязує чат лише після підтвердження номера кнопкою

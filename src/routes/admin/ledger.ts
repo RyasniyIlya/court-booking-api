@@ -52,7 +52,19 @@ ledgerRouter.get('/ledger', requireAuth, requireStaff, async (req, res) => {
   const range = dayRange(q.from, q.to, club.timezone);
   if (!range) return res.status(400).json({ error: 'BAD_PERIOD' });
 
-  const period = { clubId, createdAt: { gte: range.start, lt: range.endExclusive } };
+  /* Рішення власника: модератор бачить лише власні операції. Клієнтський
+     ?actor ігнорується — ім'я береться з акаунта, а не із запиту. */
+  let ownEmail: string | null = null;
+  if (req.auth!.role === 'ADMIN') {
+    const me = await prisma.user.findFirst({ where: { id: req.auth!.userId, clubId }, select: { email: true } });
+    if (!me) return res.status(404).json({ error: 'NOT_FOUND' });
+    ownEmail = me.email;
+  }
+  const period = {
+    clubId,
+    createdAt: { gte: range.start, lt: range.endExclusive },
+    ...(ownEmail ? { actorEmail: ownEmail } : {}),
+  };
   const search = q.q
     ? {
       OR: [
@@ -69,7 +81,7 @@ ledgerRouter.get('/ledger', requireAuth, requireStaff, async (req, res) => {
     ...(q.method ? { method: q.method } : {}),
     ...(q.kind ? { kind: q.kind } : {}),
     ...(q.account ? { account: q.account } : {}),
-    ...(q.actor ? { actorEmail: q.actor } : {}),
+    ...(q.actor && !ownEmail ? { actorEmail: q.actor } : {}),
     ...search,
   };
   const order = [{ createdAt: 'desc' as const }, { id: 'desc' as const }];

@@ -2,6 +2,7 @@ import { DateTime } from 'luxon';
 import { prisma } from './db';
 import { planFeatures } from './plans';
 import { buildLoadProfile } from './loadProfile';
+import { courtValueOf, loadPassSessionValues } from './serviceValue';
 
 export const escapeReport = (text: string) => text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
 const money = (kop: number) => `${(kop / 100).toLocaleString('uk-UA', { maximumFractionDigits: 2 })} грн`;
@@ -33,7 +34,7 @@ export function analyticsMessages(clubName: string, range: string, timezone: str
   const blocks = rows.map(r => [
     `🔸 <b>[ ${escapeReport(r.name.slice(0, 100))} ]</b>`,
     `— Підтверджені броні: <b>${r.confirmed} шт</b>`,
-    `— Сума бронювань: <b>${money(r.amount)}</b>`,
+    `— Виручка корту (без тренера й прокату): <b>${money(r.amount)}</b>`,
     `— Очікують: <b>${r.pending}</b> · скасовано: <b>${r.cancelled}</b> · прострочено: <b>${r.expired}</b>`,
     `<blockquote>Завантаження: <b>${r.occupancy == null ? 'немає доступних годин' : `${r.occupancy.toFixed(1)}%`}</b>\n∘ Зайнято: <b>${r.bookedHours.toFixed(1)} год</b>\n∘ Вільно: <b>${r.freeHours.toFixed(1)} год</b>\n∘ Онлайн: оплачено <b>${r.paid}</b> · очікують <b>${r.paymentPending}</b> · повернено <b>${r.refunded}</b></blockquote>`,
   ].join('\n'));
@@ -41,11 +42,11 @@ export function analyticsMessages(clubName: string, range: string, timezone: str
     '———————————————',
     `🔹 <b>Усього по клубу</b>`,
     `Підтверджено: <b>${total.confirmed} броней</b>`,
-    `Сума бронювань: <b>${money(total.amount)}</b>`,
+    `Виручка корту (без тренера й прокату): <b>${money(total.amount)}</b>`,
     `Очікують: <b>${total.pending}</b> · скасовано: <b>${total.cancelled}</b>`,
     rows.length ? '' : 'За цей період кортів і записів немає.',
     '',
-    '<i>Суми — ціни підтверджених броней, не банківська виписка. Групові місця не додаються до ціни броні повторно. Онлайн-статуси враховують платежі броней і місць, це кількість, не гривні.</i>',
+    '<i>Суми — виручка корту підтверджених броней (без тренера й прокату; заняття з абонемента — за вартістю заняття), не банківська виписка. Групові місця не додаються до ціни броні повторно. Онлайн-статуси враховують платежі броней і місць, це кількість, не гривні.</i>',
     '<i>Броні — за датою початку, години — за перетином із періодом. Блокування виключено; застосовано поточний графік роботи. Неявки не вимірюються.</i>',
     `\nЗнімок: ${escapeReport(generated)}. Повторний запит створить нове повідомлення; пізні зміни статусів можуть змінити цифри.`,
     '\nПерегляд: /analytics today · /analytics yesterday\n/analytics week · /analytics month\nЗа дату: <code>/analytics 2026-09-01</code>',
@@ -82,20 +83,24 @@ export async function courtAnalytics(clubId: string, input: string): Promise<Clu
   const [courts, bookings, blocks] = await Promise.all([
     prisma.court.findMany({ where: { clubId }, select: { id: true, name: true, isActive: true } }),
     prisma.booking.findMany({ where: { clubId, startTime: { lt: to }, endTime: { gt: from } }, select: {
-      courtId: true, startTime: true, endTime: true, status: true, priceTotal: true,
+      id: true, courtId: true, startTime: true, endTime: true, status: true, priceTotal: true,
+      rentalTotal: true, trainerPrice: true, capacity: true, customer: { select: { discountPercent: true } },
       payment: { select: { status: true } }, seats: { select: { payment: { select: { status: true } } } },
     } }),
     prisma.block.findMany({ where: { clubId, startTime: { lt: to }, endTime: { gt: from } }, select: { courtId: true, startTime: true, endTime: true } }),
   ]);
-  const rows = courts.filter(c => c.isActive || bookings.some(b => b.courtId === c.id)).map(c => {
-    const own = bookings.filter(b => b.courtId === c.id);
+  /* Виручка корту: без тренера/прокату, абонемент — за вартістю заняття. */
+  const passValues = await loadPassSessionValues(prisma, bookings.map(b => b.id));
+  const valued = bookings.map(b => ({ ...b, courtValue: courtValueOf({ ...b, discountPercent: b.customer?.discountPercent }, passValues.get(b.id)) }));
+  const rows = courts.filter(c => c.isActive || valued.some(b => b.courtId === c.id)).map(c => {
+    const own = valued.filter(b => b.courtId === c.id);
     const starts = own.filter(b => b.startTime >= from);
     const confirmed = starts.filter(b => b.status === 'CONFIRMED');
     const totals = buildLoadProfile({ from: from < club.createdAt ? club.createdAt : from, to, timezone: club.timezone, hours: club.hours,
       courts: c.isActive ? [{ id: c.id }] : [], blocks, bookings: own.filter(b => b.status === 'CONFIRMED'),
     }).totals;
     const payments = starts.flatMap(b => [b.payment, ...b.seats.map(s => s.payment)]).filter(p => p != null);
-    return { name: c.name, confirmed: confirmed.length, amount: confirmed.reduce((sum, b) => sum + b.priceTotal, 0),
+    return { name: c.name, confirmed: confirmed.length, amount: confirmed.reduce((sum, b) => sum + b.courtValue, 0),
       pending: starts.filter(b => b.status === 'PENDING').length, cancelled: starts.filter(b => b.status === 'CANCELLED').length,
       expired: starts.filter(b => b.status === 'EXPIRED').length,
       paid: payments.filter(p => p.status === 'PAID').length, paymentPending: payments.filter(p => p.status === 'PENDING').length,

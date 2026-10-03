@@ -3,6 +3,7 @@ import { DateTime } from 'luxon';
 import { prisma } from './db';
 import { telegramHtml } from './telegramHtml';
 import { barChart, groupBars } from './charts';
+import { courtValueOf, loadPassSessionValues } from './serviceValue';
 import { BOOKINGS, count, CUSTOMERS, DAYS, WEEKS } from './plural';
 
 /**
@@ -24,8 +25,11 @@ export type DayDigest = {
   from: Date;
   to: Date;
   bookings: number;
-  /** Копійки. Тільки підтверджені — скасоване не гроші */
+  /** Копійки. ВИРУЧКА КОРТУ (нарахування, lib/serviceValue.ts): без тренера й
+      прокату, заняття з абонемента — за pass.price/totalSessions. Тільки підтверджені. */
   revenue: number;
+  /** Копійки: тренер і прокат у приватних бронях (priceTotal − вартість корту). Не виручка корту. */
+  extras?: number;
   /** Скільки людей уперше потрапили в картотеку саме сьогодні */
   newCustomers: number;
   /** Найзавантаженіший корт дня і скільки на ньому броней */
@@ -60,16 +64,26 @@ export async function dayDigest(clubId: string, timezone: string, now?: DateTime
       startTime: { gte: from, lte: to },
     },
     select: {
+      id: true,
       priceTotal: true,
+      rentalTotal: true,
+      trainerPrice: true,
+      capacity: true,
+      customer: { select: { discountPercent: true } },
       court: { select: { name: true } },
     },
   });
 
   const perCourt = new Map<string, number>();
+  const passValues = await loadPassSessionValues(prisma, bookings.map((b) => b.id));
   let revenue = 0;
+  let extras = 0;
 
   for (const b of bookings) {
-    revenue += b.priceTotal;
+    const row = { ...b, discountPercent: b.customer?.discountPercent };
+    revenue += courtValueOf(row, passValues.get(b.id));
+    /* Тренер/прокат показуємо окремо: у касі вони є, у виручці корту — ні. */
+    extras += Math.max(0, b.priceTotal - courtValueOf(row));
     const name = b.court?.name;
     if (name) perCourt.set(name, (perCourt.get(name) ?? 0) + 1);
   }
@@ -91,23 +105,30 @@ export async function dayDigest(clubId: string, timezone: string, now?: DateTime
      тільки в порівнянні. Окремим запитом, бо це інша доба, а сума —
      єдине, що з неї потрібне. */
   const prev = clubDayBounds(timezone, (now ?? DateTime.now()).minus({ days: 1 }));
-  const prevAgg = await prisma.booking.aggregate({
+  const prevRows = await prisma.booking.findMany({
     where: {
       clubId,
       status: 'CONFIRMED',
       startTime: { gte: prev.from, lte: prev.to },
     },
-    _sum: { priceTotal: true },
+    select: {
+      id: true, priceTotal: true, rentalTotal: true, trainerPrice: true, capacity: true,
+      customer: { select: { discountPercent: true } },
+    },
   });
+  const prevPass = await loadPassSessionValues(prisma, prevRows.map((b) => b.id));
+  const prevRevenue = prevRows.reduce(
+    (s, b) => s + courtValueOf({ ...b, discountPercent: b.customer?.discountPercent }, prevPass.get(b.id)), 0);
 
   return {
     from,
     to,
     bookings: bookings.length,
     revenue,
+    extras,
     newCustomers,
     topCourt,
-    prevRevenue: prevAgg._sum.priceTotal ?? 0,
+    prevRevenue,
   };
 }
 
@@ -177,7 +198,8 @@ export function digestText(clubName: string, d: DayDigest, timezone: string): st
   return [
     header(clubName, sub),
     '',
-    `💰 <b>${hrn(d.revenue)}</b>${change ? `  <i>${change} до попереднього дня</i>` : ''}`,
+    `💰 Виручка корту (без тренера й прокату): <b>${hrn(d.revenue)}</b>${change ? `  <i>${change} до попереднього дня</i>` : ''}`,
+    d.extras && d.extras > 0 ? `➕ Тренер і прокат: ${hrn(d.extras)} · Надано послуг (всього) ${hrn(d.revenue + d.extras)}` : '',
     `📋 ${count(d.bookings, BOOKINGS)}`,
     d.newCustomers > 0 ? `👤 ${count(d.newCustomers, CUSTOMERS)}` : '',
     d.topCourt
@@ -208,7 +230,7 @@ export type WeekReport = {
   points: DayPoint[];
   total: number;
   bookings: number;
-  /** Виручка за попередній такий самий відрізок — для порівняння */
+  /** Виручка корту (без тренера/прокату) за попередній такий самий відрізок — для порівняння */
   prevTotal: number;
 };
 
@@ -240,8 +262,12 @@ export async function weekReport(
       status: 'CONFIRMED',
       startTime: { gte: startOfPrev.toUTC().toJSDate(), lte: endOfToday.toUTC().toJSDate() },
     },
-    select: { priceTotal: true, startTime: true },
+    select: {
+      id: true, priceTotal: true, rentalTotal: true, trainerPrice: true, capacity: true, startTime: true,
+      customer: { select: { discountPercent: true } },
+    },
   });
+  const passValues = await loadPassSessionValues(prisma, rows.map((b) => b.id));
 
   /* Порожні дні мають лишитись у графіку нулями: тиждень із провалом у
      вівторок — це і є те, заради чого власник дивиться на форму кривої. */
@@ -264,7 +290,12 @@ export async function weekReport(
   let bookings = 0;
   let prevTotal = 0;
 
-  for (const b of rows) {
+  for (const row of rows) {
+    /* Виручка корту, а не повна сума клієнта (тренер/прокат не рахуються). */
+    const b = {
+      startTime: row.startTime,
+      priceTotal: courtValueOf({ ...row, discountPercent: row.customer?.discountPercent }, passValues.get(row.id)),
+    };
     const day = DateTime.fromJSDate(b.startTime).setZone(timezone).toFormat('yyyy-MM-dd');
     const point = byDay.get(day);
 
@@ -351,7 +382,7 @@ export function weekText(clubName: string, r: WeekReport, days = 7): string {
     header(clubName, sub),
     '',
     `<pre>${telegramHtml(chart)}</pre>`,
-    `Разом <b>${hrn(r.total)}</b> · ${count(r.bookings, BOOKINGS)}`,
+    `Виручка корту <b>${hrn(r.total)}</b> · ${count(r.bookings, BOOKINGS)}`,
     `У середньому ${hrn(avg)} за день · найкращий ${best.label} (${hrn(best.revenue)})`,
     change ? `До попереднього періоду: <b>${change}</b>` : '',
   ].filter(Boolean).join('\n');

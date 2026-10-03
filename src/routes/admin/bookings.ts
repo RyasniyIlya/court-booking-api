@@ -143,6 +143,10 @@ bookingsRouter.get(
         customer: {
           select: {
             id: true,
+            /* Тільки ім'я й телефон — решту (нотатка персоналу, блокування,
+               Telegram id) тренеру не віддаємо, див. нижче. */
+            name: true,
+            phone: true,
             telegramChatId: true,
             isBlocked: true,
             note: true,
@@ -242,6 +246,12 @@ bookingsRouter.get(
     res.json(
       bookings.map((b) => ({
         ...b,
+        /* Тренер бачить про гравця лише ім'я й телефон. Прапорець
+           reminderReachable нижче рахується з telegramChatId, але сам id
+           назовні не йде. */
+        ...(req.auth!.role === 'TRAINER'
+          ? { customer: b.customer ? { name: b.customer.name, phone: b.customer.phone } : null }
+          : {}),
         changes: changes.filter((row) => row.entityId === b.id),
         pass: b.customerId
           ? passes.get(b.customerId) ?? null

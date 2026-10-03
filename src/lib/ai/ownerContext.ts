@@ -125,9 +125,9 @@ export function describeSnapshot(s: ClubSnapshot | null): string {
   if (!s) return '';
   const lines = [
     `Дата: ${s.date}. Активних кортів: ${s.courts}.${s.planName ? ` Тариф: ${s.planName}.` : ''}`,
-    `Сьогодні: ${s.today.bookings} підтверджених броней, виручка ${money(s.today.revenueUah)}, нових клієнтів ${s.today.newCustomers}${s.today.topCourt ? `, найзавантаженіший корт — ${s.today.topCourt}` : ''}.`,
+    `Сьогодні: ${s.today.bookings} підтверджених броней, виручка корту (без тренера й прокату) ${money(s.today.revenueUah)}, нових клієнтів ${s.today.newCustomers}${s.today.topCourt ? `, найзавантаженіший корт — ${s.today.topCourt}` : ''}.`,
   ];
-  if (s.yesterdayRevenueUah != null) lines.push(`Вчора: виручка ${money(s.yesterdayRevenueUah)}.`);
+  if (s.yesterdayRevenueUah != null) lines.push(`Вчора: виручка корту ${money(s.yesterdayRevenueUah)}.`);
   lines.push(
     `Останні 7 днів: ${money(s.week.revenueUah)}, ${s.week.bookings} броней; попередні 7 днів: ${money(s.week.prevRevenueUah)}` +
     `${s.week.changePct == null ? ' (порівнювати нема з чим)' : `, зміна ${signed(s.week.changePct)}`}.`,
@@ -162,7 +162,7 @@ export function ownerSuggestions(s: ClubSnapshot | null): string[] {
   const out: string[] = [];
   if (s?.weakestDay) out.push(`Чому у ${s.weakestDay.weekday} порожньо і що зробити?`);
   if (s && s.pending > 0) out.push('Що з бронями, які чекають підтвердження?');
-  if (s?.week.changePct != null && s.week.changePct < 0) out.push('Чому виручка впала за тиждень?');
+  if (s?.week.changePct != null && s.week.changePct < 0) out.push('Чому виручка корту впала за тиждень?');
   for (const g of GENERIC) if (!out.includes(g)) out.push(g);
   return out.slice(0, 3);
 }

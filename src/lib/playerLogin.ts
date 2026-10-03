@@ -5,7 +5,7 @@ import { verifyCustomerPassword } from './customerPassword';
 import { playerKeyboard } from './botKeyboard';
 import { normalizePhone } from './phone';
 import { bookingUrl } from './botBooking';
-import { html, linkChatToCustomer, PLAYER_LINK_MINUTES } from './playerBot';
+import { html, linkChatToCustomer, PLAYER_LINK_MINUTES, sendPrivacyNoticeOnce } from './playerBot';
 import { askMarketingConsent, sendClubHome } from './playerHome';
 
 /**
@@ -360,6 +360,7 @@ async function finish(chatId: string, club: Club, customerId: string, name: stri
     playerKeyboard(),
   );
 
+  await sendPrivacyNoticeOnce(chatId).catch((e) => console.warn('[bot] privacy notice', (e as Error).message));
   await sendClubHome(chatId, club.id, customerId);
   await askMarketingConsent(chatId, customerId);
 }

@@ -1,6 +1,6 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { DateTime } from 'luxon';
-const prisma = { club: { findUnique: vi.fn() }, court: { findMany: vi.fn() }, booking: { findMany: vi.fn() }, block: { findMany: vi.fn() } };
+const prisma = { club: { findUnique: vi.fn() }, court: { findMany: vi.fn() }, booking: { findMany: vi.fn() }, block: { findMany: vi.fn() }, passUsage: { findMany: vi.fn(async () => []) } };
 vi.mock('./db', () => ({ prisma }));
 const { analyticsRange, analyticsMessages, botAnalytics } = await import('./botAnalytics');
 const now = DateTime.fromISO('2026-09-07T12:00:00', { zone: 'Europe/Kyiv' });

@@ -17,7 +17,9 @@
  */
 
 import { spawn } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { parse as parseDotenv } from 'dotenv';
 
 const LOCAL_DB = 'postgresql://postgres:postgres@localhost:5432/courts';
 
@@ -47,6 +49,41 @@ const env = {
     PAYMENTS_SECRET: 'local-dev-payments-secret-0123456789',
   }),
 };
+
+/**
+ * Гард: який саме хост БД побачить API. Показуємо ТІЛЬКИ хост, без логіна,
+ * пароля й імені бази. Якщо хост не локальний — це справжня (онлайн) база:
+ * все, що ви створите в кабінеті, лишиться в ній. Для демо є безпечний шлях:
+ * npm run dev:isolated (база в памʼяті, вигадані дані).
+ */
+function dbHostOf(url) {
+  try {
+    return new URL(url).hostname.replace(/^\[|\]$/g, '');
+  } catch {
+    return null;
+  }
+}
+const dotenvPath = fileURLToPath(new URL('../.env', import.meta.url));
+let effectiveUrl = env.DATABASE_URL;
+if (!effectiveUrl && existsSync(dotenvPath)) {
+  effectiveUrl = parseDotenv(readFileSync(dotenvPath)).DATABASE_URL;
+}
+const dbHost = effectiveUrl ? dbHostOf(effectiveUrl) : null;
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '::1', '0.0.0.0']);
+if (!dbHost || !LOCAL_HOSTS.has(dbHost)) {
+  const bar = '#'.repeat(78);
+  const where = dbHost ? `"${dbHost}"` : 'НЕВІДОМИЙ ХОСТ (DATABASE_URL не задано або не розібрано)';
+  console.warn(
+    ['', bar,
+      '#  УВАГА: ЦЕЙ API ПІДКЛЮЧЕНИЙ ДО НЕЛОКАЛЬНОЇ БАЗИ: ' + where,
+      '#  Це ОНЛАЙН-БАЗА (ПРОД). Усе, що ви створите, змінете або видалите в',
+      '#  кабінеті, потрапить у справжні дані справжніх клубів.',
+      '#',
+      '#  НЕ ПОКАЗУЙТЕ ЦЕЙ РЕЖИМ НА ДЕМО. Для демо кабінету запускайте:',
+      '#      npm run dev:isolated      (база в памʼяті, вигадані дані)',
+      bar, ''].join('\n'),
+  );
+}
 
 const [cmd, ...args] = argv.length ? argv : ['npx', 'tsx', 'watch', 'src/index.ts'];
 

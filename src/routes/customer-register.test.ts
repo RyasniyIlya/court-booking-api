@@ -50,7 +50,7 @@ const login = (body: Record<string, unknown>) =>
 const telegramLogin = (body: Record<string, unknown>) =>
   request(app).post('/api/public/clubs/squash/customer/telegram-session').send(body);
 
-const valid = { phone: '067 111 22 33', name: '  Ілля   Рясний ', birthDate: '1990-03-15', password: 'padel-2026' };
+const valid = { phone: '067 111 22 33', name: '  Ілля   Рясний ', birthDate: '1990-03-15', password: 'padel-2026', acceptedTerms: true };
 const card = {
   id: 'cust-1', name: 'Ілля Рясний', phone: '+380671112233', email: null,
   birthDate: new Date('1990-03-15T00:00:00.000Z'),
@@ -116,6 +116,7 @@ describe('POST /clubs/:slug/customer/register', () => {
     expect(res.status).toBe(201);
     expect(res.body.token).toBe('token-1');
     expect(prisma.customer.create).toHaveBeenCalledWith({ data: {
+      termsAcceptedAt: expect.any(Date), termsVersion: '2026-09', marketingConsentAt: null,
       clubId: 'club-1', name: 'Ілля Рясний', phone: '+380671112233', phoneTail: '1112233',
       birthDate: new Date('1990-03-15T00:00:00.000Z'), passwordHash: 'hash-1', passwordFails: 0, passwordLockedUntil: null,
     }

@@ -2,6 +2,7 @@ import { DateTime } from 'luxon';
 
 import { prisma } from './db';
 import { buildLoadProfile, type LoadProfile } from './loadProfile';
+import { courtValueOf, loadPassSessionValues } from './serviceValue';
 
 /**
  * Профіль завантаження клубу (день тижня × година) — одна функція для
@@ -47,11 +48,21 @@ export async function loadClubLoadProfile(
     }),
     prisma.booking.findMany({
       where: { clubId, status: 'CONFIRMED', startTime: { lt: to }, endTime: { gt: from } },
-      select: { courtId: true, startTime: true, endTime: true, priceTotal: true },
+      select: {
+        id: true, courtId: true, startTime: true, endTime: true, priceTotal: true,
+        rentalTotal: true, trainerPrice: true, capacity: true,
+        customer: { select: { discountPercent: true } },
+      },
     }),
   ]);
 
-  const profile = buildLoadProfile({ from, to, timezone: club.timezone, hours: club.hours, courts, blocks, bookings });
+  /* Виручка корту — без тренера/прокату й за вартістю абонемента. */
+  const passValues = await loadPassSessionValues(prisma, bookings.map((b) => b.id));
+  const valued = bookings.map((b) => ({
+    courtId: b.courtId, startTime: b.startTime, endTime: b.endTime, priceTotal: b.priceTotal,
+    courtValue: courtValueOf({ ...b, discountPercent: b.customer?.discountPercent }, passValues.get(b.id)),
+  }));
+  const profile = buildLoadProfile({ from, to, timezone: club.timezone, hours: club.hours, courts, blocks, bookings: valued });
   const window: ClubLoadWindow = { weeks, from, to };
 
   if (profile.totals.bookings < LOAD_MIN_BOOKINGS) {

@@ -1,3 +1,4 @@
+import { withSendSummary } from './telegramSafety';
 import { prisma } from './db';
 import { planFeatures } from './plans';
 import { botReady, sendReminderMessage } from './telegram';
@@ -34,7 +35,8 @@ const FRESH_MINUTES = 30;
 
 const BATCH = 100;
 
-export async function runPlayerReminderTick(now: Date = new Date()): Promise<number> {
+export const runPlayerReminderTick = (now?: Date) => withSendSummary('player-reminder', () => runPlayerReminderTickInner(now));
+async function runPlayerReminderTickInner(now: Date = new Date()): Promise<number> {
   const to = new Date(now.getTime() + PLAYER_REMIND_MINUTES * 60_000);
   const freshEdge = new Date(now.getTime() - FRESH_MINUTES * 60_000);
   const withTelegram = { telegramChatId: { not: null } };

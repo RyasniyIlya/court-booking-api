@@ -1,3 +1,4 @@
+import { withSendSummary } from './telegramSafety';
 import { DateTime } from 'luxon';
 
 import { prisma } from './db';
@@ -99,13 +100,17 @@ export function buildCandidates(
  * Кандидати клубу з їхніми звичками. Беремо тільки тих, кому фізично є
  * куди написати: без привʼязаного Telegram запрошення нікуди не піде, а в
  * списку «кого покликали» такий рядок був би обіцянкою, якої не виконали.
+ *
+ * onlyConsented — лише ті, хто сам відмітив згоду на маркетинг
+ * (Customer.marketingConsentAt): запрошення у відкриті ігри — не нагадування
+ * про власну бронь, а пропозиція.
  */
-export async function candidatesOf(clubId: string, tz: string, now: Date, withChat = true): Promise<Candidate[]> {
+export async function candidatesOf(clubId: string, tz: string, now: Date, withChat = true, onlyConsented = false): Promise<Candidate[]> {
   const since = new Date(now.getTime() - HABIT_DAYS * 86_400_000);
 
   const [people, bookings, seats] = await Promise.all([
     prisma.customer.findMany({
-      where: { clubId, isBlocked: false, ...(withChat ? { telegramChatId: { not: null } } : {}) },
+      where: { clubId, isBlocked: false, ...(withChat ? { telegramChatId: { not: null } } : {}), ...(onlyConsented ? { marketingConsentAt: { not: null } } : {}) },
       select: { id: true, name: true, skillLevel: true },
     }),
     /* Приватні броні: тільки вони знають, чи людина дійшла до корту. */
@@ -164,7 +169,8 @@ type Match = {
  * одразу після створення, інакше «ми когось повідомили» доводиться брати
  * на віру.
  */
-export async function inviteToMatch(match: Match, now: Date = new Date(), limit = INVITE_LIMIT): Promise<Ranked[]> {
+export const inviteToMatch = (match: Match, now?: Date, limit?: number) => withSendSummary('open-match-invite', () => inviteToMatchInner(match, now, limit));
+async function inviteToMatchInner(match: Match, now: Date = new Date(), limit = INVITE_LIMIT): Promise<Ranked[]> {
   if (!match.capacity) return [];
 
   const local = DateTime.fromJSDate(match.startTime).setZone(match.club.timezone);
@@ -190,7 +196,7 @@ export async function inviteToMatch(match: Match, now: Date = new Date(), limit 
   });
   ctx.exclude = inside.map((s) => s.customerId!);
 
-  const candidates = await candidatesOf(match.clubId, match.club.timezone, now);
+  const candidates = await candidatesOf(match.clubId, match.club.timezone, now, true, true);
   const ranked = rankCandidates(candidates, ctx, limit);
   if (!ranked.length || !planFeatures(match.club.plan).telegram) return ranked;
 

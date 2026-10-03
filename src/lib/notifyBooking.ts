@@ -1,3 +1,4 @@
+import { withSendSummary } from './telegramSafety';
 import { DateTime } from 'luxon';
 import { telegramHtml as html } from './telegramHtml';
 
@@ -248,7 +249,8 @@ export async function notifySeriesCancelled(params: {
  * особисто, тренер особисто), і розводити їх по двох майже однакових
  * копіях означало б правити обидві при кожній зміні правил.
  */
-async function deliver(params: {
+const deliver = (params: Parameters<typeof deliverInner>[0]) => withSendSummary('notify-booking', () => deliverInner(params));
+async function deliverInner(params: {
   clubId: string;
   clubChatId: string | null;
   trainerId: string | null;

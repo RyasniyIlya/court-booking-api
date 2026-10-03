@@ -18,6 +18,7 @@ import { startDigestScheduler } from './lib/digestScheduler';
 import { startReminderScheduler } from './lib/remind';
 import { startPlayerScheduler } from './lib/playerRemind';
 import { startWinbackScheduler } from './lib/winback';
+import { startRetentionScheduler } from './lib/dataRetention';
 import { handleUpdate } from './lib/botHandlers';
 import { processTelegramUpdate } from './lib/telegramReceipt';
 import { paymentsSecretReady } from './lib/crypto';
@@ -209,5 +210,9 @@ app.listen(port, () => {
     // Повернення тих, хто давно не грав: раз на годину, вдень за часом клубу,
     // тільки за згодою гравця й лише там, де клуб це ввімкнув.
     startWinbackScheduler();
+
+    // Видалення даних клубів через 90 днів після розірвання (оферта п. 13.1).
+    // Вимкнено без DATA_RETENTION_ENABLED=true; без DATA_RETENTION_DRY_RUN=false нічого не видаляє.
+    startRetentionScheduler();
   }
 });

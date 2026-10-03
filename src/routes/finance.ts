@@ -4,6 +4,7 @@ import { DateTime } from 'luxon';
 import { prisma } from '../lib/db';
 import { requireAuth, requireRole, requireFeature } from './admin';
 import { recordChanges } from '../lib/changeLog';
+import { courtValueOf, loadPassSessionValues } from '../lib/serviceValue';
 import { buildWorkbook, XLSX_CONTENT_TYPE } from '../lib/xlsx';
 import {
   cashbookFileName,
@@ -18,7 +19,8 @@ import {
   type DebtInput,
 } from '../lib/cashbook';
 import { estimateTax, regimeLimitUsage, TAX_REGIMES, vatApplicable, type TaxRegime } from '../lib/taxRegime';
-import { breakEven, monthlyPnl, trainerPayouts } from '../lib/financeReports';
+import { breakEven, trainerPayouts } from '../lib/financeReports';
+import { accrualRevenueByMonth, basisPnl, loadAccrualBookings } from '../lib/pnlBasis';
 import { loadLiabilityPasses } from '../lib/financeData';
 
 /**
@@ -34,7 +36,8 @@ import { loadLiabilityPasses } from '../lib/financeData';
  */
 export const financeRouter = Router();
 
-financeRouter.use(requireAuth, requireRole('OWNER', 'ADMIN', 'ACCOUNTANT'), requireFeature('analytics'));
+/* Рішення власника 2026-09-28: модератор зміни фінансів не бачить (його каса — /shift і /ledger). */
+financeRouter.use(requireAuth, requireRole('OWNER', 'ACCOUNTANT'), requireFeature('analytics'));
 
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 const MAX_DAYS = 366;
@@ -63,7 +66,7 @@ const bookingBrief = {
 } as const;
 
 /** Усі рядки каси за проміжок: журнал + онлайн + абонементи. */
-async function loadCashRows(clubId: string, from: Date, to: Date, tz: string): Promise<CashRow[]> {
+export async function loadCashRows(clubId: string, from: Date, to: Date, tz: string): Promise<CashRow[]> {
   const [ledger, payments, passes] = await Promise.all([
     prisma.bookingLedgerEntry.findMany({
       where: { clubId, createdAt: { gte: from, lte: to } },
@@ -260,8 +263,8 @@ const taxRegimeBody = z.object({
  *
  * Доступ — ВЛАСНИК і БУХГАЛТЕР, не модератор: режим визначає бухгалтер
  * клубу, а не той, хто веде зміну. Тому окремий вартовий тут, вужчий за
- * router-рівневий requireRole('OWNER','ADMIN','ACCOUNTANT') вище —
- * модератор до цього ендпоінта не проходить, хоч решту каси й бачить.
+ * router-рівневий requireRole('OWNER','ACCOUNTANT') вище —
+ * зараз вони збігаються, вартовий лишено як другий замок.
  *
  * ChangeLog тут навмисно не пишеться: клубні налаштування (routes/admin/
  * club.ts, PATCH /club) його теж не пишуть — це не окрема поведінка для
@@ -455,6 +458,8 @@ financeRouter.get('/trainers', async (req, res) => {
 
 const pnlQuery = z.object({
   month: z.string().regex(/^\d{4}-\d{2}$/).optional(),
+  /** accrual («надано послуг», за замовчуванням) | cash («каса»). */
+  basis: z.enum(['accrual', 'cash']).default('accrual'),
 });
 
 const hoursOf = (b: { startTime: Date; endTime: Date }) =>
@@ -463,8 +468,10 @@ const hoursOf = (b: { startTime: Date; endTime: Date }) =>
 /**
  * GET /api/admin/finance/pnl?month=YYYY-MM
  *
- * Дванадцять місяців до вказаного: каса, витрати, прибуток. І точка
- * беззбитковості вказаного місяця в годинах корту.
+ * Дванадцять місяців до вказаного: виручка, витрати, прибуток на обраній базі
+ * (`basis=accrual|cash`, за замовчуванням accrual) і альтернативна база поруч.
+ * Те саме число віддає GET /analytics/expenses. Плюс точка беззбитковості
+ * вказаного місяця в годинах корту.
  */
 financeRouter.get('/pnl', async (req, res) => {
   const parsed = pnlQuery.safeParse(req.query);
@@ -491,7 +498,7 @@ financeRouter.get('/pnl', async (req, res) => {
   const anchor = monthEnd < now ? monthEnd : now;
   const from90 = new Date(anchor.getTime() - 90 * 86_400_000);
 
-  const [rows, expenses, recent, inMonth] = await Promise.all([
+  const [rows, expenses, recent, inMonth, accrual] = await Promise.all([
     loadCashRows(clubId, from, monthEnd, tz),
     prisma.clubExpense.findMany({
       where: { clubId, month: { gte: new Date(`${months[0]}-01T00:00:00Z`), lte: new Date(`${months.at(-1)}-01T00:00:00Z`) } },
@@ -499,23 +506,48 @@ financeRouter.get('/pnl', async (req, res) => {
     }),
     prisma.booking.findMany({
       where: { clubId, status: 'CONFIRMED', capacity: null, priceTotal: { gt: 0 }, startTime: { gte: from90, lt: anchor } },
-      select: { startTime: true, endTime: true, priceTotal: true },
+      select: {
+        id: true, startTime: true, endTime: true, priceTotal: true,
+        rentalTotal: true, trainerPrice: true, capacity: true, customer: { select: { discountPercent: true } },
+      },
     }),
     prisma.booking.findMany({
       where: { clubId, status: 'CONFIRMED', startTime: { gte: last.toJSDate(), lte: monthEnd } },
       select: { startTime: true, endTime: true },
     }),
+    loadAccrualBookings(prisma, clubId, from, monthEnd),
   ]);
 
-  const pnl = monthlyPnl(rows, expenses, months, tz);
+  const basis = parsed.data.basis;
+  const pnl = basisPnl({
+    basis, months, tz, cashRows: rows, expenses,
+    accrualByMonth: accrualRevenueByMonth(accrual.bookings, accrual.passValues, months, tz),
+  });
   const current = pnl.at(-1)!;
+  /* Виручка корту (accrual) для беззбитковості: без тренера/прокату, абонемент за вартістю заняття. */
+  const recentPass = await loadPassSessionValues(prisma, recent.map((b) => b.id));
 
+  const sum = (f: (m: (typeof pnl)[number]) => number) => pnl.reduce((s, m) => s + f(m), 0);
   res.json({
+    pnl: { basis, revenue: current.revenue, expenses: current.expenses, profit: current.profit, alt: current.alt },
+    basis,
+    month: current.month,
+    revenue: current.revenue,
+    expenses: current.expenses,
+    profit: current.profit,
+    alt: current.alt,
     months: pnl,
     total: {
-      income: pnl.reduce((s, m) => s + m.income, 0),
-      expenses: pnl.reduce((s, m) => s + m.expenses, 0),
-      profit: pnl.reduce((s, m) => s + m.profit, 0),
+      basis,
+      income: sum((m) => m.revenue),
+      revenue: sum((m) => m.revenue),
+      expenses: sum((m) => m.expenses),
+      profit: sum((m) => m.profit),
+      alt: {
+        basis: current.alt.basis,
+        revenue: sum((m) => m.alt.revenue),
+        profit: sum((m) => m.alt.profit),
+      },
     },
     breakEven: {
       month: current.month,
@@ -523,7 +555,8 @@ financeRouter.get('/pnl', async (req, res) => {
         monthExpenses: current.expenses,
         fallbackExpenses: pnl.slice(-4, -1).map((m) => m.expenses),
         soldHours90: recent.reduce((s, b) => s + hoursOf(b), 0),
-        revenue90: recent.reduce((s, b) => s + b.priceTotal, 0),
+        revenue90: recent.reduce(
+          (s, b) => s + courtValueOf({ ...b, discountPercent: b.customer?.discountPercent }, recentPass.get(b.id)), 0),
         soldHoursMonth: inMonth.reduce((s, b) => s + hoursOf(b), 0),
       }),
     },

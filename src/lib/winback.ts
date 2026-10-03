@@ -1,3 +1,4 @@
+import { withSendSummary } from './telegramSafety';
 import { DateTime } from 'luxon';
 
 import { prisma } from './db';
@@ -204,7 +205,8 @@ export async function countWinbackEligible(clubId: string, now: Date = new Date(
  * Один прохід: по кожному клубу з увімкненим поверненням — не більше
  * MAX_PER_TICK листів. Повертає, скільки доставлено.
  */
-export async function runWinbackTick(now: Date = new Date()): Promise<number> {
+export const runWinbackTick = (now?: Date) => withSendSummary('winback', () => runWinbackTickInner(now));
+async function runWinbackTickInner(now: Date = new Date()): Promise<number> {
   const clubs = await prisma.club.findMany({
     where: { isActive: true, approvedAt: { not: null } },
     select: { id: true, name: true, slug: true, timezone: true, botSettings: true, plan: true },

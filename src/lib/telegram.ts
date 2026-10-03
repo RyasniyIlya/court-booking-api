@@ -6,6 +6,8 @@
  * модель сцен і станів, під яку довелось би підганяти наші ролі й клуби.
  */
 
+import { chatHash, countSend, currentTemplate, verdictFor } from './telegramSafety';
+
 const API = 'https://api.telegram.org';
 
 export const botToken = () => process.env.TELEGRAM_BOT_TOKEN ?? '';
@@ -26,9 +28,43 @@ export class TelegramDeliveryError extends Error {
   constructor(public readonly retryable: boolean) { super('Telegram delivery failed'); }
 }
 
+/** Методи, що доходять до людини або чату: їх стосується TELEGRAM_SEND_MODE. */
+const GATED = new Set(['sendMessage', 'editMessageText', 'deleteMessage', 'answerCallbackQuery', 'setMyCommands']);
+/** З них у підсумок sent/skipped/failed іде лише те, що бачить людина. */
+const COUNTED = new Set(['sendMessage', 'editMessageText']);
+
 async function call<T>(method: string, body: unknown, strict = false): Promise<T | null> {
+  if (GATED.has(method)) {
+    const b = body as { chat_id?: string | number; scope?: { chat_id?: string | number } };
+    const chatId = b.chat_id ?? b.scope?.chat_id;
+    const verdict = verdictFor(chatId);
+    if (verdict !== 'send') {
+      if (COUNTED.has(method)) countSend('skipped');
+      if (verdict === 'skip-dry') {
+        /* Лише відбиток чату й назва шаблону — без тексту (там імена й телефони). */
+        console.log(`[telegram] dry ${method} chat=${chatId === undefined ? '-' : chatHash(chatId)} template=${currentTemplate(method)}`);
+      }
+      /* null → sendReminderMessage віддасть 'retry': мітки «нагадано» в базі не
+         ставляться, тож після переходу на live ці люди своє нагадування отримають. */
+      return null;
+    }
+  }
+
   const token = botToken();
   if (!token) return null;
+
+  const counted = COUNTED.has(method);
+  try {
+    const out = await callLive<T>(method, body, strict, token);
+    if (counted) countSend(out === null ? 'failed' : 'sent');
+    return out;
+  } catch (e) {
+    if (counted) countSend('failed');
+    throw e;
+  }
+}
+
+async function callLive<T>(method: string, body: unknown, strict: boolean, token: string): Promise<T | null> {
 
   let r: Response;
 

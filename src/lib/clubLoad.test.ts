@@ -7,6 +7,7 @@ vi.mock('./db', () => ({
     court: { findMany: vi.fn() },
     block: { findMany: vi.fn() },
     booking: { findMany: vi.fn() },
+    passUsage: { findMany: vi.fn(async () => []) },
   },
 }));
 
@@ -59,6 +60,20 @@ describe('loadClubLoadProfile', () => {
       expect(out.profile.totals.bookings).toBe(LOAD_MIN_BOOKINGS);
       expect(out.window.weeks).toBe(8);
     }
+  });
+
+  it('регресія Ф-3: виручка корту без тренера (Наталка 50 000 + 30 000 тренер) і абонемент 320 000/8', async () => {
+    arrange({ bookings: LOAD_MIN_BOOKINGS });
+    const rows = (await prisma.booking.findMany({} as any)) as any[];
+    rows[0] = { ...rows[0], id: 'natalka', priceTotal: 80_000, trainerPrice: 30_000, rentalTotal: 0 };
+    rows[1] = { ...rows[1], id: 'nastya', priceTotal: 50_000 };
+    for (let i = 2; i < rows.length; i++) rows[i] = { ...rows[i], id: `b${i}`, priceTotal: 0 };
+    vi.mocked(prisma.booking.findMany).mockResolvedValue(rows as any);
+    vi.mocked(prisma.passUsage.findMany).mockResolvedValue([
+      { bookingId: 'nastya', pass: { type: 'PACKAGE', price: 320_000, totalSessions: 8 } },
+    ] as any);
+    const out = await loadClubLoadProfile('c', 8, NOW);
+    expect(out?.available && out.profile.totals.revenue).toBe(50_000 + 40_000);
   });
 
   it('вікно не заходить за дату створення клубу', async () => {

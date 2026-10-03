@@ -10,7 +10,7 @@ vi.mock('./sections', () => ({ revenueBreakdown: vi.fn(), revenueText: vi.fn(), 
 const { handleUpdate } = await import('./botHandlers');
 const update = (type = 'private') => ({ update_id: 1, message: { message_id: 1, from: { id: 123 }, chat: { id: 123, type }, text: '/analytics yesterday' } });
 beforeEach(() => { vi.clearAllMocks(); mocks.report.mockResolvedValue(['page 1', 'page 2']); });
-it.each(['TRAINER', 'unknown'])('denies role %s before loading analytics', async role => {
+it.each(['TRAINER', 'ADMIN', 'unknown'])('denies role %s before loading analytics', async role => {
   mocks.findUnique.mockResolvedValue({ role, club: { id: 'club', plan: { tier: 3 } } });
   await handleUpdate(update());
   expect(mocks.report).not.toHaveBeenCalled();
@@ -25,7 +25,7 @@ it('denies group chats even for an owner', async () => {
   await handleUpdate(update('group'));
   expect(mocks.report).not.toHaveBeenCalled();
 });
-it.each(['OWNER', 'ADMIN'])('sends all pages for %s using the linked club only', async role => {
+it.each(['OWNER'])('sends all pages for %s using the linked club only', async role => {
   mocks.findUnique.mockResolvedValue({ role, club: { id: 'club', plan: { tier: 3 } } });
   await handleUpdate(update());
   expect(mocks.report).toHaveBeenCalledWith('club', 'yesterday');

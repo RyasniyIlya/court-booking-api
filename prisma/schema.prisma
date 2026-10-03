@@ -85,6 +85,22 @@ model Club {
   /// Цілі й пороги екрана аналітики: { occupancy, cancellation, retention }, %.
   /// null = дефолти веб-клієнта. Форма — lib/analyticsThresholds.ts.
   analyticsThresholds Json?
+
+  // ── Юридичні дані й оферта (docs/legal) ──────────────────────────────
+  /// Коли власник прийняв оферту й умови обробки ПД, і яку версію (lib/legal.ts).
+  offerAcceptedAt DateTime?
+  offerVersion    String?
+  /// Реквізити виконавця для Правил клубу: юрназва/ПІБ ФОП, ЄДРПОУ/РНОКПП, адреса, email.
+  legalName       String?
+  legalCode       String?
+  legalAddress    String?
+  email           String?
+  /// Скільки % вартості утримує клуб при пізньому скасуванні (0-50).
+  lateCancelFeePercent Int @default(50)
+  /// За скільки днів повертаються кошти.
+  refundDays      Int @default(7)
+  /// Додаткові правила клубу (вільний текст).
+  extraRules      String?
   /// Налаштування клубу в спільному Telegram-боті: привітання, що показувати,
   /// повернення тих, хто давно не грав. Форма — lib/clubBot.ts (BotSettings);
   /// читати тільки через normalizeBotSettings: у базі може лежати що завгодно.
@@ -170,6 +186,14 @@ model Club {
 
   isActive    Boolean   @default(true)
   trialEndsAt DateTime?
+
+  /// Коли оператор зафіксував РОЗІРВАННЯ договору (оферта, розділ 12). null —
+  /// договір діє. Від цієї дати йдуть 90 днів на вивантаження даних, після
+  /// чого lib/dataRetention.ts видаляє дані клубу (оферта, п. 13.1).
+  terminatedAt DateTime?
+  /// Коли дані клубу видалено за п. 13.1. Рядок Club і ClubInvoice лишаються
+  /// (рахунки зберігаються 1095 днів); особисті й ділові поля знеособлено.
+  dataPurgedAt DateTime?
 
   /// Чи веде клуб абонементи взагалі.
   ///
@@ -1227,6 +1251,12 @@ enum PassType {
 model Customer {
   bonusBalance    Int                  @default(0)
   birthDate       DateTime?            @db.Date
+  /// Згода з Правилами клубу й Політикою (lib/legal.ts), версія документів.
+  termsAcceptedAt    DateTime?
+  termsVersion       String?
+  privacyNoticeAt    DateTime?
+  /// Окрема згода на маркетинг і запрошення; null = згоди немає.
+  marketingConsentAt DateTime?
   discountPercent Int                  @default(0)
   ledgerEntries   BookingLedgerEntry[]
   rewards         CustomerReward[]

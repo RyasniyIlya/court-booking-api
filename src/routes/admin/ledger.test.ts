@@ -170,3 +170,32 @@ describe('GET /ledger?format=csv', () => {
     expect((await get(`${PERIOD}&format=csv`)).status).toBe(413);
   });
 });
+
+describe('ADMIN бачить лише власні операції', () => {
+  const firstWhere = () => (prisma.bookingLedgerEntry.findMany.mock.calls[0][0] as { where: Record<string, unknown> }).where;
+
+  it('клієнтський ?actor ігнорується: where.actorEmail — пошта акаунта', async () => {
+    await get(`${PERIOD}&actor=ira@club.ua`);
+    expect(firstWhere().actorEmail).toBe('olya@club.ua');
+  });
+
+  it('варіанти фільтрів теж лише по власних операціях', async () => {
+    await get(PERIOD);
+    const facetWhere = (prisma.bookingLedgerEntry.groupBy.mock.calls[0][0] as { where: Record<string, unknown> }).where;
+    expect(facetWhere.actorEmail).toBe('olya@club.ua');
+  });
+
+  it('CSV модератора теж звужений', async () => {
+    await get(`${PERIOD}&format=csv&actor=ira@club.ua`);
+    expect(firstWhere().actorEmail).toBe('olya@club.ua');
+  });
+
+  it('OWNER: ?actor працює як раніше, без примусового звуження', async () => {
+    auth.role = 'OWNER';
+    await get(`${PERIOD}&actor=ira@club.ua`);
+    expect(firstWhere().actorEmail).toBe('ira@club.ua');
+    vi.clearAllMocks();
+    await get(PERIOD);
+    expect(firstWhere().actorEmail).toBeUndefined();
+  });
+});

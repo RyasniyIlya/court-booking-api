@@ -1,3 +1,4 @@
+import { withSendSummary } from './telegramSafety';
 import { DateTime } from 'luxon';
 
 import { prisma } from './db';
@@ -174,7 +175,8 @@ type Entry = {
   club: Club & { plan: Parameters<typeof planFeatures>[0] };
 };
 
-export async function runWaitlistTick(now: Date = new Date()): Promise<number> {
+export const runWaitlistTick = (now?: Date) => withSendSummary('waitlist', () => runWaitlistTickInner(now));
+async function runWaitlistTickInner(now: Date = new Date()): Promise<number> {
   /* Минуле більше нікому не потрібне. */
   await prisma.waitlistEntry.updateMany({
     where: { status: { in: [...ACTIVE] }, startTime: { lte: now } },

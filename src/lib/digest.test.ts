@@ -96,6 +96,14 @@ describe('digestText — що бачить власник', () => {
     expect(t).not.toContain('💰');
   });
 
+  it('Ф-3: виручка підписана «Виручка корту (без тренера й прокату)», тренер і прокат окремим рядком', () => {
+    const t = digestText('Squash Arena', { ...base, revenue: 50_000, extras: 30_000 }, 'Europe/Kyiv');
+    expect(t).toContain('Виручка корту (без тренера й прокату):');
+    expect(t).toContain(`Тренер і прокат: ${hrn(30_000)}`);
+    expect(t).toContain(`Надано послуг (всього) ${hrn(80_000)}`);
+    expect(digestText('Squash Arena', base, 'Europe/Kyiv')).not.toContain('Тренер і прокат');
+  });
+
   it('без кортів рядок про найзавантаженіший просто зникає', () => {
     const t = digestText('Squash Arena', { ...base, topCourt: null }, 'Europe/Kyiv');
     expect(t).not.toContain('🏟');

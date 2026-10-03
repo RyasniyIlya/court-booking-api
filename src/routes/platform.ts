@@ -1129,6 +1129,48 @@ platformRouter.post('/groups/:id/subscription', requirePlatformAuth, async (req,
 });
 
 /**
+ * POST /api/platform/clubs/:id/terminate  { terminated: boolean }
+ *
+ * Зафіксувати розірвання договору (оферта, розділ 12): ставить
+ * Club.terminatedAt = зараз і вимикає клуб. Від цієї дати йдуть 90 днів на
+ * вивантаження, після чого lib/dataRetention.ts (якщо ввімкнено) видаляє дані.
+ * terminated:false знімає позначку (клуб передумав), доки дані не видалено.
+ */
+platformRouter.post('/clubs/:id/terminate', requirePlatformAuth, async (req, res) => {
+  const parsed = z.object({ terminated: z.boolean() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+
+  const club = await prisma.club.findUnique({
+    where: { id },
+    select: { terminatedAt: true, dataPurgedAt: true },
+  });
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+  if (club.dataPurgedAt) return res.status(409).json({ error: 'ALREADY_PURGED' });
+
+  const { terminated } = parsed.data;
+  if (Boolean(club.terminatedAt) === terminated) return res.json({ terminatedAt: club.terminatedAt });
+
+  const terminatedAt = terminated ? new Date() : null;
+  await prisma.$transaction(async (tx) => {
+    await tx.club.update({
+      where: { id },
+      data: terminated ? { terminatedAt, isActive: false } : { terminatedAt: null },
+    });
+    await tx.crmActivity.create(
+      systemNote(
+        id,
+        terminated
+          ? 'Договір розірвано: дані клубу буде видалено через 90 днів (п. 13.1 оферти)'
+          : 'Розірвання скасовано: видалення даних не планується',
+        req.platformAuth?.email,
+      ),
+    );
+  });
+  res.json({ terminatedAt });
+});
+
+/**
  * GET /api/platform/clubs/:id/invoices
  *
  * Історія оплат клубу — те, що оператор читає під час дзвінка «а коли я

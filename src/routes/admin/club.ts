@@ -11,9 +11,30 @@ import { wayForPayKeys } from '../../lib/payments/wayforpay';
 import { stripeKeys } from '../../lib/payments/stripe';
 import { BACKDROP_STYLES } from '../../lib/backdrop';
 import { Prisma } from '@prisma/client';
+import { LEGAL_VERSION } from '../../lib/legal';
 import { analyticsThresholdsSchema, readAnalyticsThresholds } from '../../lib/analyticsThresholds';
 
 export const clubRouter = Router();
+
+/** Юридичні поля клубу для кабінету (GET і відповідь PATCH). */
+function legalFields(club: {
+  offerAcceptedAt: Date | null; offerVersion: string | null; legalName: string | null;
+  legalCode: string | null; legalAddress: string | null; email: string | null;
+  lateCancelFeePercent: number; refundDays: number; extraRules: string | null;
+}) {
+  return {
+    offerAcceptedAt: club.offerAcceptedAt,
+    offerVersion: club.offerVersion,
+    legalVersion: LEGAL_VERSION,
+    legalName: club.legalName,
+    legalCode: club.legalCode,
+    legalAddress: club.legalAddress,
+    email: club.email,
+    lateCancelFeePercent: club.lateCancelFeePercent,
+    refundDays: club.refundDays,
+    extraRules: club.extraRules,
+  };
+}
 
 /* CLUB                                                                       */
 /* -------------------------------------------------------------------------- */
@@ -115,6 +136,8 @@ clubRouter.get(
       /* Цілі аналітики: бачить увесь персонал, міняє лише власник. */
       analyticsThresholds:
         readAnalyticsThresholds(club.analyticsThresholds),
+
+      ...legalFields(club),
     });
   },
 );
@@ -276,6 +299,15 @@ clubRouter.patch(
             .max(600)
             .nullable()
             .optional(),
+
+        /* Юридичні реквізити для Правил клубу (docs/legal). */
+        legalName: z.string().trim().max(200).nullable().optional(),
+        legalCode: z.string().trim().max(20).nullable().optional(),
+        legalAddress: z.string().trim().max(300).nullable().optional(),
+        email: z.string().trim().toLowerCase().email().max(254).nullable().optional(),
+        lateCancelFeePercent: z.number().int().min(0).max(50).optional(),
+        refundDays: z.number().int().min(1).max(60).optional(),
+        extraRules: z.string().trim().max(3000).nullable().optional(),
 
         /* null скидає до дефолтів веб-клієнта. */
         analyticsThresholds:
@@ -489,7 +521,26 @@ clubRouter.patch(
         `${publicBase()}/api/pay/webhook/${club.id}`,
       analyticsThresholds:
         readAnalyticsThresholds(club.analyticsThresholds),
+      ...legalFields(club),
     });
+  },
+);
+
+/**
+ * POST /api/admin/club/accept-offer — власник приймає оферту й умови
+ * обробки ПД. Фіксуємо дату й версію документів (lib/legal.ts).
+ */
+clubRouter.post(
+  '/club/accept-offer',
+  requireAuth,
+  requireRole('OWNER'),
+  async (req, res) => {
+    const club = await prisma.club.update({
+      where: { id: req.auth!.clubId },
+      data: { offerAcceptedAt: new Date(), offerVersion: LEGAL_VERSION },
+      select: { offerAcceptedAt: true, offerVersion: true },
+    });
+    res.json({ offerAcceptedAt: club.offerAcceptedAt, offerVersion: club.offerVersion, legalVersion: LEGAL_VERSION });
   },
 );
 

@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "dev:safe": "node scripts/dev-local.mjs",
+    "dev:isolated": "tsx scripts/dev-isolated.mjs",
     "build": "tsc",
     "start": "node dist/index.js",
     "db:migrate": "prisma migrate dev",
@@ -18,7 +19,8 @@
     "test": "vitest run --pool=threads",
     "test:watch": "vitest",
     "security:preflight": "tsx scripts/security-preflight.ts",
-    "test:security:live": "tsx scripts/security-live-check.ts"
+    "test:security:live": "tsx scripts/security-live-check.ts",
+    "test:payments:live": "tsx scripts/payment-live-check.ts"
   },
   "keywords": [],
   "author": "",
@@ -43,6 +45,8 @@
     "qs": "6.16.0"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "^0.5.8",
+    "@electric-sql/pglite-socket": "^0.2.11",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",

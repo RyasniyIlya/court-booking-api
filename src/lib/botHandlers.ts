@@ -34,7 +34,7 @@ import {
   settingsText,
 } from './botSettings';
 import { clubChoiceKeyboard, slugFromStartPayload } from './botBooking';
-import { codeFromStartPayload, handlePlayerCallback, handlePlayerCommand } from './playerBot';
+import { codeFromStartPayload, handlePlayerCallback, handlePlayerCommand, sendPrivacyNoticeOnce } from './playerBot';
 import {
   handlePlayerLoginMessage,
   loginSlugFromStartPayload,
@@ -427,7 +427,8 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
     return;
   }
 
-  if (me.role === 'TRAINER') {
+  /* Модератор грошових зведень не бачить (рішення власника 2026-09-28). */
+  if (me.role === 'TRAINER' || me.role === 'ADMIN') {
     await answerCallback(q.id, 'Ця команда доступна власнику клубу');
     return;
   }
@@ -549,6 +550,11 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
     return;
   }
 
+  /* Перший /start гравця: один рядок із посиланням на Політику. */
+  if (cmd === '/start' && msg.chat.type === 'private') {
+    await sendPrivacyNoticeOnce(chatId).catch((e) => console.warn('[bot] privacy notice', (e as Error).message));
+  }
+
   /* Гравець: /start p_<код> з профілю у віджеті. Раніше за /start із кодом
      персоналу — інакше код гравця пішов би шукатись серед кодів кабінету й
      повернувся б «Такого коду немає». Сам код чат не привʼязує: далі бот
@@ -654,8 +660,8 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
   const menu = menuFor(me.role);
 
   if (cmd === '/analytics') {
-    if (msg.chat.type !== 'private' || !['OWNER', 'ADMIN'].includes(me.role)) {
-      await sendMessage(chatId, 'Аналітика доступна власнику та модератору лише в особистому чаті з ботом.');
+    if (msg.chat.type !== 'private' || me.role !== 'OWNER') {
+      await sendMessage(chatId, 'Аналітика доступна власнику лише в особистому чаті з ботом.');
       return;
     }
     const messages = await botAnalytics(me.club.id, args.join(' '));
@@ -705,6 +711,13 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
       return;
     }
 
+    if (me.role === 'ADMIN') {
+      await sendMessage(chatId, `Ця команда доступна власнику клубу.
+
+${menu}`, keyboard);
+      return;
+    }
+
     const m = await dayMessage(me.club, 0);
     await sendMessage(chatId, m.text, m.markup);
     return;
@@ -714,7 +727,7 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
      кабінеті теж закриті від ролі TRAINER, і бот не має бути обхідним
      шляхом до того, чого людина не бачить на екрані. */
   if (cmd === '/yesterday' || cmd === '/week' || cmd === '/staff' || cmd === '/revenue') {
-    if (me.role === 'TRAINER') {
+    if (me.role === 'TRAINER' || me.role === 'ADMIN') {
       await sendMessage(chatId, `Ця команда доступна власнику клубу.\n\n${menu}`, keyboard);
       return;
     }

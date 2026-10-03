@@ -1,10 +1,13 @@
-import { Router, type Request, type Response } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { DateTime } from 'luxon';
 import { prisma } from '../lib/db';
 import { requireAuth, requireRole, requireFeature } from './admin';
 import { buildLoadProfile } from '../lib/loadProfile';
+import { courtValueOf, loadPassSessionValues } from '../lib/serviceValue';
 import { loadClubLoadProfile } from '../lib/clubLoad';
+import { accrualTotal, cashNet, loadAccrualBookings, otherBasis, type Basis } from '../lib/pnlBasis';
+import { loadCashRows } from './finance';
 import { bookingFunnel, retentionFromVisits, roundPct, type FunnelBooking } from '../lib/deepAnalytics';
 import { dateOnly, daysUntilBirthday } from '../lib/birthday';
 import { recordChanges } from '../lib/changeLog';
@@ -51,7 +54,22 @@ export const analyticsRouter = Router();
  * першому рівні не зміг би прийняти бронь від постійного гравця — це вже
  * не «недоплатив за аналітику», а зламаний основний сценарій.
  */
-analyticsRouter.use(requireAuth, requireRole('OWNER', 'ADMIN'), requireFeature('analytics'));
+/*
+ * Рішення власника 2026-09-28: модератор зміни бачить лише свою касу, без
+ * прибутку, витрат, виплат тренерам і аналітики. Тому для ADMIN відкрито
+ * ТІЛЬКИ картку клієнта (список і історія візитів) — це робота ресепшена,
+ * а не звіт. Решта — default-deny: новий ендпоінт аналітики закритий для
+ * модератора, поки його явно не додано в цей список.
+ */
+const ADMIN_ALLOWED = [/^\/customers\/?$/, /^\/customers\/[^/]+\/visits\/?$/];
+function denyAdminExceptCustomerCards(req: Request, res: Response, next: NextFunction) {
+  if (req.auth?.role === 'ADMIN' && !ADMIN_ALLOWED.some((re) => re.test(req.path))) {
+    return res.status(403).json({ error: 'FORBIDDEN' });
+  }
+  next();
+}
+
+analyticsRouter.use(requireAuth, requireRole('OWNER', 'ADMIN'), denyAdminExceptCustomerCards, requireFeature('analytics'));
 
 const DATE_ONLY = /^\d{4}-\d{2}-\d{2}$/;
 
@@ -176,10 +194,16 @@ export async function periodStats(clubId: string, start: Date, end: Date) {
       status: 'CONFIRMED',
       startTime: { gte: start, lte: end },
     },
-    select: { priceTotal: true },
+    select: {
+      id: true, priceTotal: true, rentalTotal: true, trainerPrice: true, capacity: true,
+      customer: { select: { discountPercent: true } },
+    },
   });
 
-  const revenue = bookings.reduce((s, b) => s + b.priceTotal, 0);
+  /* Виручка корту (нарахування): без тренера/прокату, абонемент за вартістю заняття. */
+  const passValues = await loadPassSessionValues(prisma, bookings.map((b) => b.id));
+  const revenue = bookings.reduce(
+    (s, b) => s + courtValueOf({ ...b, discountPercent: b.customer?.discountPercent }, passValues.get(b.id)), 0);
   /* Різні клієнти — і власники броней, і учасники місць групових занять. */
   const uniqueCustomers = tallyVisits(await loadPeriodVisits(clubId, start, end)).size;
 
@@ -532,7 +556,10 @@ analyticsRouter.get('/deep', async (req, res) => {
       where: {
         clubId, status: 'CONFIRMED', startTime: { lt: loadTo }, endTime: { gt: loadFrom },
       },
-      select: { courtId: true, startTime: true, endTime: true, priceTotal: true },
+      select: {
+        id: true, courtId: true, startTime: true, endTime: true, priceTotal: true,
+        rentalTotal: true, trainerPrice: true, capacity: true, customer: { select: { discountPercent: true } },
+      },
     }),
     prisma.booking.findMany({
       where: { clubId, startTime: { gte: operationalFrom, lte: operationalTo } },
@@ -562,8 +589,14 @@ analyticsRouter.get('/deep', async (req, res) => {
     }),
   ]);
 
+  /* Виручка корту: без тренера/прокату, заняття з абонемента — за pass.price/totalSessions. */
+  const loadPassValues = await loadPassSessionValues(prisma, loadBookings.map((b) => b.id));
+  const valuedLoadBookings = loadBookings.map((b) => ({
+    courtId: b.courtId, startTime: b.startTime, endTime: b.endTime, priceTotal: b.priceTotal,
+    courtValue: courtValueOf({ ...b, discountPercent: b.customer?.discountPercent }, loadPassValues.get(b.id)),
+  }));
   const profileInput = {
-    from: loadFrom, to: loadTo, timezone: club.timezone, hours: club.hours, blocks, bookings: loadBookings,
+    from: loadFrom, to: loadTo, timezone: club.timezone, hours: club.hours, blocks, bookings: valuedLoadBookings,
   };
   const load = buildLoadProfile({ ...profileInput, courts });
   const courtPerformance = courts.map((court) => {
@@ -670,7 +703,45 @@ const monthQuery = z.object({
 const expensesQuery = monthQuery.extend({
   from: z.string().regex(DATE_ONLY).optional(),
   to: z.string().regex(DATE_ONLY).optional(),
+  /** accrual («надано послуг», за замовчуванням) | cash («каса») — те саме, що GET /finance/pnl. */
+  basis: z.enum(['accrual', 'cash']).default('accrual'),
 });
+
+/**
+ * Виручка періоду на обох базах (одне визначення з /finance/pnl, lib/pnlBasis.ts):
+ * accrual — послуги за датою початку (корт + тренер + прокат, абонемент за
+ * вартістю заняття); cash — рух грошей за датою (ledger, онлайн, абонементи).
+ */
+async function revenueBothBases(clubId: string, start: Date, end: Date, tz: string) {
+  const [acc, cashRows] = await Promise.all([
+    loadAccrualBookings(prisma, clubId, start, end),
+    loadCashRows(clubId, start, end, tz),
+  ]);
+  return { accrual: accrualTotal(acc.bookings, acc.passValues), cash: cashNet(cashRows) };
+}
+
+function basisBlock(basis: Basis, totalExpenses: number, rev: { accrual: number; cash: number }) {
+  const revenue = rev[basis];
+  const other = otherBasis(basis);
+  const pnl = {
+    basis,
+    revenue,
+    expenses: totalExpenses,
+    profit: revenue - totalExpenses,
+    alt: { basis: other, revenue: rev[other], profit: rev[other] - totalExpenses },
+  };
+  /* Єдиний блок `pnl` має ту саму форму в /finance/pnl. Верхній рівень лишає
+     старі імена: `expenses` тут — РЯДКИ витрат (як і було), тому сума — у
+     totalExpenses, а netProfit тепер дорівнює profit обраної бази. */
+  return {
+    pnl,
+    basis,
+    revenue,
+    profit: pnl.profit,
+    netProfit: pnl.profit,
+    alt: pnl.alt,
+  };
+}
 
 /** 'YYYY-MM' (або порожньо — тоді поточний місяць у таймзоні клуба) -> межі місяця. */
 function monthBounds(monthStr: string | undefined, tz: string) {
@@ -728,7 +799,7 @@ analyticsRouter.get('/expenses', async (req, res) => {
         where: { clubId, month: { in: months } },
         orderBy: [{ month: 'asc' }, { createdAt: 'asc' }],
       }),
-      periodStats(clubId, start.toJSDate(), end.toJSDate()),
+      revenueBothBases(clubId, start.toJSDate(), end.toJSDate(), tz),
     ]);
 
     const totalExpenses = expenses.reduce((s, e) => s + e.amount, 0);
@@ -744,8 +815,7 @@ analyticsRouter.get('/expenses', async (req, res) => {
         && end.hasSame(end.endOf('month'), 'day'),
       expenses,
       totalExpenses,
-      revenue: stats.revenue,
-      netProfit: stats.revenue - totalExpenses,
+      ...basisBlock(parsed.data.basis, totalExpenses, stats),
     });
     return;
   }
@@ -757,7 +827,7 @@ analyticsRouter.get('/expenses', async (req, res) => {
       where: { clubId, month: monthDate },
       orderBy: { createdAt: 'asc' },
     }),
-    periodStats(clubId, start, end),
+    revenueBothBases(clubId, start, end, tz),
   ]);
 
   const totalExpenses = expenses.reduce((s, e) => s + e.amount, 0);
@@ -768,8 +838,7 @@ analyticsRouter.get('/expenses', async (req, res) => {
     wholeMonths: true,
     expenses,
     totalExpenses,
-    revenue: stats.revenue,
-    netProfit: stats.revenue - totalExpenses,
+    ...basisBlock(parsed.data.basis, totalExpenses, stats),
   });
 });
 

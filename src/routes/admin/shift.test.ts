@@ -204,3 +204,31 @@ describe('GET /shifts/:id', () => {
     expect(res.body.entries).toHaveLength(1000);
   });
 });
+
+/* Рішення власника 2026-09-28: модератор бачить лише свої закриття */
+
+describe('ADMIN бачить лише власні закриті зміни', () => {
+  it('/shifts без періоду: where.actorId = власний id', async () => {
+    await request(app).get('/api/admin/shifts?limit=5');
+    expect(tx.shiftClose.findMany.mock.calls[0][0]).toMatchObject({ where: { clubId: 'club-1', actorId: 'u1' } });
+  });
+
+  it('/shifts з періодом: where.actorId = власний id', async () => {
+    await request(app).get('/api/admin/shifts?from=2026-09-01&to=2026-09-30');
+    expect(tx.shiftClose.findMany.mock.calls[0][0]).toMatchObject({ where: { clubId: 'club-1', actorId: 'u1' } });
+  });
+
+  it('/shifts/:id: чужа зміна шукається з actorId і дає 404', async () => {
+    tx.shiftClose.findFirst.mockResolvedValue(null);
+    const res = await request(app).get(`/api/admin/shifts/${ID1}`);
+    expect(res.status).toBe(404);
+    expect(tx.shiftClose.findFirst.mock.calls[0][0]).toMatchObject({ where: { id: ID1, clubId: 'club-1', actorId: 'u1' } });
+  });
+
+  it('OWNER не звужується до себе', async () => {
+    auth.role = 'OWNER';
+    await request(app).get('/api/admin/shifts?limit=5');
+    const where = (tx.shiftClose.findMany.mock.calls[0][0] as { where: Record<string, unknown> }).where;
+    expect(where).toEqual({ clubId: 'club-1' });
+  });
+});

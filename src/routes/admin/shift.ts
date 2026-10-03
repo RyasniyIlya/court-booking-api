@@ -199,11 +199,13 @@ const shiftsQuery = z.object({
  */
 shiftRouter.get('/shifts', requireAuth, requireStaff, async (req, res) => {
   const clubId = req.auth!.clubId;
+  /* Рішення власника: модератор бачить лише зміни, закриті ним самим. */
+  const own = req.auth!.role === 'ADMIN' ? { actorId: req.auth!.userId } : {};
 
   if (req.query.from === undefined && req.query.to === undefined) {
     const limit = z.coerce.number().int().min(1).max(60).catch(20).parse(req.query.limit);
     const items = await prisma.shiftClose.findMany({
-      where: { clubId },
+      where: { clubId, ...own },
       orderBy: { closedAt: 'desc' },
       take: limit,
     });
@@ -221,7 +223,7 @@ shiftRouter.get('/shifts', requireAuth, requireStaff, async (req, res) => {
   /* Увесь період одним читанням: підсумок однаково потребує всіх змін, а
      їх за рік — кілька сотень рядків. Сторінка — зріз цього ж списку. */
   const all = await prisma.shiftClose.findMany({
-    where: { clubId, closedAt: { gte: range.start, lt: range.endExclusive } },
+    where: { clubId, ...own, closedAt: { gte: range.start, lt: range.endExclusive } },
     orderBy: [{ closedAt: 'desc' }, { id: 'desc' }],
   });
   const page = pageAfter(all, q.cursor, q.limit);
@@ -245,7 +247,8 @@ shiftRouter.get('/shifts/:id', requireAuth, requireStaff, async (req, res) => {
   if (!id.success) return res.status(404).json({ error: 'NOT_FOUND' });
   const clubId = req.auth!.clubId;
 
-  const close = await prisma.shiftClose.findFirst({ where: { id: id.data, clubId } });
+  const own = req.auth!.role === 'ADMIN' ? { actorId: req.auth!.userId } : {};
+  const close = await prisma.shiftClose.findFirst({ where: { id: id.data, clubId, ...own } });
   if (!close) return res.status(404).json({ error: 'NOT_FOUND' });
 
   const found = await prisma.bookingLedgerEntry.findMany({

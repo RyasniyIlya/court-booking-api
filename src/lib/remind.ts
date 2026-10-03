@@ -1,3 +1,4 @@
+import { withSendSummary } from './telegramSafety';
 import { DateTime } from 'luxon';
 import { telegramHtml } from './telegramHtml';
 
@@ -111,7 +112,8 @@ function textFor(
  * Один прохід. Винесено з інтервалу, щоб тест міг покликати напряму —
  * той самий прийом, що в digestScheduler.
  */
-export async function runReminderTick(now: Date = new Date()): Promise<number> {
+export const runReminderTick = (now?: Date) => withSendSummary('staff-reminder', () => runReminderTickInner(now));
+async function runReminderTickInner(now: Date = new Date()): Promise<number> {
   const from = now;
   const to = new Date(now.getTime() + MAX_LEAD * 60_000);
 

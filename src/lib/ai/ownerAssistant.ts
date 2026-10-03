@@ -79,7 +79,7 @@ async function loadHeatmap(clubId: string, weeks: number) {
       bookings: profile.totals.bookings,
       unsold_hours: pct(Math.max(0, profile.totals.openMinutes - profile.totals.bookedMinutes) / 60),
       by_weekday: profile.byWeekday.map((w) => ({
-        weekday: WEEKDAYS_0[w.weekday], occupancy_pct: pct(w.occupancy * 100), bookings: w.bookings, revenue_uah: uah(w.revenue),
+        weekday: WEEKDAYS_0[w.weekday], occupancy_pct: pct(w.occupancy * 100), bookings: w.bookings, court_revenue_uah: uah(w.revenue),
       })),
       quietest: pickCells(profile.cells, 'asc', 6),
       busiest: pickCells(profile.cells, 'desc', 6),
@@ -174,7 +174,7 @@ export function ownerTools(club: OwnerClub, generate?: GenerateFn): ToolDef[] {
     {
       decl: {
         name: 'get_day_summary',
-        description: 'Підсумок доби: кількість підтверджених броней, виручка, нові клієнти, найзавантаженіший корт і виручка попередньої доби.',
+        description: 'Підсумок доби: кількість підтверджених броней, виручка корту (без тренера й прокату; поле court_revenue_uah), нові клієнти, найзавантаженіший корт і виручка корту попередньої доби. Це не «надано послуг».',
         parameters: { type: 'object', properties: { date: dateProp } },
       },
       run: async (a) => {
@@ -182,15 +182,15 @@ export function ownerTools(club: OwnerClub, generate?: GenerateFn): ToolDef[] {
         const d = await dayDigest(club.id, club.timezone, day);
         return {
           date: day.toFormat('yyyy-MM-dd'),
-          bookings: d.bookings, revenue_uah: uah(d.revenue), new_customers: d.newCustomers,
-          top_court: d.topCourt, prev_day_revenue_uah: d.prevRevenue == null ? null : uah(d.prevRevenue),
+          bookings: d.bookings, court_revenue_uah: uah(d.revenue), new_customers: d.newCustomers,
+          top_court: d.topCourt, prev_day_court_revenue_uah: d.prevRevenue == null ? null : uah(d.prevRevenue),
         };
       },
     },
     {
       decl: {
         name: 'get_revenue_trend',
-        description: 'Виручка й кількість броней по днях за останні N днів плюс порівняння з попереднім таким самим відрізком.',
+        description: 'Виручка корту (без тренера й прокату) й кількість броней по днях за останні N днів плюс порівняння з попереднім таким самим відрізком.',
         parameters: { type: 'object', properties: { days: { type: 'integer', description: 'Від 3 до 60, типово 14' } } },
       },
       run: async (a) => {
@@ -198,15 +198,15 @@ export function ownerTools(club: OwnerClub, generate?: GenerateFn): ToolDef[] {
         const r = await weekReport(club.id, club.timezone, days);
         return {
           days,
-          total_uah: uah(r.total), previous_period_total_uah: uah(r.prevTotal), bookings: r.bookings,
-          by_day: r.points.map((p) => ({ date: p.day, label: p.label, revenue_uah: uah(p.revenue), bookings: p.bookings })),
+          court_revenue_total_uah: uah(r.total), previous_period_court_revenue_uah: uah(r.prevTotal), bookings: r.bookings,
+          by_day: r.points.map((p) => ({ date: p.day, label: p.label, court_revenue_uah: uah(p.revenue), bookings: p.bookings })),
         };
       },
     },
     {
       decl: {
         name: 'get_court_report',
-        description: 'Звіт по кортах за період: броні, виручка, скасування, оплати, відсоток завантаження й вільні години. week — з понеділка поточного тижня дотепер, month — з 1 числа поточного місяця дотепер (не ковзні N днів, на відміну від get_revenue_trend).',
+        description: 'Звіт по кортах за період: броні, виручка корту (без тренера й прокату; court_revenue_uah), скасування, оплати, відсоток завантаження й вільні години. week — з понеділка поточного тижня дотепер, month — з 1 числа поточного місяця дотепер (не ковзні N днів, на відміну від get_revenue_trend).',
         parameters: {
           type: 'object',
           properties: { range: { type: 'string', description: 'today, yesterday, week, month або дата YYYY-MM-DD' } },
@@ -222,7 +222,7 @@ export function ownerTools(club: OwnerClub, generate?: GenerateFn): ToolDef[] {
           period_label: data.label,
           courts: data.rows.map((r) => ({
             court: r.name, confirmed: r.confirmed, pending: r.pending, cancelled: r.cancelled, expired: r.expired,
-            revenue_uah: uah(r.amount), occupancy_pct: r.occupancy == null ? null : pct(r.occupancy),
+            court_revenue_uah: uah(r.amount), occupancy_pct: r.occupancy == null ? null : pct(r.occupancy),
             booked_hours: pct(r.bookedHours), free_hours: pct(r.freeHours),
             paid_online: r.paid, payment_pending: r.paymentPending, refunded: r.refunded,
           })),
@@ -256,7 +256,7 @@ export function ownerTools(club: OwnerClub, generate?: GenerateFn): ToolDef[] {
     {
       decl: {
         name: 'get_revenue_mix',
-        description: 'Звідки береться виручка за останні N днів: по кортах, робота тренерів проти оренди, групові заняття, топ-10 тренерів. Нарахування підтверджених броней за датою гри, не каса.',
+        description: 'Звідки береться «надано послуг (всього)» за останні N днів: повні ціни броней, тобто з тренером і прокатом, по кортах, робота тренерів проти оренди, групові заняття, топ-10 тренерів. Нарахування підтверджених броней за датою гри, не каса і не «виручка корту» з інших інструментів.',
         parameters: { type: 'object', properties: { days: { type: 'integer', description: 'Від 1 до 90, типово 30' } } },
       },
       run: async (a) => {
@@ -330,7 +330,7 @@ export function ownerSystemPrompt(club: OwnerClub, snapshotText = '') {
 - Кожен висновок закінчуй конкретною дією: що зробити, до якого дня, чого очікувати (акція на слабкі години, обдзвонити абонементників, підняти ціну на пікові вечори).
 - Погоду й події міста шукай через web_lookup, коли це доречно для попиту (відкриті корти, вихідні, турніри, свята). Не додавай погоду, якщо про неї не питали й вона тут ні до чого.
 - Гроші — у гривнях, відсотки округлюй. Відповідь — стисла: короткий абзац і 2–4 пункти, без води.
-- «Виручка» скрізь — це вартість підтверджених броней за датою гри (нарахування), а не гроші в касі: сьогоднішня ще не зіграна бронь уже входить у неї. Каси й витрат клубу в тебе немає — якщо питають про прибуток чи касу, так і скажи.
+- Дві різні цифри не змішуй. «Виручка корту» (поля court_revenue_*) — це вартість корту без тренера й прокату, заняття з абонемента за вартістю заняття; так її й називай. «Надано послуг» (get_revenue_mix) — повні ціни броней, разом із тренером і прокатом; називай саме так, а не «виручка». Обидві — нарахування за датою гри, а не гроші в касі: сьогоднішня ще не зіграна бронь уже входить. Каси й витрат клубу в тебе немає — якщо питають про прибуток чи касу, так і скажи; якщо цифри двох інструментів різні — поясни, що це різні бази, а не помилка.
 - Який інструмент для чого: клієнти, відтік, «хто давно не був» → get_customer_health. Акція на тихі години, ціни на пік → get_load_heatmap. Звідки гроші, тренери проти оренди → get_revenue_mix. Абонементи, кому продовжити → get_passes_status. Як минула доба чи тиждень → get_day_summary/get_revenue_trend. Броні наперед → get_booking_outlook. По кортах окремо → get_court_report.
 - Імен і телефонів клієнтів у тебе немає і не повинно бути. Щоб власник побачив конкретних людей — порадь відповідний фільтр у кабінеті (наприклад «Клієнти → Під ризиком»). «Під ризиком» — одне число, at_risk; не називай відтоком інші показники руху, не вигадуй імена сам.
 - Даних за період мало чи немає — так і скажи, не заповнюй прогалини домислами.
