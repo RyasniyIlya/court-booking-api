@@ -27,7 +27,10 @@ import { birthDateText, birthDateValue, dateOnly } from '../lib/birthday';
 import { isRegistrationOpen, registrationClosesAt } from '../lib/registrationCutoff';
 import { isTournament, resolveJoinPayment, tournamentPayMode } from '../lib/tournamentPay';
 import { courtPriceWithPromos, bestPromo, promoPrice } from '../lib/promo';
-import { courtPhotoUrl } from '../lib/courtMedia';
+import { courtPhotoUrl, trainerPhotoUrl } from '../lib/courtMedia';
+import {
+  RATING_COMMENT_MAX, listPendingRatings, loadRateableItem, publicRating, ratingSummaries, saveTrainerRating,
+} from '../lib/trainerRating';
 import { canCancelNow, cancelBookingByCustomer, cancelSeatByCustomer } from '../lib/customerCancel';
 import { botReady } from '../lib/telegram';
 import { consentUpdate, LEGAL_VERSION } from '../lib/legal';
@@ -426,6 +429,30 @@ publicRouter.get('/courts/photos/:id', async (req, res) => {
 });
 
 /**
+ * GET /api/public/trainers/photos/:id — фото тренера для віджета.
+ *
+ * Так само, як знімок корту: адреса незмінна (знімок не перезаписується, а
+ * видаляється й заводиться новим рядком), тож кеш на рік безпечний.
+ */
+publicRouter.get('/trainers/photos/:id', async (req, res) => {
+  const id = z.string().uuid().safeParse(req.params.id);
+  if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const photo = await prisma.trainerPhoto.findUnique({
+    where: { id: id.data },
+    select: { data: true, mime: true },
+  });
+  if (!photo) return res.status(404).json({ error: 'NO_PHOTO' });
+
+  res.setHeader('Content-Type', photo.mime);
+  res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Content-Disposition', 'inline');
+
+  res.send(photo.data);
+});
+
+/**
  * GET /api/public/inventory/:id/photo — фото речі з комори клубу.
  *
  * Публічний з тієї ж причини, що й логотип: <img src> не вміє слати
@@ -496,11 +523,33 @@ publicRouter.get('/clubs/:slug/trainers', async (req, res) => {
 
   const range = start && end ? { start: new Date(start), end: new Date(end) } : null;
 
+  /* Фото й середні — по одному запиту на весь список, не на кожного тренера.
+     Байти знімків не читаємо: тільки id. */
+  const trainerIds = club.trainers.map((t) => t.id);
+  const [photoRows, ratings] = await Promise.all([
+    trainerIds.length === 0
+      ? []
+      : prisma.trainerPhoto.findMany({
+        where: { trainerId: { in: trainerIds } },
+        select: { id: true, trainerId: true },
+        orderBy: [{ sortOrder: 'asc' }, { createdAt: 'asc' }],
+      }),
+    ratingSummaries(trainerIds, club.id),
+  ]);
+  const photosByTrainer = new Map<string, string[]>();
+  for (const row of photoRows) {
+    photosByTrainer.set(row.trainerId, [...(photosByTrainer.get(row.trainerId) ?? []), trainerPhotoUrl(row.id)]);
+  }
+
   res.json(club.trainers.map((t) => ({
     id: t.id,
     name: t.name,
     pricePerHour: t.pricePerHour,
     note: t.note,
+    photoUrl: photosByTrainer.get(t.id)?.[0] ?? null,
+    photos: photosByTrainer.get(t.id) ?? [],
+    /* Від трьох оцінок: одна не має визначати репутацію тренера. */
+    rating: publicRating(ratings.get(t.id)),
     available: !busy.has(t.id) && (!range || isTrainerAvailable(
       t.hours, range.start, range.end, club.timezone, t.exceptions,
     )),
@@ -1765,7 +1814,7 @@ publicRouter.get('/customer/me', async (req, res) => {
 
   const now = new Date();
 
-  const [upcoming, seats, club, pastBookings, pastSeats, pass, waitlist] = await Promise.all([
+  const [upcoming, seats, club, pastBookings, pastSeats, pass, waitlist, pendingRatings] = await Promise.all([
     prisma.booking.findMany({
       where: {
         customerId: customer.id,
@@ -1863,6 +1912,9 @@ publicRouter.get('/customer/me', async (req, res) => {
       orderBy: { startTime: 'asc' },
       take: 10,
     }),
+    /* Заняття з тренером, які гравець ще не оцінив і не відхилив: віджет
+       покаже картку «Оцініть заняття». Правила допуску — lib/trainerRating.ts. */
+    listPendingRatings({ customerId: customer.id, clubId: customer.clubId }, now),
   ]);
 
   const tz = club?.timezone ?? 'Europe/Kyiv';
@@ -1964,6 +2016,14 @@ publicRouter.get('/customer/me', async (req, res) => {
         ? `https://t.me/${process.env.TELEGRAM_BOT_USERNAME}?start=club_${club.slug}`
         : null,
     },
+    pendingRatings: pendingRatings.map((r) => ({
+      kind: r.kind,
+      id: r.id,
+      trainerName: r.trainerName,
+      trainerPhotoUrl: r.trainerPhotoUrl,
+      startTime: r.startTime.toISOString(),
+      endTime: r.endTime.toISOString(),
+    })),
     waitlist: waitlist.map((w) => ({
       id: w.id,
       courtId: w.courtId,
@@ -2037,6 +2097,43 @@ publicRouter.get('/customer/me', async (req, res) => {
       })),
     ].sort((a, b) => b.start.localeCompare(a.start)),
   });
+});
+
+/**
+ * POST /api/public/customer/trainer-ratings
+ *   { kind: 'court' | 'seat', id, score: 1..5 | null, comment? }
+ *
+ * Оцінка заняття з тренером. score = null — «Не оцінювати»: записуємо
+ * відмову, і більше не питаємо. Одна оцінка на (заняття, гравець); вона
+ * змінюється, поки вікно в сім днів не закрилось. Чуже й неіснуюче — 404,
+ * не пройшло правила допуску — 409 NOT_RATEABLE (lib/trainerRating.ts).
+ */
+publicRouter.post('/customer/trainer-ratings', publicWriteLimiter, async (req, res) => {
+  const auth = requireCustomerAuth(req, res);
+  if (!auth) return;
+  const parsed = z.object({
+    kind: z.enum(['court', 'seat']),
+    id: z.string().uuid(),
+    score: z.number().int().min(1).max(5).nullable(),
+    comment: z.string().trim().max(RATING_COMMENT_MAX).optional(),
+  }).strict().safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const found = await loadRateableItem(parsed.data.kind, parsed.data.id, auth);
+  if (!found.ok) {
+    return found.error === 'NOT_FOUND'
+      ? res.status(404).json({ error: 'NOT_FOUND' })
+      : res.status(409).json({ error: 'NOT_RATEABLE' });
+  }
+
+  const saved = await saveTrainerRating(found.target, {
+    score: parsed.data.score,
+    comment: parsed.data.comment,
+    source: 'WIDGET',
+  });
+  if (!saved.ok) return res.status(409).json({ error: 'NOT_RATEABLE' });
+
+  res.json({ ok: true });
 });
 
 /**

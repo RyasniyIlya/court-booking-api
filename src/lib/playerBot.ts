@@ -12,6 +12,7 @@ import {
   cancelBookingByCustomer,
   cancelSeatByCustomer,
 } from './customerCancel';
+import { loadRatingTarget, saveTrainerRating } from './trainerRating';
 
 /**
  * Бот для гравця: привʼязка чату з профілю у віджеті, картка майбутньої гри
@@ -317,6 +318,7 @@ export async function handlePlayerCallback(q: NonNullable<TgUpdate['callback_que
   const act = parsePlayerAction(q.data);
   if (!act) {
     if (q.data?.startsWith('wl:')) return handleWaitlistCallback(q);
+    if (q.data?.startsWith('tr:')) return handleRatingCallback(q);
     return false;
   }
 
@@ -402,6 +404,48 @@ async function handleWaitlistCallback(q: NonNullable<TgUpdate['callback_query']>
     await editMessageText(chatId, q.message.message_id, 'Ви вийшли з черги на цей час.');
   }
   await answerCallback(q.id, 'Готово');
+  return true;
+}
+
+/** ★★★★☆ — завжди пʼять символів */
+export const ratingStars = (score: number) => '★'.repeat(score) + '☆'.repeat(5 - score);
+
+/**
+ * Кнопки ⭐1…⭐5 і «Не оцінювати» під запитом оцінки тренера.
+ * Допуск (вікно, неявка, статус) — у lib/trainerRating.ts, одним місцем
+ * із віджетом.
+ */
+async function handleRatingCallback(q: NonNullable<TgUpdate['callback_query']>): Promise<boolean> {
+  const m = /^tr:([0-5]):([bs]):([0-9a-f-]{36})$/.exec(q.data ?? '');
+  if (!m) return false;
+  const score = Number(m[1]);
+
+  const chatId = String(q.message?.chat.id ?? q.from?.id ?? '');
+  const target = await loadRatingTarget(m[2] as PlayerItemKind, m[3]);
+  /* Чуже заняття або чат, від якого гравець відвʼязався — відповідь та сама,
+     що й у решти кнопок: не підказуємо, що такий id існує. */
+  if (!target || !chatId || target.chatId !== chatId) {
+    await answerCallback(q.id, 'Цей запис вам недоступний');
+    return true;
+  }
+
+  const saved = await saveTrainerRating(target, { score: score === 0 ? null : score, source: 'TELEGRAM' });
+  if (!saved.ok) {
+    if (q.message) await editMessageText(chatId, q.message.message_id, 'Оцінити це заняття вже не можна.');
+    await answerCallback(q.id, 'Оцінити вже не можна');
+    return true;
+  }
+
+  if (q.message) {
+    await editMessageText(
+      chatId,
+      q.message.message_id,
+      score === 0
+        ? 'Добре, не будемо питати про це заняття.'
+        : `Дякуємо! Ваша оцінка тренеру ${html(target.trainerName ?? '')}: ${ratingStars(score)}`,
+    );
+  }
+  await answerCallback(q.id, score === 0 ? 'Готово' : 'Дякуємо');
   return true;
 }
 

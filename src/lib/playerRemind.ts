@@ -3,6 +3,7 @@ import { prisma } from './db';
 import { planFeatures } from './plans';
 import { botReady, sendReminderMessage } from './telegram';
 import { runWaitlistTick } from './waitlist';
+import { runTrainerRatingTick } from './trainerRatingBot';
 import { loadPlayerItem, playerCardKeyboard, playerCardText, type PlayerItemKind } from './playerBot';
 
 /**
@@ -158,6 +159,12 @@ export function startPlayerScheduler() {
     void (async () => {
       try {
         await runPlayerReminderTick();
+        /* Окремо: збій запиту оцінок не повинен зупинити чергу. */
+        try {
+          await runTrainerRatingTick();
+        } catch (e) {
+          console.error('[player] тік оцінок тренера упав', e);
+        }
         await runWaitlistTick();
       } catch (e) {
         console.error('[player] тік упав', e);
@@ -168,5 +175,5 @@ export function startPlayerScheduler() {
   }, 60_000);
   timer.unref?.();
 
-  console.log(`[player] нагадування гравцям за ${PLAYER_REMIND_MINUTES} хв і черга увімкнені`);
+  console.log(`[player] нагадування гравцям за ${PLAYER_REMIND_MINUTES} хв, запит оцінки тренера і черга увімкнені`);
 }

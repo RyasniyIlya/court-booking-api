@@ -616,8 +616,57 @@ model Trainer {
   notes         Note[]
   hours         TrainerHours[]
   exceptions    TrainerScheduleException[]
+  photos        TrainerPhoto[]
+  ratings       TrainerRating[]
 
   @@index([clubId, isActive])
+}
+
+/// Фото тренера для віджета. Окремою таблицею з тієї ж причини, що й CourtPhoto:
+/// байти не мають їхати з базою в кожному запиті до Trainer.
+model TrainerPhoto {
+  id        String   @id @default(uuid()) @db.Uuid
+  trainerId String   @db.Uuid
+  trainer   Trainer  @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  /// Денормалізовано: межа клубу перевіряється одним where, без join.
+  clubId    String   @db.Uuid
+  data      Bytes
+  mime      String
+  /// Найменший номер — аватар тренера у виборі тренера у віджеті.
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  @@index([trainerId, sortOrder])
+}
+
+/// Оцінка заняття з тренером від гравця. Один рядок на (заняття, гравець):
+/// оцінку можна змінити, поки не минуло вікно в 7 днів (lib/trainerRating.ts).
+/// Імена й коментарі бачить тільки персонал клубу.
+model TrainerRating {
+  id         String       @id @default(uuid()) @db.Uuid
+  clubId     String       @db.Uuid
+  trainerId  String       @db.Uuid
+  trainer    Trainer      @relation(fields: [trainerId], references: [id], onDelete: Cascade)
+  bookingId  String       @db.Uuid
+  booking    Booking      @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  /// Для групових занять — місце, з якого прийшла оцінка.
+  seatId     String?      @db.Uuid
+  seat       BookingSeat? @relation(fields: [seatId], references: [id], onDelete: SetNull)
+  customerId String       @db.Uuid
+  customer   Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  /// 1..5; null — гравець відмовився оцінювати (більше не питаємо).
+  /// Діапазон стереже CHECK trainer_rating_score_range.
+  score      Int?
+  /// До 500 символів; без оцінки не зберігається.
+  comment    String?
+  /// 'TELEGRAM' | 'WIDGET'
+  source     String
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+
+  @@unique([bookingId, customerId])
+  @@index([trainerId, createdAt])
+  @@index([clubId, createdAt])
 }
 
 /// Регулярний тижневий графік конкретного тренера.
@@ -873,18 +922,21 @@ model CourtPhoto {
 }
 
 model Booking {
-  reschedules   BookingReschedule[]
-  paymentPlan   Json                 @default("{}")
-  createdBy     String?
-  confirmedBy   String?
-  confirmedAt   DateTime?
-  ledgerEntries BookingLedgerEntry[]
-  id            String               @id @default(uuid()) @db.Uuid
+  /// Мітка «в Telegram уже запитали про оцінку тренера» (lib/trainerRating.ts).
+  rateAskedAt    DateTime?
+  trainerRatings TrainerRating[]
+  reschedules    BookingReschedule[]
+  paymentPlan    Json                 @default("{}")
+  createdBy      String?
+  confirmedBy    String?
+  confirmedAt    DateTime?
+  ledgerEntries  BookingLedgerEntry[]
+  id             String               @id @default(uuid()) @db.Uuid
   /// Денормалізовано навмисно: усі адмінські вибірки йдуть по клубу
-  clubId        String               @db.Uuid
-  club          Club                 @relation(fields: [clubId], references: [id], onDelete: Cascade)
-  courtId       String               @db.Uuid
-  court         Court                @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  clubId         String               @db.Uuid
+  club           Club                 @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  courtId        String               @db.Uuid
+  court          Court                @relation(fields: [courtId], references: [id], onDelete: Cascade)
 
   /// Копія на момент броні — імʼя в картці клієнта може змінитись пізніше.
   ///
@@ -1176,6 +1228,9 @@ model TournamentMatch {
 }
 
 model BookingSeat {
+  /// Те саме, що Booking.rateAskedAt, але для місця в груповому занятті.
+  rateAskedAt       DateTime?
+  trainerRatings    TrainerRating[]
   tournamentEntries TournamentEntry[]
   ledgerEntries     BookingLedgerEntry[]
   id                String               @id @default(uuid()) @db.Uuid
@@ -1399,6 +1454,7 @@ enum PassType {
 /// Картка учасника клубу. Створюється автоматично при першій броні —
 /// жодної реєстрації з боку клієнта не потрібно, ідентифікатор = телефон.
 model Customer {
+  trainerRatings     TrainerRating[]
   tournamentEntries  TournamentEntry[]
   bonusBalance       Int                  @default(0)
   birthDate          DateTime?            @db.Date

@@ -1,10 +1,23 @@
-import { Router } from 'express';
+import { Router, raw } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
 import { requireAuth, requireStaff, requireFeature, param } from './shared';
 import { mountNoteRoutes } from './notes';
 import { calendarDateText, birthDateValue } from '../../lib/birthday';
+import {
+  COURT_PHOTO_MAX_BYTES, COURT_PHOTO_MIMES, TRAINER_PHOTO_LIMIT, sniffImage, trainerPhotoUrl,
+} from '../../lib/courtMedia';
+import { adminRating, listTrainerRatings, ratingSummaries } from '../../lib/trainerRating';
+
+/** Фото тренера в списку — тільки id, без байтів. Аватар перший. */
+const PHOTO_LIST = {
+  select: { id: true },
+  orderBy: [{ sortOrder: 'asc' as const }, { createdAt: 'asc' as const }],
+};
+
+const photosToApi = (photos: { id: string }[]) =>
+  photos.map((p) => ({ id: p.id, url: trainerPhotoUrl(p.id) }));
 
 export const trainersRouter = Router();
 
@@ -35,9 +48,50 @@ trainersRouter.get(
               'asc',
           },
         ],
+        include: {
+          photos: PHOTO_LIST,
+        },
       });
 
-    res.json(trainers);
+    /* Середні всіх тренерів одним groupBy, а не запитом на кожного. */
+    const ratings =
+      await ratingSummaries(
+        trainers.map((t) => t.id),
+        req.auth!.clubId,
+      );
+
+    res.json(
+      trainers.map((t) => ({
+        ...t,
+        photos: photosToApi(t.photos),
+        rating: adminRating(ratings.get(t.id)),
+      })),
+    );
+  },
+);
+
+/**
+ * GET /api/admin/trainers/:id/ratings?limit=50 — відгуки про тренера.
+ *
+ * Імена гравців і коментарі бачить тільки персонал: гравцям віджет віддає
+ * лише середню (і то від трьох оцінок). Відмови сюди не потрапляють.
+ */
+trainersRouter.get(
+  '/trainers/:id/ratings',
+  requireAuth,
+  requireStaff,
+  requireFeature('trainers'),
+  async (req, res) => {
+    const id = z.string().uuid().safeParse(param(req, 'id'));
+    const query = z.object({
+      limit: z.coerce.number().int().min(1).max(200).default(50),
+    }).safeParse(req.query);
+    if (!id.success || !query.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+    const result = await listTrainerRatings(id.data, req.auth!.clubId, query.data.limit);
+    if (!result) return res.status(404).json({ error: 'NOT_FOUND' });
+
+    res.json(result);
   },
 );
 
@@ -380,6 +434,123 @@ trainersRouter.delete(
       ok: true,
       hidden: false,
     });
+  },
+);
+
+/* ФОТО ТРЕНЕРА                                                              */
+/* -------------------------------------------------------------------------- */
+//
+// Той самий механізм, що й фото корту (courts.ts): знімок їде сирим тілом,
+// кілька знімків кабінет шле кількома запитами. Ліміт — чотири.
+
+const photoList = (clubId: string, trainerId: string) =>
+  prisma.trainerPhoto.findMany({ where: { trainerId, clubId }, ...PHOTO_LIST });
+
+trainersRouter.post(
+  '/trainers/:id/photos',
+  requireAuth,
+  requireStaff,
+  requireFeature('trainers'),
+  raw({ type: '*/*', limit: COURT_PHOTO_MAX_BYTES }),
+  async (req, res) => {
+    const id = z.string().uuid().safeParse(param(req, 'id'));
+    if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+    const body = req.body;
+    if (!Buffer.isBuffer(body) || body.length === 0) {
+      return res.status(400).json({ error: 'EMPTY_FILE' });
+    }
+
+    const mime = sniffImage(body);
+    if (!mime || !COURT_PHOTO_MIMES.has(mime)) {
+      return res.status(415).json({ error: 'UNSUPPORTED_TYPE', allowed: [...COURT_PHOTO_MIMES] });
+    }
+
+    const clubId = req.auth!.clubId;
+    const trainer = await prisma.trainer.findFirst({
+      where: { id: id.data, clubId },
+      select: { id: true },
+    });
+    if (!trainer) return res.status(404).json({ error: 'NOT_FOUND' });
+
+    const last = await prisma.trainerPhoto.aggregate({
+      where: { trainerId: trainer.id, clubId },
+      _count: true,
+      _max: { sortOrder: true },
+    });
+    if (last._count >= TRAINER_PHOTO_LIMIT) {
+      return res.status(409).json({ error: 'PHOTO_LIMIT', limit: TRAINER_PHOTO_LIMIT });
+    }
+
+    await prisma.trainerPhoto.create({
+      data: {
+        trainerId: trainer.id,
+        clubId,
+        data: body,
+        mime,
+        sortOrder: (last._max.sortOrder ?? -1) + 1,
+      },
+      select: { id: true },
+    });
+
+    res.status(201).json({ photos: photosToApi(await photoList(clubId, trainer.id)) });
+  },
+);
+
+/**
+ * PUT /api/admin/trainers/:id/photos/order  { ids }
+ *
+ * Весь порядок одним запитом. Перший у списку стає аватаром. Неповний
+ * список або чужий id — 409.
+ */
+trainersRouter.put(
+  '/trainers/:id/photos/order',
+  requireAuth,
+  requireStaff,
+  requireFeature('trainers'),
+  async (req, res) => {
+    const id = z.string().uuid().safeParse(param(req, 'id'));
+    const parsed = z
+      .object({
+        ids: z.array(z.string().uuid()).min(1).max(TRAINER_PHOTO_LIMIT)
+          .refine((ids) => new Set(ids).size === ids.length, 'duplicate ids'),
+      })
+      .strict()
+      .safeParse(req.body);
+    if (!id.success || !parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+    const clubId = req.auth!.clubId;
+    const { ids } = parsed.data;
+
+    const own = new Set((await photoList(clubId, id.data)).map((p) => p.id));
+    if (own.size !== ids.length || ids.some((photoId) => !own.has(photoId))) {
+      return res.status(409).json({ error: 'ORDER_MISMATCH' });
+    }
+
+    await prisma.$transaction(ids.map((photoId, index) =>
+      prisma.trainerPhoto.update({ where: { id: photoId }, data: { sortOrder: index } })));
+
+    res.json({ photos: photosToApi(await photoList(clubId, id.data)) });
+  },
+);
+
+trainersRouter.delete(
+  '/trainers/:id/photos/:photoId',
+  requireAuth,
+  requireStaff,
+  requireFeature('trainers'),
+  async (req, res) => {
+    const id = z.string().uuid().safeParse(param(req, 'id'));
+    const photoId = z.string().uuid().safeParse(param(req, 'photoId'));
+    if (!id.success || !photoId.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+    const clubId = req.auth!.clubId;
+    const result = await prisma.trainerPhoto.deleteMany({
+      where: { id: photoId.data, trainerId: id.data, clubId },
+    });
+    if (result.count === 0) return res.status(404).json({ error: 'NOT_FOUND' });
+
+    res.json({ photos: photosToApi(await photoList(clubId, id.data)) });
   },
 );
 

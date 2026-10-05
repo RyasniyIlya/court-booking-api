@@ -95,3 +95,12 @@ export function courtVideoUrl(video: CourtVideo): string {
     ? `https://www.youtube.com/watch?v=${video.id}`
     : `https://vimeo.com/${video.id}`;
 }
+
+/**
+ * Фото тренера — той самий механізм, що й знімки корту (байти в базі,
+ * перевірка за вмістом, незмінна адреса). Чотири знімки: перший — аватар у
+ * виборі тренера, решта — «хто це» для тих, хто вагається.
+ */
+export const TRAINER_PHOTO_LIMIT = 4;
+
+export const trainerPhotoUrl = (id: string) => `/api/public/trainers/photos/${id}`;
