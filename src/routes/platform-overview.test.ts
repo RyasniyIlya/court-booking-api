@@ -460,6 +460,39 @@ describe('POST /clubs/:id/subscription', () => {
   });
 });
 
+describe('POST /clubs/:id/subscription і відкритий рахунок', () => {
+  const clubRow = () => ({
+    id: A, name: 'Падел Клаб', paidUntil: null, billingPeriod: 'MONTH', planPrice: null,
+    plan: plan(), users: [], _count: { courts: 2 },
+  });
+
+  it('є ISSUED-рахунок: він стає PAID, дубль не створюється', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow());
+    prisma.clubInvoice.findFirst.mockResolvedValue({ id: 'open-1' });
+    prisma.clubInvoice.update.mockResolvedValue({ id: 'open-1' });
+
+    const res = await request(app).post(`/clubs/${A}/subscription`).set('Authorization', authorization).send({ method: 'transfer' });
+
+    expect(res.status).toBe(200);
+    expect(prisma.clubInvoice.create).not.toHaveBeenCalled();
+    expect(prisma.clubInvoice.update).toHaveBeenCalledWith({
+      where: { id: 'open-1' },
+      data: expect.objectContaining({ status: 'PAID', amount: 1000_00, method: 'transfer' }),
+    });
+  });
+
+  it('відкритого немає: новий PAID-рахунок отримує номер К-рік-00001', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow());
+    prisma.clubInvoice.findFirst.mockResolvedValue(null);
+
+    await request(app).post(`/clubs/${A}/subscription`).set('Authorization', authorization).send({});
+
+    const { data } = prisma.clubInvoice.create.mock.calls[0][0];
+    expect(data.number).toMatch(/^К-\d{4}-00001$/);
+    expect(data.status).toBe('PAID');
+  });
+});
+
 describe('POST /invoices/:id/void', () => {
   it('скасування рахунку лишає запис у журналі в тій самій транзакції', async () => {
     prisma.clubInvoice.findUnique.mockResolvedValue({

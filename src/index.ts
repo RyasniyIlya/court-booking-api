@@ -10,6 +10,8 @@ import { exportRouter } from './routes/export';
 import { financeRouter } from './routes/finance';
 import { platformRouter } from './routes/platform';
 import { platformCrmRouter } from './routes/platformCrm';
+import { platformAnalyticsRouter } from './routes/platformAnalytics';
+import { partnerRouter } from './routes/partner';
 import { requirePlatformAuth } from './lib/platformAuth';
 import { payRouter } from './routes/pay';
 import { startExpirySweeper } from './lib/expire';
@@ -50,7 +52,7 @@ app.use((req, res, next) => {
   }
   // Персональні дані не мають осідати в спільних кешах. Це лише значення
   // за замовчуванням: маршрут, що ставить свій Cache-Control, перекриє його.
-  if (req.path.startsWith('/api/admin') || req.path.startsWith('/api/platform')) {
+  if (req.path.startsWith('/api/admin') || req.path.startsWith('/api/platform') || req.path.startsWith('/api/partner')) {
     res.set('Cache-Control', 'no-store');
   }
   next();
@@ -116,6 +118,18 @@ app.use('/api/platform', cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
+// Кабінет партнера (будівельники кортів) — той самий origin-allowlist.
+app.use('/api/partner', cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    if (adminOrigins.includes(origin.replace(/\/+$/, ''))) return cb(null, true);
+    if (process.env.NODE_ENV !== 'production') return cb(null, true);
+    cb(null, false);
+  },
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+}));
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/public', publicRouter);
 app.use('/api/public', assistantRouter);
@@ -128,6 +142,8 @@ app.use('/api/admin/analytics', analyticsRouter);
 app.use('/api/admin/export', exportRouter);
 app.use('/api/platform', platformRouter);
 app.use('/api/platform', platformCrmRouter);
+app.use('/api/platform', platformAnalyticsRouter);
+app.use('/api/partner', partnerRouter);
 
 /**
  * Вебхук Telegram. Це єдиний шлях для вхідних команд: фоновий polling

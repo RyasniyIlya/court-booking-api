@@ -19,6 +19,8 @@
 
 export type GeminiPart = {
   text?: string;
+  /** Файл у запиті (зображення/PDF), base64. */
+  inlineData?: { mimeType: string; data: string };
   /** Міркування моделі. Назад у історію їх повертаємо як є, читачу не віддаємо. */
   thought?: boolean;
   thoughtSignature?: string;

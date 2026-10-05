@@ -69,6 +69,9 @@ const registerSchema = z.object({
     .trim()
     .max(30)
     .optional(),
+
+  /* Реф-код партнера (?ref=). Невідомий або неактивний — ігноруємо мовчки. */
+  ref: z.string().trim().toLowerCase().max(32).optional(),
 });
 
 /**
@@ -133,6 +136,20 @@ authRouter.post('/register', registerLimiter, async (req, res) => {
     12,
   );
 
+  /* Партнер за реф-кодом: помилка пошуку або невідомий код не валять реєстрацію. */
+  let partnerId: string | null = null;
+  if (data.ref) {
+    try {
+      const partner = await prisma.partner.findUnique({
+        where: { refCode: data.ref },
+        select: { id: true, isActive: true },
+      });
+      if (partner?.isActive) partnerId = partner.id;
+    } catch (error) {
+      console.error('[admin register] partner lookup failed', error);
+    }
+  }
+
   try {
     const result = await prisma.$transaction(
       async (tx) => {
@@ -143,6 +160,8 @@ authRouter.post('/register', registerLimiter, async (req, res) => {
             phone: data.phone ?? null,
 
             approvedAt: null,
+
+            ...(partnerId ? { partnerId, partnerAttachedAt: new Date() } : {}),
           },
         });
 

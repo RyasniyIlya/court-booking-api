@@ -25,7 +25,7 @@ import { signCustomerToken, verifyCustomerToken } from '../lib/customerAuth';
 import { hashCustomerPassword, passwordText, verifyCustomerPassword } from '../lib/customerPassword';
 import { birthDateText, birthDateValue, dateOnly } from '../lib/birthday';
 import { isRegistrationOpen, registrationClosesAt } from '../lib/registrationCutoff';
-import { resolveJoinPayment, tournamentPayMode } from '../lib/tournamentPay';
+import { isTournament, resolveJoinPayment, tournamentPayMode } from '../lib/tournamentPay';
 import { courtPriceWithPromos, bestPromo, promoPrice } from '../lib/promo';
 import { courtPhotoUrl } from '../lib/courtMedia';
 import { canCancelNow, cancelBookingByCustomer, cancelSeatByCustomer } from '../lib/customerCancel';
@@ -206,6 +206,60 @@ export function logoSrcOf(club: {
 const BUSY_STATUSES = ['PENDING', 'CONFIRMED'] as const;
 
 /** GET /api/public/clubs/:slug — дані для віджета */
+/* Табло турніру для екрана в клубі. Ключ — uuid брони, його не вгадати;
+   віддаємо лише назву, час, корт, статус і сітку з іменами — жодних
+   телефонів і службових id учасників. */
+publicRouter.get('/tournaments/:id', async (req, res) => {
+  if (!z.string().uuid().safeParse(req.params.id).success) {
+    return res.status(404).json({ error: 'NOT_FOUND' });
+  }
+  const booking = await prisma.booking.findUnique({
+    where: { id: req.params.id },
+    select: {
+      id: true, title: true, capacity: true, startTime: true, status: true,
+      tournamentStatus: true, thirdPlace: true,
+      court: { select: { name: true } },
+      club: { select: { name: true, brandColor: true } },
+      tournamentEntries: { select: { id: true, name: true, seed: true }, orderBy: { seed: 'asc' } },
+      tournamentMatches: {
+        select: {
+          round: true, slot: true, entryAId: true, entryBId: true, winnerEntryId: true,
+          sets: true, status: true, scheduledAt: true, court: { select: { name: true } },
+        },
+        orderBy: [{ round: 'asc' }, { slot: 'asc' }],
+      },
+    },
+  });
+  if (!booking || !isTournament(booking) || booking.status === 'CANCELLED') {
+    return res.status(404).json({ error: 'NOT_FOUND' });
+  }
+  const nameOf = new Map(booking.tournamentEntries.map((e) => [e.id, e.name]));
+  res.set('Cache-Control', 'no-store');
+  res.json({
+    id: booking.id,
+    title: booking.title,
+    startTime: booking.startTime,
+    court: booking.court,
+    club: booking.club,
+    status: booking.tournamentStatus,
+    thirdPlace: booking.thirdPlace,
+    entries: booking.tournamentEntries.map((e) => ({ name: e.name, seed: e.seed })),
+    matches: booking.tournamentMatches.map((m) => ({
+      round: m.round,
+      slot: m.slot,
+      a: m.entryAId ? nameOf.get(m.entryAId) ?? null : null,
+      b: m.entryBId ? nameOf.get(m.entryBId) ?? null : null,
+      sets: m.sets,
+      winner: m.winnerEntryId
+        ? (m.winnerEntryId === m.entryAId ? 'A' : m.winnerEntryId === m.entryBId ? 'B' : null)
+        : null,
+      status: m.status,
+      court: m.court?.name ?? null,
+      scheduledAt: m.scheduledAt,
+    })),
+  });
+});
+
 publicRouter.get('/clubs/:slug', async (req, res) => {
   const club = await loadClub(req.params.slug);
   if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });

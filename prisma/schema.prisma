@@ -81,44 +81,44 @@ enum UserRole {
 
 /// Спортивний клуб = один тенант SaaS
 model Club {
-  settlementSettings Json                 @default("{}")
+  settlementSettings  Json  @default("{}")
   /// Цілі й пороги екрана аналітики: { occupancy, cancellation, retention }, %.
   /// null = дефолти веб-клієнта. Форма — lib/analyticsThresholds.ts.
   analyticsThresholds Json?
 
   // ── Юридичні дані й оферта (docs/legal) ──────────────────────────────
   /// Коли власник прийняв оферту й умови обробки ПД, і яку версію (lib/legal.ts).
-  offerAcceptedAt DateTime?
-  offerVersion    String?
+  offerAcceptedAt      DateTime?
+  offerVersion         String?
   /// Реквізити виконавця для Правил клубу: юрназва/ПІБ ФОП, ЄДРПОУ/РНОКПП, адреса, email.
-  legalName       String?
-  legalCode       String?
-  legalAddress    String?
-  email           String?
+  legalName            String?
+  legalCode            String?
+  legalAddress         String?
+  email                String?
   /// Скільки % вартості утримує клуб при пізньому скасуванні (0-50).
-  lateCancelFeePercent Int @default(50)
+  lateCancelFeePercent Int                  @default(50)
   /// За скільки днів повертаються кошти.
-  refundDays      Int @default(7)
+  refundDays           Int                  @default(7)
   /// Додаткові правила клубу (вільний текст).
-  extraRules      String?
+  extraRules           String?
   /// Налаштування клубу в спільному Telegram-боті: привітання, що показувати,
   /// повернення тих, хто давно не грав. Форма — lib/clubBot.ts (BotSettings);
   /// читати тільки через normalizeBotSettings: у базі може лежати що завгодно.
-  botSettings        Json                 @default("{}")
-  ledgerEntries      BookingLedgerEntry[]
-  id                 String               @id @default(uuid()) @db.Uuid
-  name               String
-  slug               String               @unique
+  botSettings          Json                 @default("{}")
+  ledgerEntries        BookingLedgerEntry[]
+  id                   String               @id @default(uuid()) @db.Uuid
+  name                 String
+  slug                 String               @unique
   /// IANA-таймзона, напр. "Europe/Kyiv". Уся конвертація рахується від неї.
-  timezone           String               @default("Europe/Kyiv")
+  timezone             String               @default("Europe/Kyiv")
   /// Телефон адміністратора. Показується у шапці віджета посиланням tel:
-  phone              String?
+  phone                String?
   /// Адреса клубу для шапки віджета: "Київ, вул. Хрещатик, 1"
-  address            String?
+  address              String?
   /// Логотип для шапки віджета. Абсолютний https-URL на чужому хостингу
   /// Зовнішнє посилання на логотип. Лишилось для клубів, у яких файл уже
   /// лежить на власному сайті — вставити адресу швидше, ніж вивантажувати.
-  logoUrl            String?
+  logoUrl              String?
 
   // ── Завантажений логотип ─────────────────────────────────────────────
   // Байти в базі, а не файл на диску: у Render файлова система ефемерна,
@@ -262,31 +262,44 @@ model Club {
   groupId String?    @db.Uuid
   group   ClubGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
 
+  /// Партнер (будівельник кортів), що привів клуб. Дата привʼязки — точка
+  /// відліку 12 місяців підвищеної ставки (lib/partnerCommission.ts).
+  partnerId         String?   @db.Uuid
+  partner           Partner?  @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+  partnerAttachedAt DateTime?
+
+  /// Згода власника: партнер бачить агрегати кортів (години, %), без гравців
+  /// і грошей. За замовчуванням вимкнено (lib/courtUsage.ts).
+  shareStatsWithPartner Boolean   @default(false)
+  shareStatsChangedAt   DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  courts        Court[]
-  hours         ClubHours[]
-  bookings      Booking[]
-  blocks        Block[]
-  users         User[]
-  customers     Customer[]
-  passes        Pass[]
-  payments      Payment[]
-  trainers      Trainer[]
-  invoices      ClubInvoice[]
-  passPlans     PassPlan[]
-  expenses      ClubExpense[]
-  promos        Promo[]
-  inventory     InventoryItem[]
-  rentals       BookingRental[]
-  waitlist      WaitlistEntry[]
-  resetRequests PasswordReset[]
-  shiftCloses   ShiftClose[]
+  courts          Court[]
+  hours           ClubHours[]
+  bookings        Booking[]
+  blocks          Block[]
+  users           User[]
+  customers       Customer[]
+  passes          Pass[]
+  payments        Payment[]
+  trainers        Trainer[]
+  invoices        ClubInvoice[]
+  receipts        PaymentReceipt[]
+  passPlans       PassPlan[]
+  expenses        ClubExpense[]
+  promos          Promo[]
+  inventory       InventoryItem[]
+  rentals         BookingRental[]
+  waitlist        WaitlistEntry[]
+  resetRequests   PasswordReset[]
+  shiftCloses     ShiftClose[]
   /// Коли ми підтвердили клуб після реєстрації. null = чекає на дзвінок/оплату.
   /// Впливає на віддачу даних для публічного віджета.
-  approvedAt    DateTime?
-  changeLogs    ChangeLog[]
+  approvedAt      DateTime?
+  changeLogs      ChangeLog[]
+  serviceRequests ServiceRequest[]
 
   // ── CRM оператора платформи ──────────────────────────────────────────
   // Клуб їх не бачить: це наші мітки й наш журнал роботи з клієнтом.
@@ -302,6 +315,7 @@ model Club {
   crmActivities CrmActivity[]
 
   @@index([groupId])
+  @@index([partnerId])
 }
 
 /// Кілька клубів-точок, якими оператор керує як однією мережею.
@@ -515,7 +529,63 @@ model ClubInvoice {
   issuedAt DateTime  @default(now())
   paidAt   DateTime?
 
+  /// К-{рік}-{5 цифр}. null — старі рядки без номера.
+  number String? @unique
+
+  /// На який наш профіль отримувача (рахунок) виставлено. SetNull: профіль
+  /// можна видалити, рахунок лишається.
+  sellerId String?        @db.Uuid
+  seller   SellerProfile? @relation(fields: [sellerId], references: [id], onDelete: SetNull)
+
+  receipts PaymentReceipt[]
+
   @@index([clubId, periodTo])
+  @@index([sellerId])
+}
+
+enum ReceiptStatus {
+  PENDING
+  CONFIRMED
+  REJECTED
+}
+
+enum ReceiptAiStatus {
+  PENDING
+  DONE
+  SKIPPED
+  FAILED
+}
+
+/// Квитанція про оплату рахунку. Байти в БД (як логотип): диск Render ефемерний.
+/// ШІ лише готує вердикт (aiResult), PAID ставить тільки оператор.
+model PaymentReceipt {
+  id        String      @id @default(uuid()) @db.Uuid
+  clubId    String      @db.Uuid
+  club      Club        @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  invoiceId String      @db.Uuid
+  invoice   ClubInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  fileData Bytes
+  mime     String
+  size     Int
+  /// Повторне завантаження того самого файлу -> 409
+  sha256   String @unique
+
+  uploadedBy String?
+  uploadedAt DateTime @default(now())
+
+  aiStatus    ReceiptAiStatus @default(PENDING)
+  aiResult    Json?
+  aiCheckedAt DateTime?
+
+  status       ReceiptStatus @default(PENDING)
+  reviewedBy   String?
+  reviewedAt   DateTime?
+  rejectReason String?
+
+  @@index([clubId, uploadedAt])
+  @@index([invoiceId])
+  @@index([status, uploadedAt])
 }
 
 /// Тренер клубу.
@@ -758,25 +828,27 @@ model ClubHours {
 }
 
 model Court {
-  id           String  @id @default(uuid()) @db.Uuid
-  clubId       String  @db.Uuid
-  club         Club    @relation(fields: [clubId], references: [id], onDelete: Cascade)
-  name         String
+  tournamentMatches TournamentMatch[]
+  id                String            @id @default(uuid()) @db.Uuid
+  clubId            String            @db.Uuid
+  club              Club              @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  name              String
   /// Ціна за годину в копійках. 45000 = 450,00 грн
-  pricePerHour Int     @default(0)
+  pricePerHour      Int               @default(0)
   /// Перевизначає Club.slotMinutes, якщо задано
-  slotMinutes  Int?
-  sortOrder    Int     @default(0)
-  isActive     Boolean @default(true)
+  slotMinutes       Int?
+  sortOrder         Int               @default(0)
+  isActive          Boolean           @default(true)
   /// Ролик про корт — канонічне посилання на YouTube або Vimeo. Саме відео
   /// в базі не лежить: це десятки мегабайт, і роздавати їх із Postgres нічим.
-  videoUrl     String?
+  videoUrl          String?
 
-  bookings Booking[]
-  blocks   Block[]
-  notes    Note[]
-  waitlist WaitlistEntry[]
-  photos   CourtPhoto[]
+  bookings        Booking[]
+  blocks          Block[]
+  notes           Note[]
+  waitlist        WaitlistEntry[]
+  photos          CourtPhoto[]
+  serviceRequests ServiceRequest[]
 
   @@index([clubId, isActive])
 }
@@ -855,6 +927,16 @@ model Booking {
   levelMax    SkillLevel?
 
   seats BookingSeat[]
+
+  /// Турнір: null = сітки ще немає. DRAFT — склад збирається, RUNNING —
+  /// матчі згенеровані й склад заблокований, FINISHED — правки закриті.
+  tournamentStatus  TournamentStatus?
+  /// Формат сітки. Поки лише SINGLE_ELIM; поле — на майбутнє.
+  tournamentFormat  String?
+  /// Матч за 3-є місце (раунд = останній, slot 1).
+  thirdPlace        Boolean           @default(false)
+  tournamentEntries TournamentEntry[]
+  tournamentMatches TournamentMatch[]
 
   /// Картка клієнта. Nullable: історичні броні до впровадження обліку
   customerId String?   @db.Uuid
@@ -1026,11 +1108,79 @@ enum SeatStatus {
 /// Скасоване місце лишається рядком, а не видаляється: клуб має бачити,
 /// хто записався й передумав, інакше «нас було восьмеро, чому порожньо»
 /// не буде на що відповісти.
+enum TournamentStatus {
+  DRAFT
+  RUNNING
+  FINISHED
+}
+
+enum TournamentMatchStatus {
+  PENDING
+  SCHEDULED
+  LIVE
+  DONE
+  WALKOVER
+  RETIRED
+}
+
+/// Учасник турніру: гравець або пара («Іван / Олег»). seed — місце посіву.
+model TournamentEntry {
+  id          String            @id @default(uuid()) @db.Uuid
+  bookingId   String            @db.Uuid
+  booking     Booking           @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  clubId      String            @db.Uuid
+  seatId      String?           @db.Uuid
+  seat        BookingSeat?      @relation(fields: [seatId], references: [id], onDelete: SetNull)
+  customerId  String?           @db.Uuid
+  customer    Customer?         @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  name        String
+  seed        Int
+  withdrawnAt DateTime?
+  createdAt   DateTime          @default(now())
+  matchesA    TournamentMatch[] @relation("MatchEntryA")
+  matchesB    TournamentMatch[] @relation("MatchEntryB")
+  matchesWon  TournamentMatch[] @relation("MatchWinner")
+
+  @@unique([bookingId, seed])
+  @@index([clubId])
+}
+
+/// Матч сітки на вибування. round/slot — позиція; sets — [{a,b}].
+model TournamentMatch {
+  id            String                @id @default(uuid()) @db.Uuid
+  bookingId     String                @db.Uuid
+  booking       Booking               @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  clubId        String                @db.Uuid
+  round         Int
+  slot          Int
+  entryAId      String?               @db.Uuid
+  entryBId      String?               @db.Uuid
+  entryA        TournamentEntry?      @relation("MatchEntryA", fields: [entryAId], references: [id], onDelete: SetNull)
+  entryB        TournamentEntry?      @relation("MatchEntryB", fields: [entryBId], references: [id], onDelete: SetNull)
+  sets          Json                  @default("[]")
+  winnerEntryId String?               @db.Uuid
+  winner        TournamentEntry?      @relation("MatchWinner", fields: [winnerEntryId], references: [id], onDelete: SetNull)
+  status        TournamentMatchStatus @default(PENDING)
+  courtId       String?               @db.Uuid
+  court         Court?                @relation(fields: [courtId], references: [id], onDelete: SetNull)
+  scheduledAt   DateTime?             @db.Timestamptz(3)
+  startedAt     DateTime?             @db.Timestamptz(3)
+  finishedAt    DateTime?             @db.Timestamptz(3)
+  note          String?
+  version       Int                   @default(0)
+  updatedBy     String?
+  updatedAt     DateTime              @updatedAt
+
+  @@unique([bookingId, round, slot])
+  @@index([clubId])
+}
+
 model BookingSeat {
-  ledgerEntries BookingLedgerEntry[]
-  id            String               @id @default(uuid()) @db.Uuid
-  bookingId     String               @db.Uuid
-  booking       Booking              @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  tournamentEntries TournamentEntry[]
+  ledgerEntries     BookingLedgerEntry[]
+  id                String               @id @default(uuid()) @db.Uuid
+  bookingId         String               @db.Uuid
+  booking           Booking              @relation(fields: [bookingId], references: [id], onDelete: Cascade)
 
   /// Картка клієнта — та сама, що й у звичайній броні. Nullable з тієї ж
   /// причини: історія важливіша за звʼязок, який може зникнути.
@@ -1249,20 +1399,21 @@ enum PassType {
 /// Картка учасника клубу. Створюється автоматично при першій броні —
 /// жодної реєстрації з боку клієнта не потрібно, ідентифікатор = телефон.
 model Customer {
-  bonusBalance    Int                  @default(0)
-  birthDate       DateTime?            @db.Date
+  tournamentEntries  TournamentEntry[]
+  bonusBalance       Int                  @default(0)
+  birthDate          DateTime?            @db.Date
   /// Згода з Правилами клубу й Політикою (lib/legal.ts), версія документів.
   termsAcceptedAt    DateTime?
   termsVersion       String?
   privacyNoticeAt    DateTime?
   /// Окрема згода на маркетинг і запрошення; null = згоди немає.
   marketingConsentAt DateTime?
-  discountPercent Int                  @default(0)
-  ledgerEntries   BookingLedgerEntry[]
-  rewards         CustomerReward[]
-  id              String               @id @default(uuid()) @db.Uuid
-  clubId          String               @db.Uuid
-  club            Club                 @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  discountPercent    Int                  @default(0)
+  ledgerEntries      BookingLedgerEntry[]
+  rewards            CustomerReward[]
+  id                 String               @id @default(uuid()) @db.Uuid
+  clubId             String               @db.Uuid
+  club               Club                 @relation(fields: [clubId], references: [id], onDelete: Cascade)
 
   name      String
   /// Нормалізований E.164, напр. +380671234567
@@ -1273,10 +1424,10 @@ model Customer {
   phoneTail String
 
   /// Особистий чат гравця з ботом. Заповнює /start p_<код> (lib/playerBot.ts).
-  telegramChatId String?
+  telegramChatId     String?
   /// Одноразовий код привʼязки з профілю у віджеті, живе 15 хвилин.
-  tgLinkCode     String?   @unique
-  tgLinkUntil    DateTime?
+  tgLinkCode         String?   @unique
+  tgLinkUntil        DateTime?
   /// Згода на акції й «повернення» в Telegram. null — нічого маркетингового
   /// не надсилаємо. Ставиться кнопкою в боті, знімається кнопкою «Не
   /// надсилати таке» або /stop.
@@ -1922,9 +2073,14 @@ model Lead {
   club       Club?         @relation(fields: [clubId], references: [id], onDelete: SetNull)
   activities CrmActivity[]
 
+  /// Партнер, що порекомендував цей лід
+  partnerId String?  @db.Uuid
+  partner   Partner? @relation(fields: [partnerId], references: [id], onDelete: SetNull)
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
+  @@index([partnerId])
   @@index([stage])
   @@index([nextActionAt])
   @@index([city])
@@ -1951,4 +2107,189 @@ model CrmActivity {
   @@index([leadId, createdAt])
   @@index([clubId, createdAt])
   @@index([kind, doneAt, dueAt])
+}
+
+/// Партнер — будівельник кортів. Окремий вхід, не повʼязаний ні з User, ні з
+/// оператором. Бачить лише свої клуби/ліди й свою винагороду (docs/partner-panel-spec.md).
+model Partner {
+  id             String    @id @default(uuid()) @db.Uuid
+  /// ПІБ контактної особи
+  name           String
+  company        String?
+  /// lower-case
+  email          String    @unique
+  phone          String?
+  passwordHash   String
+  /// 6–10 символів [a-z0-9], для ?ref=
+  refCode        String    @unique
+  /// Відсотки: перші 12 місяців від привʼязки / далі
+  rateFirstYear  Int       @default(50)
+  rateAfter      Int       @default(20)
+  isActive       Boolean   @default(true)
+  note           String?
+  pinFails       Int       @default(0)
+  pinLockedUntil DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  /// Реквізити партнера (docs/partner-paperwork-spec.md)
+  kind            PartnerKind?
+  legalName       String?
+  /// РНОКПП (ФОП, 10 цифр) / ЄДРПОУ (ТОВ, 8 цифр)
+  legalCode       String?
+  taxInfo         String?
+  vatPayer        Boolean              @default(false)
+  iban            String?
+  bankName        String?
+  legalAddress    String?
+  signerName      String?
+  signerBasis     String?
+  docsEmail       String?
+  kvedConfirmed   Boolean              @default(false)
+  requisitesAt    DateTime?
+  contractMode    PartnerContractMode?
+  offerAcceptedAt DateTime?
+  offerVersion    String?
+  offerIp         String?
+  /// Реквізити обох сторін і версія на момент акцепту
+  offerSnapshot   Json?
+  /// Для INDIVIDUAL
+  contractNo      String?
+  contractDate    DateTime?
+
+  clubs           Club[]
+  leads           Lead[]
+  payouts         PartnerPayout[]
+  acts            PartnerAct[]
+  serviceRequests ServiceRequest[]
+}
+
+/// Виплати партнеру — вносить оператор.
+model PartnerPayout {
+  id        String      @id @default(uuid()) @db.Uuid
+  partnerId String      @db.Uuid
+  partner   Partner     @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  /// Копійки
+  amount    Int
+  paidAt    DateTime
+  note      String?
+  createdAt DateTime    @default(now())
+  act       PartnerAct?
+
+  @@index([partnerId, paidAt])
+}
+
+enum SellerKind {
+  FOP
+  TOV
+  INDIVIDUAL
+}
+
+enum PartnerKind {
+  FOP
+  TOV
+}
+
+enum PartnerContractMode {
+  PUBLIC_OFFER
+  INDIVIDUAL
+}
+
+enum PartnerActStatus {
+  DRAFT
+  ISSUED
+  SIGNED
+  PAID
+  VOID
+}
+
+/// Наші реквізити отримувача (оператор). Кілька профілів, один isDefault.
+model SellerProfile {
+  id          String     @id @default(uuid()) @db.Uuid
+  kind        SellerKind
+  /// «ФОП Рясний, Моно» — для вибору
+  label       String
+  /// ФОП ПІБ / ТОВ «…» / ПІБ
+  legalName   String
+  /// РНОКПП або ЄДРПОУ
+  code        String
+  taxInfo     String?
+  /// UA + 27 цифр, mod-97
+  iban        String
+  bankName    String?
+  address     String?
+  signerName  String?
+  signerBasis String?
+  email       String?
+  phone       String?
+  isDefault   Boolean    @default(false)
+  isActive    Boolean    @default(true)
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  invoices ClubInvoice[]
+}
+
+/// Квартальний акт наданих послуг партнера.
+model PartnerAct {
+  id              String           @id @default(uuid()) @db.Uuid
+  partnerId       String           @db.Uuid
+  partner         Partner          @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  /// «А-2026-Q3-0001»
+  number          String           @unique
+  /// [periodFrom, periodTo)
+  periodFrom      DateTime
+  periodTo        DateTime
+  /// Копійки, винагорода за період
+  amount          Int
+  lines           Json
+  sellerSnapshot  Json
+  partnerSnapshot Json
+  status          PartnerActStatus @default(DRAFT)
+  issuedAt        DateTime?
+  signedAt        DateTime?
+  paidAt          DateTime?
+  /// PartnerPayout, створений при «Оплачено»
+  payoutId        String?          @unique @db.Uuid
+  payout          PartnerPayout?   @relation(fields: [payoutId], references: [id], onDelete: SetNull)
+  note            String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  @@unique([partnerId, periodFrom])
+  @@index([status])
+}
+
+enum ServiceRequestStatus {
+  NEW
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+/// Заявка на сервіс від клубу (ремонт, заміна покриття, тощо).
+/// Видима партнеру, якому привʼязаний клуб.
+model ServiceRequest {
+  id        String  @id @default(uuid()) @db.Uuid
+  clubId    String  @db.Uuid
+  club      Club    @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  partnerId String  @db.Uuid
+  partner   Partner @relation(fields: [partnerId], references: [id], onDelete: Cascade)
+  courtId   String? @db.Uuid
+  court     Court?  @relation(fields: [courtId], references: [id], onDelete: SetNull)
+
+  /// repair|surface|nets|lighting|other
+  kind         String
+  /// 5–2000 символів
+  message      String
+  contactName  String?
+  contactPhone String?
+  status       ServiceRequestStatus @default(NEW)
+  partnerNote  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([partnerId, status])
+  @@index([clubId])
 }

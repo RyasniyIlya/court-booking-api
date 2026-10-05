@@ -12,6 +12,7 @@ import { stripeKeys } from '../../lib/payments/stripe';
 import { BACKDROP_STYLES } from '../../lib/backdrop';
 import { Prisma } from '@prisma/client';
 import { LEGAL_VERSION } from '../../lib/legal';
+import { recordChanges } from '../../lib/changeLog';
 import { analyticsThresholdsSchema, readAnalyticsThresholds } from '../../lib/analyticsThresholds';
 
 export const clubRouter = Router();
@@ -48,6 +49,7 @@ clubRouter.get(
         where: {
           id: req.auth!.clubId,
         },
+        include: { partner: { select: { company: true, name: true } } },
       });
 
     if (!club) {
@@ -57,6 +59,9 @@ clubRouter.get(
     }
 
     res.json({
+      shareStatsWithPartner: club.shareStatsWithPartner,
+      hasPartner: Boolean(club.partnerId),
+      partnerCompany: club.partner ? (club.partner.company ?? club.partner.name) : null,
       name: club.name,
       slug: club.slug,
       timezone: club.timezone,
@@ -523,6 +528,39 @@ clubRouter.patch(
         readAnalyticsThresholds(club.analyticsThresholds),
       ...legalFields(club),
     });
+  },
+);
+
+/**
+ * PUT /api/admin/club/share-stats — згода власника показувати партнеру-будівельнику
+ * агрегати кортів (години, %). Тільки OWNER; лише коли в клубу є партнер.
+ */
+clubRouter.put(
+  '/club/share-stats',
+  requireAuth,
+  requireRole('OWNER'),
+  async (req, res) => {
+    const parsed = z.object({ share: z.boolean() }).safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+    const clubId = req.auth!.clubId;
+    const club = await prisma.club.findUnique({
+      where: { id: clubId },
+      select: { partnerId: true, shareStatsWithPartner: true },
+    });
+    if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+    if (!club.partnerId) return res.status(409).json({ error: 'NO_PARTNER' });
+    const share = parsed.data.share;
+    if (club.shareStatsWithPartner !== share) {
+      await prisma.club.update({ where: { id: clubId }, data: { shareStatsWithPartner: share, shareStatsChangedAt: new Date() } });
+      const who = await prisma.user.findUnique({ where: { id: req.auth!.userId }, select: { email: true, role: true } });
+      await recordChanges(
+        prisma,
+        { clubId, entity: 'CLUB', entityId: clubId },
+        { userId: req.auth!.userId, email: who?.email ?? '', role: who?.role ?? req.auth!.role },
+        [{ field: 'shareStatsWithPartner', before: club.shareStatsWithPartner, after: share }],
+      ).catch((e) => console.error('[change log] share-stats', e));
+    }
+    res.json({ shareStatsWithPartner: share });
   },
 );
 

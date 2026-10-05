@@ -3,6 +3,7 @@ import { z } from 'zod';
 import bcrypt from 'bcryptjs';
 import { hashPassword } from '../lib/passwordHash';
 import jwt from 'jsonwebtoken';
+import { randomBytes } from 'node:crypto';
 import rateLimit from 'express-rate-limit';
 
 import { prisma } from '../lib/db';
@@ -14,9 +15,20 @@ import { COURT_PRICING, courtMultiplier, courtPrice, isCustomQuote } from '../li
 import { EMPTY_BUNDLE, clubListPrice, healthOf, loadClubMetrics } from '../lib/platformMetrics';
 import { fmtDate, fmtUah, systemNote } from '../lib/platformJournal';
 import { nextPeriod, periodAmount } from '../lib/subscription';
+import { nextInvoiceNumbers } from '../lib/clubInvoice';
+import { grantSubscription } from '../lib/grantSubscription';
+import { receiptsRouter } from './platformReceipts';
 import { sendMessage } from '../lib/telegram';
 import { telegramHtml } from '../lib/telegramHtml';
 import { requirePlatformAuth, platformCredentialVersion } from '../lib/platformAuth';
+import { buildPartnerCommissions } from './partner';
+import { buildPartnersReport, partnersReportSheets, REPORT_DATE_RE } from '../lib/partnerReport';
+import { buildWorkbook, XLSX_CONTENT_TYPE } from '../lib/xlsx';
+import { paperworkRouter } from './platformPaperwork';
+import {
+  PARTNER_CONTRACT_SELECT, PARTNER_REQUISITES_SELECT, contractView, defaultSellerId, partnerReadiness,
+  requisitesView,
+} from '../lib/partnerRequisites';
 
 export const platformRouter = Router();
 
@@ -144,6 +156,8 @@ platformRouter.get('/clubs', requirePlatformAuth, async (_req, res) => {
         plan: { select: PLAN_SELECT },
         group: { select: { id: true, name: true } },
         lead: { select: { id: true, stage: true } },
+        partnerId: true,
+        partnerAttachedAt: true,
         createdAt: true,
         users: {
           where: { role: 'OWNER' },
@@ -994,72 +1008,15 @@ platformRouter.post('/clubs/:id/subscription', requirePlatformAuth, async (req, 
 
   const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
 
-  const club = await prisma.club.findUnique({
-    where: { id },
-    select: {
-      id: true,
-      name: true,
-      paidUntil: true,
-      billingPeriod: true,
-      planPrice: true,
-      plan: { select: PLAN_SELECT },
-      users: { where: { role: 'OWNER' }, select: { tgChatId: true }, take: 1 },
-      /* Ціна залежить від кількості АКТИВНИХ кортів: вимкнений корт клуб
-         не використовує і платити за нього не мусить. */
-      _count: { select: { courts: { where: { isActive: true } } } },
-    },
+  /* Спільний шлях із підтвердженням квитанції: lib/grantSubscription.ts */
+  const result = await grantSubscription({
+    clubId: id,
+    ...parsed.data,
+    actorEmail: req.platformAuth?.email,
   });
+  if (!result) return res.status(404).json({ error: 'NOT_FOUND' });
 
-  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
-
-  const period = parsed.data.period ?? club.plan?.period ?? club.billingPeriod;
-  const { from, to } = nextPeriod(club.paidUntil, period);
-  const amount =
-    parsed.data.amount ?? periodAmount(club.plan, club.planPrice, period, club._count.courts);
-
-  const [invoice, updated] = await prisma.$transaction([
-    prisma.clubInvoice.create({
-      data: {
-        clubId: club.id,
-        periodFrom: from,
-        periodTo: to,
-        amount,
-        status: 'PAID',
-        paidAt: new Date(),
-        method: parsed.data.method || null,
-        note: parsed.data.note || null,
-      },
-    }),
-    prisma.club.update({
-      where: { id: club.id },
-      /* billingPeriod підтягується за виданим періодом: клуб, який перейшов
-         з місяця на рік, має бачити в кабінеті рік, а не старий підпис. */
-      data: { paidUntil: to, billingPeriod: period },
-      include: { plan: { select: PLAN_SELECT } },
-    }),
-    prisma.crmActivity.create(
-      systemNote(
-        club.id,
-        `Зараховано оплату: ${PERIOD_LABEL[period]} · ${fmtUah(amount)}, до ${fmtDate(to)}`,
-        req.platformAuth?.email,
-      ),
-    ),
-  ]);
-
-  /* Власнику — рядок у Telegram. Не «дякуємо за оплату», а дата: єдине, що
-     він хотів дізнатись, коли переказував гроші. */
-  const tgChatId = club.users[0]?.tgChatId;
-  if (tgChatId) {
-    await sendMessage(
-      tgChatId,
-      `✅ Оплату зараховано. Обслуговування ${telegramHtml(club.name)} діє до ${to.toLocaleDateString('uk-UA')}.`,
-    ).catch(() => {
-      /* Бот вимкнений або чат заблокований. Гроші вже зараховані, і валити
-         через це відповідь оператору не можна. */
-    });
-  }
-
-  res.json({ ok: true, club: updated, invoice });
+  res.json({ ok: true, club: result.club, invoice: result.invoice });
 });
 
 /** Зарахувати однаковий період усім точкам мережі. amount — за одну точку. */
@@ -1095,9 +1052,14 @@ platformRouter.post('/groups/:id/subscription', requirePlatformAuth, async (req,
     };
   });
 
-  await prisma.$transaction(rows.flatMap((row) => [
+  const sellerId = await defaultSellerId();
+  const numbers = await nextInvoiceNumbers(rows.length);
+
+  await prisma.$transaction(rows.flatMap((row, i) => [
     prisma.clubInvoice.create({
       data: {
+        ...(sellerId ? { sellerId } : {}),
+        ...(numbers[i] ? { number: numbers[i] } : {}),
         clubId: row.club.id,
         periodFrom: row.from,
         periodTo: row.to,
@@ -1183,6 +1145,7 @@ platformRouter.get('/clubs/:id/invoices', requirePlatformAuth, async (req, res) 
     where: { clubId: id },
     orderBy: { periodTo: 'desc' },
     take: 24,
+    include: { seller: { select: { id: true, label: true } } },
   });
 
   res.json(rows);
@@ -1247,4 +1210,238 @@ platformRouter.post('/invoices/:id/void', requirePlatformAuth, async (req, res) 
   });
 
   res.json({ ok: true, rolledBack: rolled.count > 0 });
+});
+
+/* -------------------------------------------------------------------------- */
+/* ПАРТНЕРИ (будівельники кортів)                                              */
+/* -------------------------------------------------------------------------- */
+
+const PARTNER_ADMIN_SELECT = {
+  id: true, name: true, company: true, email: true, phone: true, refCode: true,
+  rateFirstYear: true, rateAfter: true, isActive: true, note: true,
+  pinLockedUntil: true, createdAt: true,
+  ...PARTNER_REQUISITES_SELECT, ...PARTNER_CONTRACT_SELECT,
+  _count: { select: { clubs: true, leads: true } },
+} as const;
+
+/** Вигляд партнера для оператора: поля, лічильники, готовність, договір, реквізити. */
+function adminPartnerView<P extends { _count: { clubs: number; leads: number } } & Parameters<typeof partnerReadiness>[0] & Parameters<typeof requisitesView>[0] & Parameters<typeof contractView>[0]>(p: P) {
+  const { _count, ...rest } = p;
+  const keep: Record<string, unknown> = { ...rest };
+  for (const k of Object.keys(PARTNER_REQUISITES_SELECT)) delete keep[k];
+  for (const k of Object.keys(PARTNER_CONTRACT_SELECT)) delete keep[k];
+  const { ready, missing } = partnerReadiness(p);
+  const contract = contractView(p);
+  return {
+    ...keep,
+    clubsCount: _count.clubs,
+    leadsCount: _count.leads,
+    ready,
+    missing,
+    contractMode: contract.mode,
+    offerAcceptedAt: contract.offerAcceptedAt,
+    offerVersion: contract.offerVersion,
+    contractNo: contract.contractNo,
+    contractDate: contract.contractDate,
+    requisites: requisitesView(p),
+  };
+}
+
+function genRefCode(): string {
+  const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
+  return Array.from(randomBytes(8), (b) => alphabet[b % alphabet.length]).join('');
+}
+
+function genTempPassword(): string {
+  const alphabet = 'abcdefghjkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  return Array.from(randomBytes(12), (b) => alphabet[b % alphabet.length]).join('');
+}
+
+const isUniqueError = (e: unknown) => (e as { code?: string })?.code === 'P2002';
+
+platformRouter.use(paperworkRouter);
+platformRouter.use(receiptsRouter);
+
+/* Звіт — ДО /partners/:id, щоб «report» не потрапив у :id */
+const reportQuery = z.object({
+  from: z.string().regex(REPORT_DATE_RE).refine((v) => DateTime.fromISO(v).isValid).optional(),
+  to: z.string().regex(REPORT_DATE_RE).refine((v) => DateTime.fromISO(v).isValid).optional(),
+  partnerId: z.string().uuid().optional(),
+});
+
+platformRouter.get('/partners/report', requirePlatformAuth, async (req, res) => {
+  const parsed = reportQuery.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  res.json(await buildPartnersReport(parsed.data));
+});
+
+platformRouter.get('/partners/report.xlsx', requirePlatformAuth, async (req, res) => {
+  const parsed = reportQuery.safeParse(req.query);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const report = await buildPartnersReport(parsed.data);
+  const buf = buildWorkbook(partnersReportSheets(report));
+  res.setHeader('Content-Type', XLSX_CONTENT_TYPE);
+  res.setHeader('Content-Disposition', 'attachment; filename="partners-report.xlsx"');
+  res.setHeader('Cache-Control', 'no-store');
+  res.send(buf);
+});
+
+platformRouter.get('/partners', requirePlatformAuth, async (_req, res) => {
+  const partners = await prisma.partner.findMany({
+    select: PARTNER_ADMIN_SELECT,
+    orderBy: { createdAt: 'desc' },
+  });
+  res.json(partners.map(adminPartnerView));
+});
+
+const partnerRate = z.number().int().min(0).max(100);
+
+platformRouter.post('/partners', requirePlatformAuth, async (req, res) => {
+  const parsed = z
+    .object({
+      name: z.string().trim().min(2).max(120),
+      company: z.string().trim().max(160).optional(),
+      email: z.string().trim().email().toLowerCase(),
+      phone: z.string().trim().max(30).optional(),
+      rateFirstYear: partnerRate.optional(),
+      rateAfter: partnerRate.optional(),
+      note: z.string().trim().max(1000).optional(),
+    })
+    .safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const d = parsed.data;
+
+  const tempPassword = genTempPassword();
+  const passwordHash = await hashPassword(tempPassword, 12);
+
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const partner = await prisma.partner.create({
+        data: {
+          name: d.name,
+          company: d.company || null,
+          email: d.email,
+          phone: d.phone || null,
+          passwordHash,
+          refCode: genRefCode(),
+          ...(d.rateFirstYear !== undefined ? { rateFirstYear: d.rateFirstYear } : {}),
+          ...(d.rateAfter !== undefined ? { rateAfter: d.rateAfter } : {}),
+          note: d.note || null,
+        },
+        select: PARTNER_ADMIN_SELECT,
+      });
+      /* Тимчасовий пароль показуємо лише тут, один раз. */
+      return res.status(201).json({ ...adminPartnerView(partner), tempPassword });
+    } catch (e) {
+      if (!isUniqueError(e)) throw e;
+      const taken = await prisma.partner.findUnique({ where: { email: d.email }, select: { id: true } });
+      if (taken) return res.status(409).json({ error: 'EMAIL_ALREADY_EXISTS' });
+      /* інакше колізія refCode — пробуємо новий */
+    }
+  }
+  res.status(500).json({ error: 'INTERNAL' });
+});
+
+platformRouter.patch('/partners/:id', requirePlatformAuth, async (req, res) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const parsed = z
+    .object({
+      rateFirstYear: partnerRate.optional(),
+      rateAfter: partnerRate.optional(),
+      isActive: z.boolean().optional(),
+      note: z.string().trim().max(1000).nullable().optional(),
+    })
+    .strict()
+    .safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const existing = await prisma.partner.findUnique({ where: { id }, select: { id: true } });
+  if (!existing) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const partner = await prisma.partner.update({
+    where: { id },
+    data: parsed.data,
+    select: PARTNER_ADMIN_SELECT,
+  });
+  res.json(adminPartnerView(partner));
+});
+
+/** POST /partners/:id/password — новий тимчасовий пароль, показується один раз. */
+platformRouter.post('/partners/:id/password', requirePlatformAuth, async (req, res) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const existing = await prisma.partner.findUnique({ where: { id }, select: { id: true } });
+  if (!existing) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const tempPassword = genTempPassword();
+  const passwordHash = await hashPassword(tempPassword, 12);
+  await prisma.partner.update({ where: { id }, data: { passwordHash, pinFails: 0, pinLockedUntil: null } });
+  res.json({ ok: true, tempPassword });
+});
+
+/** PATCH /clubs/:id/partner {partnerId|null} — привʼязка клубу до партнера. */
+platformRouter.patch('/clubs/:id/partner', requirePlatformAuth, async (req, res) => {
+  const clubId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const parsed = z.object({ partnerId: z.string().uuid().nullable() }).strict().safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const { partnerId } = parsed.data;
+
+  const club = await prisma.club.findUnique({ where: { id: clubId }, select: { id: true } });
+  if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  let partnerName: string | null = null;
+  if (partnerId) {
+    const partner = await prisma.partner.findUnique({ where: { id: partnerId }, select: { id: true, name: true, company: true } });
+    if (!partner) return res.status(404).json({ error: 'PARTNER_NOT_FOUND' });
+    partnerName = partner.company || partner.name;
+  }
+
+  const attachedAt = partnerId ? new Date() : null;
+  await prisma.$transaction(async (tx) => {
+    await tx.club.update({
+      where: { id: clubId },
+      data: { partnerId, partnerAttachedAt: attachedAt },
+    });
+    await tx.crmActivity.create(
+      systemNote(
+        clubId,
+        partnerId ? `Клуб привʼязано до партнера «${partnerName}»` : 'Привʼязку клубу до партнера знято',
+        req.platformAuth?.email,
+      ),
+    );
+  });
+
+  res.json({ ok: true, partnerId, partnerAttachedAt: attachedAt });
+});
+
+platformRouter.get('/partners/:id/commissions', requirePlatformAuth, async (req, res) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const result = await buildPartnerCommissions(id);
+  if (!result) return res.status(404).json({ error: 'NOT_FOUND' });
+  res.json(result);
+});
+
+platformRouter.post('/partners/:id/payouts', requirePlatformAuth, async (req, res) => {
+  const id = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const parsed = z
+    .object({
+      amount: z.number().int().min(1).max(1_000_000_000),
+      paidAt: z.string().datetime({ offset: true }).or(z.string().date()).optional(),
+      note: z.string().trim().max(500).optional(),
+    })
+    .safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+
+  const existing = await prisma.partner.findUnique({ where: { id }, select: { id: true } });
+  if (!existing) return res.status(404).json({ error: 'NOT_FOUND' });
+
+  const payout = await prisma.partnerPayout.create({
+    data: {
+      partnerId: id,
+      amount: parsed.data.amount,
+      paidAt: parsed.data.paidAt ? new Date(parsed.data.paidAt) : new Date(),
+      note: parsed.data.note || null,
+    },
+    select: { id: true, amount: true, paidAt: true, note: true },
+  });
+  res.status(201).json(payout);
 });

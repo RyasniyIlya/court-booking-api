@@ -3,6 +3,7 @@ import { Router } from 'express';
 import { authRouter } from './auth';
 import { bookingsRouter } from './bookings';
 import { attendanceRouter } from './attendance';
+import { tournamentsRouter } from './tournaments';
 import { bookingSearchRouter } from './bookingSearch';
 import { shiftRouter } from './shift';
 import { ledgerRouter } from './ledger';
@@ -17,6 +18,7 @@ import { logoRouter } from './logo';
 import { telegramRouter } from './telegram';
 import { botSettingsRouter } from './botSettings';
 import { billingRouter } from './billing';
+import { receiptsRouter } from './receipts';
 import { blocksRouter } from './blocks';
 import { customersRouter } from './customers';
 import { passesRouter } from './passes';
@@ -26,6 +28,7 @@ import { promosRouter } from './promos';
 import { inventoryRouter } from './inventory';
 import { rentalsRouter } from './rentals';
 import { aiRouter } from './ai';
+import { serviceRequestsRouter } from './serviceRequests';
 import { requireAuth, blockAccountant } from './shared';
 
 /**
@@ -50,6 +53,7 @@ adminRouter.use(requireAuth, blockAccountant);
 /* Пошук перед bookingsRouter: /bookings/search не має впасти в /bookings/:id. */
 adminRouter.use(bookingSearchRouter);
 adminRouter.use(bookingsRouter);
+adminRouter.use(tournamentsRouter);
 adminRouter.use(attendanceRouter);
 adminRouter.use(refundsRouter);
 adminRouter.use(settlementsRouter);
@@ -67,6 +71,8 @@ adminRouter.use(logoRouter);
 adminRouter.use(telegramRouter);
 adminRouter.use(botSettingsRouter);
 adminRouter.use(billingRouter);
+/* Квитанції йдуть сирим тілом (express.raw) на власному шляху. */
+adminRouter.use(receiptsRouter);
 adminRouter.use(blocksRouter);
 adminRouter.use(customersRouter);
 adminRouter.use(passesRouter);
@@ -79,6 +85,7 @@ adminRouter.use(promosRouter);
 adminRouter.use(inventoryRouter);
 adminRouter.use(rentalsRouter);
 adminRouter.use(aiRouter);
+adminRouter.use(serviceRequestsRouter);
 
 // analytics.ts монтується окремо в index.ts (src/index.ts), але захищає
 // свої роути тим самим requireAuth/requireRole, що й кабінет.
