@@ -23,6 +23,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { readdirSync, readFileSync } from 'node:fs';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -772,7 +773,8 @@ if (NO_API) {
     PUBLIC_WEB_URL: 'http://localhost:5175',
   };
   console.log(`\nСтартую API на http://localhost:${API_PORT} (ізольована база). Ctrl+C — зупинити.\n`);
-  const child = spawn('npx tsx watch src/index.ts', { env, cwd: ROOT, stdio: 'inherit', shell: true });
+  const tsxCli = createRequire(import.meta.url).resolve('tsx/cli');
+  const child = spawn(process.execPath, [tsxCli, 'watch', 'src/index.ts'], { env, cwd: ROOT, stdio: 'inherit' });
   const stop = () => { child.kill(); shutdown(0); };
   process.on('SIGINT', stop);
   process.on('SIGTERM', stop);

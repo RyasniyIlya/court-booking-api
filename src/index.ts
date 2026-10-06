@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import { timingSafeEqual } from 'node:crypto';
 import cors from 'cors';
+import compression from 'compression';
 import { publicRouter } from './routes/public';
 import { assistantRouter } from './routes/assistant';
 import { adminRouter } from './routes/admin';
@@ -27,6 +28,8 @@ import { paymentsSecretReady } from './lib/crypto';
 import { payGeneralLimiter, publicGeneralLimiter } from './lib/rateLimits';
 
 const app = express();
+// Content negotiation, Vary and streaming are handled by standard middleware.
+app.use(compression({ threshold: 1024 }));
 
 // За Render/Vercel завжди один хоп реверс-проксі: без цього req.ip показує
 // адресу проксі, а не клієнта, і express-rate-limit або лічить усіх одним

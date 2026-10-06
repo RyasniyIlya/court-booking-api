@@ -27,6 +27,7 @@ beforeEach(() => {
 it('віддає сітку з іменами й стороною переможця, без телефонів', async () => {
   const r = await request(app).get(`/tournaments/${ID}`);
   expect(r.status).toBe(200);
+  expect(r.headers['cache-control']).toBe('public, max-age=5, s-maxage=5, must-revalidate');
   expect(r.body).toMatchObject({ status: 'RUNNING', court: { name: 'Корт 1' }, club: { brandColor: '#123456' } });
   expect(r.body.entries).toEqual([{ name: 'Іван', seed: 1 }, { name: 'Олег', seed: 2 }]);
   expect(r.body.matches[0]).toMatchObject({ a: 'Іван', b: 'Олег', winner: 'B', court: 'Корт 2', status: 'DONE' });

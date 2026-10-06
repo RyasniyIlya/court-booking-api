@@ -44,3 +44,5 @@ tmp/
 .DS_Store
 Thumbs.db
 desktop.ini
+# Local package/tool cache.
+.npm-cache/

@@ -95,6 +95,15 @@ courtsRouter.post(
             .number()
             .int()
             .default(0),
+
+        /* Порожній рядок і null — «без групи». */
+        groupName:
+          z
+            .string()
+            .trim()
+            .max(40)
+            .nullable()
+            .optional(),
       })
       .safeParse(req.body);
 
@@ -111,6 +120,10 @@ courtsRouter.post(
           slotMinutes:
             parsed.data
               .slotMinutes ??
+            null,
+          groupName:
+            parsed.data
+              .groupName ||
             null,
           clubId:
             req.auth!.clubId,
@@ -167,6 +180,15 @@ courtsRouter.patch(
             .boolean()
             .optional(),
 
+        /* Порожній рядок і null — «без групи». */
+        groupName:
+          z
+            .string()
+            .trim()
+            .max(40)
+            .nullable()
+            .optional(),
+
         /* Порожній рядок і null — «ролика немає». */
         videoUrl:
           z
@@ -189,6 +211,7 @@ courtsRouter.patch(
     const data: Omit<typeof parsed.data, 'videoUrl'> & { videoUrl?: string | null } = {
       ...parsed.data,
     };
+    if (parsed.data.groupName !== undefined) data.groupName = parsed.data.groupName || null;
 
     /* У базу лягає не те, що вписав клуб, а канонічна адреса, зібрана з
        розпізнаного ідентифікатора: віджет кладе її в <iframe>, і чужому

@@ -237,7 +237,8 @@ publicRouter.get('/tournaments/:id', async (req, res) => {
     return res.status(404).json({ error: 'NOT_FOUND' });
   }
   const nameOf = new Map(booking.tournamentEntries.map((e) => [e.id, e.name]));
-  res.set('Cache-Control', 'no-store');
+  // Public DTO only. Keep live scores within the board's ten-second refresh.
+  res.set('Cache-Control', 'public, max-age=5, s-maxage=5, must-revalidate');
   res.json({
     id: booking.id,
     title: booking.title,
@@ -328,6 +329,7 @@ publicRouter.get('/clubs/:slug', async (req, res) => {
       name: c.name,
       pricePerHour: c.pricePerHour,
       slotMinutes: c.slotMinutes ?? club.slotMinutes,
+      groupName: c.groupName,
       /* Обкладинка перша. Порожній список і null — віджет малює рядок
          корту як раніше, без галереї. */
       photos: c.photos.map((p) => courtPhotoUrl(p.id)),
@@ -741,6 +743,7 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
     return {
       courtId: court.id,
       courtName: court.name,
+      groupName: court.groupName ?? null,
       pricePerHour: court.pricePerHour,
       slots: slots.map((s) => {
         const sMs = Date.parse(s.start);

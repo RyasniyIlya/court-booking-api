@@ -4,6 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "test:federation:migration": "node scripts/verify-federation-migration.mjs",
+    "test:federation:linking": "tsx scripts/verify-player-linking.mjs",
     "dev": "tsx watch src/index.ts",
     "dev:safe": "node scripts/dev-local.mjs",
     "dev:isolated": "tsx scripts/dev-isolated.mjs",
@@ -28,6 +30,7 @@
   "dependencies": {
     "@prisma/client": "6.16.3",
     "bcryptjs": "^3.0.3",
+    "compression": "^1.8.2",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
@@ -47,6 +50,7 @@
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.8",
     "@electric-sql/pglite-socket": "^0.2.11",
+    "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",

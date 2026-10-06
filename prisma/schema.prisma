@@ -81,10 +81,14 @@ enum UserRole {
 
 /// Спортивний клуб = один тенант SaaS
 model Club {
-  settlementSettings  Json  @default("{}")
+  playerRatings          ClubPlayerRating[]
+  federationPartnerships ClubFederation[]
+  interclubTournaments   TournamentClub[]
+  ratingChanges          RatingChange[]
+  settlementSettings     Json               @default("{}")
   /// Цілі й пороги екрана аналітики: { occupancy, cancellation, retention }, %.
   /// null = дефолти веб-клієнта. Форма — lib/analyticsThresholds.ts.
-  analyticsThresholds Json?
+  analyticsThresholds    Json?
 
   // ── Юридичні дані й оферта (docs/legal) ──────────────────────────────
   /// Коли власник прийняв оферту й умови обробки ПД, і яку версію (lib/legal.ts).
@@ -888,6 +892,10 @@ model Court {
   slotMinutes       Int?
   sortOrder         Int               @default(0)
   isActive          Boolean           @default(true)
+  /// Група кортів, яку клуб назвав сам: «Падел», «Сквош», «Басейн». Гравець
+  /// у віджеті спершу обирає групу, потім бачить тільки її майданчики.
+  /// null = без групи; якщо груп у клубі менше двох, вибір не показується.
+  groupName         String?
   /// Ролик про корт — канонічне посилання на YouTube або Vimeo. Саме відео
   /// в базі не лежить: це десятки мегабайт, і роздавати їх із Postgres нічим.
   videoUrl          String?
@@ -922,21 +930,26 @@ model CourtPhoto {
 }
 
 model Booking {
+  tournamentScope    TournamentScope      @default(CLUB)
+  federationId       String?              @db.Uuid
+  federation         Federation?          @relation(fields: [federationId], references: [id], onDelete: Restrict)
+  federationCode     String?
+  participatingClubs TournamentClub[]
   /// Мітка «в Telegram уже запитали про оцінку тренера» (lib/trainerRating.ts).
-  rateAskedAt    DateTime?
-  trainerRatings TrainerRating[]
-  reschedules    BookingReschedule[]
-  paymentPlan    Json                 @default("{}")
-  createdBy      String?
-  confirmedBy    String?
-  confirmedAt    DateTime?
-  ledgerEntries  BookingLedgerEntry[]
-  id             String               @id @default(uuid()) @db.Uuid
+  rateAskedAt        DateTime?
+  trainerRatings     TrainerRating[]
+  reschedules        BookingReschedule[]
+  paymentPlan        Json                 @default("{}")
+  createdBy          String?
+  confirmedBy        String?
+  confirmedAt        DateTime?
+  ledgerEntries      BookingLedgerEntry[]
+  id                 String               @id @default(uuid()) @db.Uuid
   /// Денормалізовано навмисно: усі адмінські вибірки йдуть по клубу
-  clubId         String               @db.Uuid
-  club           Club                 @relation(fields: [clubId], references: [id], onDelete: Cascade)
-  courtId        String               @db.Uuid
-  court          Court                @relation(fields: [courtId], references: [id], onDelete: Cascade)
+  clubId             String               @db.Uuid
+  club               Club                 @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  courtId            String               @db.Uuid
+  court              Court                @relation(fields: [courtId], references: [id], onDelete: Cascade)
 
   /// Копія на момент броні — імʼя в картці клієнта може змінитись пізніше.
   ///
@@ -1101,6 +1114,7 @@ model Booking {
   /// Snapshot автора отмены: роль и email на момент действия.
   cancelledBy Json?
 
+  @@unique([federationId, federationCode])
   @@index([clubId, startTime])
   /// Звіт «виручка за каналами» групує за каналом у межах періоду.
   @@index([clubId, trafficChannel, startTime])
@@ -1110,6 +1124,7 @@ model Booking {
   @@index([status, expiresAt])
   @@index([trainerId, startTime])
   @@index([seriesId])
+  @@index([federationId, tournamentScope, startTime])
 }
 
 /// Історія перенесень незалежна від редагованого плану оплати.
@@ -1177,6 +1192,8 @@ enum TournamentMatchStatus {
 
 /// Учасник турніру: гравець або пара («Іван / Олег»). seed — місце посіву.
 model TournamentEntry {
+  playerId    String?           @db.Uuid
+  player      Player?           @relation(fields: [playerId], references: [id], onDelete: Restrict)
   id          String            @id @default(uuid()) @db.Uuid
   bookingId   String            @db.Uuid
   booking     Booking           @relation(fields: [bookingId], references: [id], onDelete: Cascade)
@@ -1194,11 +1211,13 @@ model TournamentEntry {
   matchesWon  TournamentMatch[] @relation("MatchWinner")
 
   @@unique([bookingId, seed])
+  @@index([playerId])
   @@index([clubId])
 }
 
 /// Матч сітки на вибування. round/slot — позиція; sets — [{a,b}].
 model TournamentMatch {
+  ratingChanges RatingChange[]
   id            String                @id @default(uuid()) @db.Uuid
   bookingId     String                @db.Uuid
   booking       Booking               @relation(fields: [bookingId], references: [id], onDelete: Cascade)
@@ -1224,6 +1243,9 @@ model TournamentMatch {
   updatedAt     DateTime              @updatedAt
 
   @@unique([bookingId, round, slot])
+  @@index([entryAId])
+  @@index([entryBId])
+  @@index([winnerEntryId])
   @@index([clubId])
 }
 
@@ -1454,6 +1476,8 @@ enum PassType {
 /// Картка учасника клубу. Створюється автоматично при першій броні —
 /// жодної реєстрації з боку клієнта не потрібно, ідентифікатор = телефон.
 model Customer {
+  playerId           String?              @db.Uuid
+  player             Player?              @relation(fields: [playerId], references: [id], onDelete: SetNull)
   trainerRatings     TrainerRating[]
   tournamentEntries  TournamentEntry[]
   bonusBalance       Int                  @default(0)
@@ -1557,6 +1581,7 @@ model Customer {
   /// Телефон унікальний у межах клубу, а не глобально:
   /// одна людина може ходити у два клуби — це різні картки.
   @@unique([clubId, phone])
+  @@index([playerId])
   /// Звіт «що приводить нових клієнтів» групує саме за цією парою.
   @@index([clubId, firstChannel])
   @@index([clubId, phoneTail])
@@ -2348,4 +2373,147 @@ model ServiceRequest {
 
   @@index([partnerId, status])
   @@index([clubId])
+}
+
+enum TournamentScope {
+  CLUB
+  INTERCLUB
+  FEDERATION
+}
+
+enum RatingLevelSource {
+  AUTO
+  MANUAL
+}
+
+enum RatingType {
+  CLUB
+  FEDERATION
+}
+
+enum RatingChangeKind {
+  MATCH
+  MANUAL
+  IMPORT
+  REVERSAL
+}
+
+enum FederationPartnershipStatus {
+  PENDING
+  CONFIRMED
+  REVOKED
+}
+
+/// Platform identity. Matching a phone does not confer authentication rights.
+model Player {
+  id                    String             @id @default(uuid()) @db.Uuid
+  phone                 String             @unique
+  name                  String
+  phoneVerifiedAt       DateTime?          @db.Timestamptz(3)
+  eloFederation         Int                @default(1200)
+  federationMatchCount  Int                @default(0)
+  lastFederationMatchAt DateTime?          @db.Timestamptz(3)
+  levelSource           RatingLevelSource  @default(AUTO)
+  manualLevel           String?
+  federationId          String?            @db.Uuid
+  federation            Federation?        @relation(fields: [federationId], references: [id], onDelete: Restrict)
+  federationPlayerCode  String?
+  customers             Customer[]
+  clubRatings           ClubPlayerRating[]
+  tournamentEntries     TournamentEntry[]
+  ratingChanges         RatingChange[]
+  createdAt             DateTime           @default(now()) @db.Timestamptz(3)
+  updatedAt             DateTime           @updatedAt @db.Timestamptz(3)
+
+  @@unique([federationId, federationPlayerCode])
+  @@index([eloFederation, id])
+}
+
+model ClubPlayerRating {
+  clubId      String            @db.Uuid
+  playerId    String            @db.Uuid
+  club        Club              @relation(fields: [clubId], references: [id], onDelete: Restrict)
+  player      Player            @relation(fields: [playerId], references: [id], onDelete: Restrict)
+  eloClub     Int               @default(1200)
+  matchCount  Int               @default(0)
+  lastMatchAt DateTime?         @db.Timestamptz(3)
+  levelSource RatingLevelSource @default(AUTO)
+  manualLevel String?
+  updatedAt   DateTime          @updatedAt @db.Timestamptz(3)
+
+  @@id([clubId, playerId])
+  @@index([clubId, eloClub, playerId])
+  @@index([playerId])
+}
+
+model Federation {
+  id           String           @id @default(uuid()) @db.Uuid
+  name         String
+  code         String           @unique
+  logoUrl      String?
+  players      Player[]
+  tournaments  Booking[]
+  partnerships ClubFederation[]
+  createdAt    DateTime         @default(now()) @db.Timestamptz(3)
+  updatedAt    DateTime         @updatedAt @db.Timestamptz(3)
+}
+
+model ClubFederation {
+  clubId       String                      @db.Uuid
+  federationId String                      @db.Uuid
+  club         Club                        @relation(fields: [clubId], references: [id], onDelete: Restrict)
+  federation   Federation                  @relation(fields: [federationId], references: [id], onDelete: Restrict)
+  status       FederationPartnershipStatus @default(PENDING)
+  confirmedAt  DateTime?                   @db.Timestamptz(3)
+  confirmedBy  String?
+
+  @@id([clubId, federationId])
+  @@index([federationId, status])
+}
+
+model TournamentClub {
+  bookingId String  @db.Uuid
+  clubId    String  @db.Uuid
+  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  club      Club    @relation(fields: [clubId], references: [id], onDelete: Restrict)
+
+  @@id([bookingId, clubId])
+  @@index([clubId])
+}
+
+/// Append-only audit. Corrections append REVERSAL events, never overwrite history.
+model RatingChange {
+  id                 String           @id @default(uuid()) @db.Uuid
+  playerId           String           @db.Uuid
+  player             Player           @relation(fields: [playerId], references: [id], onDelete: Restrict)
+  matchId            String?          @db.Uuid
+  /// Optional live reference; matchId above remains the immutable audit identifier.
+  matchRefId         String?          @db.Uuid
+  match              TournamentMatch? @relation(fields: [matchRefId], references: [id], onDelete: SetNull)
+  clubId             String?          @db.Uuid
+  club               Club?            @relation(fields: [clubId], references: [id], onDelete: Restrict)
+  ratingType         RatingType
+  kind               RatingChangeKind
+  before             Int
+  after              Int
+  matchCountBefore   Int              @default(0)
+  matchCountAfter    Int              @default(0)
+  lastMatchAtBefore  DateTime?        @db.Timestamptz(3)
+  lastMatchAtAfter   DateTime?        @db.Timestamptz(3)
+  matchVersion       Int?
+  calculationVersion String?
+  changedBy          String
+  reason             String
+  /// Stable scope/player/match/version key, also used for manual request retries.
+  idempotencyKey     String           @unique
+  reversesId         String?          @unique @db.Uuid
+  reverses           RatingChange?    @relation("RatingReversal", fields: [reversesId], references: [id], onDelete: Restrict)
+  reversal           RatingChange?    @relation("RatingReversal")
+  effectiveAt        DateTime         @db.Timestamptz(3)
+  createdAt          DateTime         @default(now()) @db.Timestamptz(3)
+
+  @@index([playerId, ratingType, effectiveAt, id])
+  @@index([clubId, playerId, effectiveAt])
+  @@index([matchId, matchVersion])
+  @@index([matchRefId])
 }
