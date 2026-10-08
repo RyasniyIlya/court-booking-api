@@ -3,7 +3,7 @@ import { DateTime } from 'luxon';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
-import { planFeatures } from '../../lib/plans';
+import { planFeatures, telegramAnalytics } from '../../lib/plans';
 import { botReady } from '../../lib/telegram';
 import { clubStartPayload } from '../../lib/botBooking';
 import {
@@ -28,7 +28,9 @@ import { requireAuth, requireRole } from './shared';
  * платіжні налаштування.
  *
  * Перегляд відкритий на будь-якому тарифі (кабінет показує замок і
- * пояснення), а зберегти можна лише там, де бот є в тарифі.
+ * пояснення), а зберегти можна лише там, де бот є в тарифі. Бот є на кожному
+ * призначеному тарифі; аналітичні розсилки (повернення клієнтів, зведення)
+ * — лише на «Аналітика», їх вмикання закрите окремо (`analyticsAllowed`).
  */
 export const botSettingsRouter = Router();
 
@@ -79,6 +81,7 @@ botSettingsRouter.get('/bot-settings', async (req, res) => {
   res.json({
     settings: normalizeBotSettings(club.botSettings),
     planAllows: planFeatures(club.plan).telegram,
+    analyticsAllowed: telegramAnalytics(club.plan),
     botReady: botReady() && Boolean(username),
     botUsername: username,
     clubLink: username ? `https://t.me/${username}?start=${clubStartPayload(club.slug)}` : null,
@@ -95,7 +98,7 @@ botSettingsRouter.get('/bot-settings', async (req, res) => {
 botSettingsRouter.put('/bot-settings', async (req, res) => {
   const clubId = req.auth!.clubId;
 
-  const club = await prisma.club.findUnique({ where: { id: clubId }, select: { plan: true } });
+  const club = await prisma.club.findUnique({ where: { id: clubId }, select: { plan: true, botSettings: true } });
   if (!club) return res.status(404).json({ error: 'NOT_FOUND' });
 
   if (!planFeatures(club.plan).telegram) {
@@ -105,6 +108,17 @@ botSettingsRouter.put('/bot-settings', async (req, res) => {
   const parsed = botSettingsSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
   const input = parsed.data;
+
+  /* Повернення клієнтів — аналітичний шар. Заборонено саме ВМИКАТИ (було
+     вимкнено, стало ввімкнено): клуб, що зійшов з «Аналітики» з уже
+     ввімкненим поверненням, усе одно зможе зберегти решту налаштувань. */
+  if (
+    input.winback.enabled
+    && !normalizeBotSettings(club.botSettings).winback.enabled
+    && !telegramAnalytics(club.plan)
+  ) {
+    return res.status(403).json({ error: 'PLAN_REQUIRED', feature: 'analytics' });
+  }
 
   /* Ідентифікатори приходять від клієнта. Акція чи тренер чужого клубу
      в списку «показувати» не повинні ні зберегтись, ні вплинути на те, що

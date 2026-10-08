@@ -112,6 +112,45 @@ export function winnerBySets(sets: SetScore[]): Side | null {
   return a > b ? 'A' : 'B';
 }
 
+/**
+ * Переможець за сетами з порогом: сторона має ≥ setsToWin виграних сетів,
+ * а суперник — менше. Без порога (legacy) — як winnerBySets.
+ */
+export function decisiveBySets(sets: SetScore[], setsToWin?: number | null): Side | null {
+  if (!setsToWin) return winnerBySets(sets);
+  let a = 0;
+  let b = 0;
+  for (const s of sets) {
+    if (s.a > s.b) a++;
+    else if (s.b > s.a) b++;
+  }
+  if (a >= setsToWin && b < setsToWin) return 'A';
+  if (b >= setsToWin && a < setsToWin) return 'B';
+  return null;
+}
+
+/** Переможець за завершеними (за правилами) сетами; незавершений сет не рахується. */
+export function decisiveCompleteSets(sets: SetScore[], sc: SetScoring): Side | null {
+  let a = 0;
+  let b = 0;
+  for (const s of sets) {
+    if (!sc.isSetComplete(s.a, s.b)) continue;
+    if (s.a > s.b) a++; else b++;
+  }
+  if (a >= sc.setsToWin && b < sc.setsToWin) return 'A';
+  if (b >= sc.setsToWin && a < sc.setsToWin) return 'B';
+  return null;
+}
+
+/** Чи є сети після того, як матч уже вирішено, або їх більше 2N-1. */
+export function tooManySets(sets: SetScore[], setsToWin: number): boolean {
+  if (sets.length > 2 * setsToWin - 1) return true;
+  for (let i = 1; i < sets.length; i++) {
+    if (decisiveBySets(sets.slice(0, i), setsToWin)) return true;
+  }
+  return false;
+}
+
 export type MatchPatch = {
   entryAId?: string | null;
   entryBId?: string | null;
@@ -194,10 +233,21 @@ export function applyPatches(
   }
 }
 
+/** Правила сету для турніру з налаштуваннями (див. lib/sportRules.ts). */
+export type SetScoring = {
+  setsToWin: number;
+  isSetComplete: (a: number, b: number) => boolean;
+  isSetPossible: (a: number, b: number) => boolean;
+};
+
 export type MatchInput = {
   sets?: SetScore[];
   winner?: Side | null;
   status?: MatchStatus;
+  /** Скільки сетів треба виграти (null/undefined — legacy: більше сетів). */
+  setsToWin?: number | null;
+  /** Правила рахунку з tournamentSettings; без них — legacy-логіка. */
+  scoring?: SetScoring | null;
 };
 
 export type MatchCurrent = {
@@ -210,7 +260,7 @@ export type MatchCurrent = {
 
 export type MatchResolution =
   | { ok: true; sets: SetScore[]; status: MatchStatus; winnerEntryId: string | null }
-  | { ok: false; error: 'MATCH_NOT_READY' | 'WINNER_REQUIRED' };
+  | { ok: false; error: 'MATCH_NOT_READY' | 'WINNER_REQUIRED' | 'SCORE_NOT_FINAL' | 'TOO_MANY_SETS' | 'BAD_SET_SCORE' };
 
 /**
  * Звести те, що прислали, у новий стан матчу: рахунок, статус, переможець.
@@ -228,6 +278,22 @@ export function resolveMatchUpdate(cur: MatchCurrent, input: MatchInput): MatchR
   const forced = input.status === 'WALKOVER' || input.status === 'RETIRED';
   const ready = cur.entryAId != null && cur.entryBId != null;
 
+  const sc = input.scoring ?? null;
+  const stw = sc ? sc.setsToWin : (input.setsToWin ?? null);
+  const bySets = (x: SetScore[]) => (sc ? decisiveCompleteSets(x, sc) : decisiveBySets(x, stw));
+  if (sc && !forced) {
+    for (let i = 0; i < sets.length; i++) {
+      const s = sets[i];
+      if (!sc.isSetPossible(s.a, s.b) || (i < sets.length - 1 && !sc.isSetComplete(s.a, s.b))) {
+        return { ok: false, error: 'BAD_SET_SCORE' };
+      }
+    }
+    if (sets.length > 2 * sc.setsToWin - 1) return { ok: false, error: 'TOO_MANY_SETS' };
+    for (let i = 1; i < sets.length; i++) {
+      if (decisiveCompleteSets(sets.slice(0, i), sc)) return { ok: false, error: 'TOO_MANY_SETS' };
+    }
+  } else if (stw && !forced && tooManySets(sets, stw)) return { ok: false, error: 'TOO_MANY_SETS' };
+
   let side: Side | null;
   let status: MatchStatus;
 
@@ -239,14 +305,15 @@ export function resolveMatchUpdate(cur: MatchCurrent, input: MatchInput): MatchR
     side = null;
     status = open(input.status) ?? 'PENDING';
   } else if (input.winner) {
+    if (sc && bySets(sets) !== input.winner) return { ok: false, error: 'SCORE_NOT_FINAL' };
     side = input.winner;
     status = 'DONE';
   } else if (input.status === 'DONE') {
-    side = winnerBySets(sets) ?? curSide;
-    if (!side) return { ok: false, error: 'WINNER_REQUIRED' };
+    side = bySets(sets) ?? (stw && (sc || input.sets !== undefined) ? null : curSide);
+    if (!side) return { ok: false, error: stw ? 'SCORE_NOT_FINAL' : 'WINNER_REQUIRED' };
     status = 'DONE';
   } else if (input.sets !== undefined) {
-    side = winnerBySets(sets);
+    side = bySets(sets);
     status = side ? 'DONE' : (open(input.status) ?? (isFinished(cur) ? 'LIVE' : cur.status));
   } else if (input.status) {
     // Повернення в незавершений статус знімає й переможця.

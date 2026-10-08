@@ -13,6 +13,9 @@ import { platformRouter } from './routes/platform';
 import { platformCrmRouter } from './routes/platformCrm';
 import { platformAnalyticsRouter } from './routes/platformAnalytics';
 import { partnerRouter } from './routes/partner';
+import { federationRouter, federationProvisionRouter, federationRawParser } from './routes/federation';
+import { playerProfilesRouter, publicFederationRouter } from './routes/playerProfiles';
+import { requireFederationAuth } from './lib/federationAuth';
 import { requirePlatformAuth } from './lib/platformAuth';
 import { payRouter } from './routes/pay';
 import { startExpirySweeper } from './lib/expire';
@@ -29,7 +32,8 @@ import { payGeneralLimiter, publicGeneralLimiter } from './lib/rateLimits';
 
 const app = express();
 // Content negotiation, Vary and streaming are handled by standard middleware.
-app.use(compression({ threshold: 1024 }));
+// SSE-потік табло не стискаємо: gzip буферизує і гальмує пуші.
+app.use(compression({ threshold: 1024, filter: (req, res) => !req.path.endsWith('/stream') && compression.filter(req, res) }));
 
 // За Render/Vercel завжди один хоп реверс-проксі: без цього req.ip показує
 // адресу проксі, а не клієнта, і express-rate-limit або лічить усіх одним
@@ -55,7 +59,7 @@ app.use((req, res, next) => {
   }
   // Персональні дані не мають осідати в спільних кешах. Це лише значення
   // за замовчуванням: маршрут, що ставить свій Cache-Control, перекриє його.
-  if (req.path.startsWith('/api/admin') || req.path.startsWith('/api/platform') || req.path.startsWith('/api/partner')) {
+  if (req.path.startsWith('/api/admin') || req.path.startsWith('/api/platform') || req.path.startsWith('/api/partner') || req.path.startsWith('/api/federation')) {
     res.set('Cache-Control', 'no-store');
   }
   next();
@@ -76,6 +80,8 @@ app.use(
   (req, res, next) => (req.method === 'OPTIONS' ? next() : requirePlatformAuth(req, res, next)),
   express.json({ limit: '5mb' }),
 );
+app.use('/api/federation/import/preview', (req, res, next) => req.method === 'OPTIONS' ? next() : requireFederationAuth(req, res, next), federationRawParser[1]);
+app.use('/api/federation/import', (req, res, next) => req.method === 'OPTIONS' ? next() : requireFederationAuth(req, res, next), express.json({ limit: '1mb' }));
 app.use(express.json({ limit: '100kb' }));
 
 // Віджет вантажиться на чужих доменах — публічне API відкрите для всіх
@@ -122,7 +128,7 @@ app.use('/api/platform', cors({
 }));
 
 // Кабінет партнера (будівельники кортів) — той самий origin-allowlist.
-app.use('/api/partner', cors({
+app.use(['/api/partner', '/api/federation'], cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
     if (adminOrigins.includes(origin.replace(/\/+$/, ''))) return cb(null, true);
@@ -135,18 +141,22 @@ app.use('/api/partner', cors({
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
 app.use('/api/public', publicRouter);
+app.use('/api/public', publicFederationRouter);
 app.use('/api/public', assistantRouter);
 app.use('/api/admin/finance', financeRouter);
 app.use('/api/admin', adminRouter);
+app.use('/api/admin', playerProfilesRouter);
 app.use('/api/admin/analytics', analyticsRouter);
 /* Вивантаження бази клубу — окремо від analyticsRouter і без
    requireFeature('analytics'): дані клубу (броні, клієнти) належать
    власнику на будь-якому тарифі, див. коментар у routes/export.ts. */
 app.use('/api/admin/export', exportRouter);
 app.use('/api/platform', platformRouter);
+app.use('/api/platform', federationProvisionRouter);
 app.use('/api/platform', platformCrmRouter);
 app.use('/api/platform', platformAnalyticsRouter);
 app.use('/api/partner', partnerRouter);
+app.use('/api/federation', federationRouter);
 
 /**
  * Вебхук Telegram. Це єдиний шлях для вхідних команд: фоновий polling

@@ -711,6 +711,10 @@ async function seed() {
 let summary;
 try {
   summary = await seed();
+  if (argv.includes('--federation')) {
+    const { seedFederationDemo } = await import('./seed-federation-demo.mjs');
+    summary.federation = await seedFederationDemo(prisma, summary.club, DEMO_PASSWORD);
+  }
 } catch (e) {
   console.error('Сід не вдався:', e);
   await prisma.$disconnect();
@@ -730,6 +734,10 @@ console.log(`Логіни (ТІЛЬКИ ДЕМО, пароль для всіх: 
 for (const u of USERS) console.log(`  ${u.role.padEnd(10)} ${u.email}`);
 console.log(`  ${'OPERATOR'.padEnd(10)} ${OPERATOR_EMAIL}   → /platform`);
 console.log(`  ${'PARTNER'.padEnd(10)} ${PARTNER_EMAIL}    → /partner`);
+if (summary.federation) {
+  console.log(`  FEDERATION federation@demo.test → /federation (пароль ${DEMO_PASSWORD})`);
+  console.log('Federation demo pages:', JSON.stringify(summary.federation));
+}
 console.log('Партнерські документи:', JSON.stringify({
   sellers: await prisma.sellerProfile.count(),
   invoicesWithSeller: await prisma.clubInvoice.count({ where: { sellerId: { not: null } } }),

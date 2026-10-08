@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import { sportsSchema } from '../../lib/sport';
 import { comparePassword, hashPassword } from '../../lib/passwordHash';
 import rateLimit from 'express-rate-limit';
 
@@ -69,6 +70,8 @@ const registerSchema = z.object({
     .trim()
     .max(30)
     .optional(),
+
+  sports: sportsSchema.optional(),
 
   /* Реф-код партнера (?ref=). Невідомий або неактивний — ігноруємо мовчки. */
   ref: z.string().trim().toLowerCase().max(32).optional(),
@@ -158,6 +161,7 @@ authRouter.post('/register', registerLimiter, async (req, res) => {
             name: data.clubName,
             slug: data.slug,
             phone: data.phone ?? null,
+            ...(data.sports ? { sports: data.sports } : {}),
 
             approvedAt: null,
 

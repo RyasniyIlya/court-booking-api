@@ -25,6 +25,7 @@ import { signCustomerToken, verifyCustomerToken } from '../lib/customerAuth';
 import { hashCustomerPassword, passwordText, verifyCustomerPassword } from '../lib/customerPassword';
 import { birthDateText, birthDateValue, dateOnly } from '../lib/birthday';
 import { isRegistrationOpen, registrationClosesAt } from '../lib/registrationCutoff';
+import { publicTournamentDto, subscribe } from '../lib/tournamentLive';
 import { isTournament, resolveJoinPayment, tournamentPayMode } from '../lib/tournamentPay';
 import { courtPriceWithPromos, bestPromo, promoPrice } from '../lib/promo';
 import { courtPhotoUrl, trainerPhotoUrl } from '../lib/courtMedia';
@@ -42,6 +43,8 @@ import { TelegramMiniAppDataError, verifyTelegramMiniAppData } from '../lib/tele
 import {
   RentalError, listRentables, loadOccupancy, lockRentableItems, previewRentals, rentalCreateData, reserveRentals,
 } from '../lib/rentalStore';
+import { publicSportRules } from '../lib/sportRules';
+import { createTtlCache } from '../lib/ttlCache';
 import { MAX_RENT_LINES, MAX_RENT_QUANTITY, findShortages } from '../lib/rentals';
 
 /** Бот налаштований і план клубу дозволяє Telegram */
@@ -177,6 +180,23 @@ async function loadClub(slug: string) {
 }
 
 /**
+ * loadClub із кешем на 10 с — ТІЛЬКИ для read-only GET-хендлерів віджета
+ * (картка клубу, тренери, доступність): вони б'ють по 12 SQL-запитів на
+ * кожен показ, перемикання дати й вибір слота.
+ *
+ * Записи (броні, join, вхід/реєстрація клієнта, telegram-сесія) і далі
+ * викликають свіжий loadClub, тож перевірки ціни й активних кортів при
+ * записі ніколи не бувають застарілими. Після правки в адмінці віджет
+ * побачить зміну не пізніше ніж за 10 с. Хендлери кешований обʼєкт не
+ * мутують. null (клуб не знайдено) кешується теж — проти ботів на хибний slug.
+ */
+const clubReadCache = createTtlCache<Awaited<ReturnType<typeof loadClub>>>(10_000, 500);
+
+function loadClubForRead(slug: string) {
+  return clubReadCache.get(slug, () => loadClub(slug));
+}
+
+/**
  * Адреса логотипа для віджета й кабінету.
  *
  * Завантажений файл б'є зовнішнє посилання: якщо клуб вивантажив картинку,
@@ -212,60 +232,73 @@ const BUSY_STATUSES = ['PENDING', 'CONFIRMED'] as const;
 /* Табло турніру для екрана в клубі. Ключ — uuid брони, його не вгадати;
    віддаємо лише назву, час, корт, статус і сітку з іменами — жодних
    телефонів і службових id учасників. */
+publicRouter.get('/sport-rules', (_req, res) => {
+  res.set('Cache-Control', 'public, max-age=3600');
+  res.json(publicSportRules());
+});
+
 publicRouter.get('/tournaments/:id', async (req, res) => {
   if (!z.string().uuid().safeParse(req.params.id).success) {
     return res.status(404).json({ error: 'NOT_FOUND' });
   }
-  const booking = await prisma.booking.findUnique({
-    where: { id: req.params.id },
-    select: {
-      id: true, title: true, capacity: true, startTime: true, status: true,
-      tournamentStatus: true, thirdPlace: true,
-      court: { select: { name: true } },
-      club: { select: { name: true, brandColor: true } },
-      tournamentEntries: { select: { id: true, name: true, seed: true }, orderBy: { seed: 'asc' } },
-      tournamentMatches: {
-        select: {
-          round: true, slot: true, entryAId: true, entryBId: true, winnerEntryId: true,
-          sets: true, status: true, scheduledAt: true, court: { select: { name: true } },
-        },
-        orderBy: [{ round: 'asc' }, { slot: 'asc' }],
-      },
-    },
-  });
-  if (!booking || !isTournament(booking) || booking.status === 'CANCELLED') {
-    return res.status(404).json({ error: 'NOT_FOUND' });
+  const dto = await publicTournamentDto(req.params.id);
+  if (!dto) return res.status(404).json({ error: 'NOT_FOUND' });
+  // Живий рахунок: CDN тримає відповідь 1 с (захист від натовпу екранів), браузер не кешує.
+  res.set('Cache-Control', 'public, max-age=0, s-maxage=1, must-revalidate');
+  res.json(dto);
+});
+
+/* SSE-потік табло: повний знімок на кожну зміну (без дельт — нічого не губиться
+   і не приходить не в порядку). Pub/sub у пам'яті одного інстанса; якщо API
+   запущено в кількох, клієнт лишається на поллінгу (див. useLiveTournament). */
+const MAX_STREAMS_IP = 20, MAX_STREAMS_ALL = 2000;
+const streamsByIp = new Map<string, number>();
+let streamsTotal = 0;
+publicRouter.get('/tournaments/:id/stream', async (req, res) => {
+  const id = req.params.id;
+  if (!z.string().uuid().safeParse(id).success) return res.status(404).json({ error: 'NOT_FOUND' });
+  const ip = req.ip ?? 'unknown';
+  if (streamsTotal >= MAX_STREAMS_ALL || (streamsByIp.get(ip) ?? 0) >= MAX_STREAMS_IP) {
+    return res.status(429).json({ error: 'TOO_MANY_STREAMS' });
   }
-  const nameOf = new Map(booking.tournamentEntries.map((e) => [e.id, e.name]));
-  // Public DTO only. Keep live scores within the board's ten-second refresh.
-  res.set('Cache-Control', 'public, max-age=5, s-maxage=5, must-revalidate');
-  res.json({
-    id: booking.id,
-    title: booking.title,
-    startTime: booking.startTime,
-    court: booking.court,
-    club: booking.club,
-    status: booking.tournamentStatus,
-    thirdPlace: booking.thirdPlace,
-    entries: booking.tournamentEntries.map((e) => ({ name: e.name, seed: e.seed })),
-    matches: booking.tournamentMatches.map((m) => ({
-      round: m.round,
-      slot: m.slot,
-      a: m.entryAId ? nameOf.get(m.entryAId) ?? null : null,
-      b: m.entryBId ? nameOf.get(m.entryBId) ?? null : null,
-      sets: m.sets,
-      winner: m.winnerEntryId
-        ? (m.winnerEntryId === m.entryAId ? 'A' : m.winnerEntryId === m.entryBId ? 'B' : null)
-        : null,
-      status: m.status,
-      court: m.court?.name ?? null,
-      scheduledAt: m.scheduledAt,
-    })),
-  });
+  // Місце займаємо до await, щоб паралельні відкриття не обійшли ліміт.
+  streamsTotal++; streamsByIp.set(ip, (streamsByIp.get(ip) ?? 0) + 1);
+  let unsub = () => {}, ping: ReturnType<typeof setInterval> | undefined, closed = false;
+  const cleanup = () => {
+    if (closed) return;
+    closed = true; unsub(); clearInterval(ping);
+    streamsTotal--;
+    const n = (streamsByIp.get(ip) ?? 1) - 1;
+    if (n > 0) streamsByIp.set(ip, n); else streamsByIp.delete(ip);
+  };
+  req.on('close', cleanup);
+  const flush = () => (res as unknown as { flush?: () => void }).flush?.();
+  try {
+    const dto = await publicTournamentDto(id);
+    if (closed) return;
+    if (!dto) { cleanup(); return res.status(404).json({ error: 'NOT_FOUND' }); }
+    res.set({
+      'Content-Type': 'text/event-stream; charset=utf-8',
+      'Cache-Control': 'no-store, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no',
+    });
+    res.flushHeaders();
+    let seq = 0;
+    const send = (json: string) => { res.write(`id: ${++seq}\nevent: snapshot\ndata: ${json}\n\n`); flush(); };
+    res.write('retry: 2000\n\n');
+    send(JSON.stringify(dto));
+    unsub = subscribe(id, send);
+    ping = setInterval(() => { res.write(': ping\n\n'); flush(); }, 20_000);
+  } catch (e) {
+    cleanup();
+    console.error('[tournament stream] failed', e);
+    if (!res.headersSent) res.status(500).json({ error: 'INTERNAL' });
+  }
 });
 
 publicRouter.get('/clubs/:slug', async (req, res) => {
-  const club = await loadClub(req.params.slug);
+  const club = await loadClubForRead(req.params.slug);
   if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
 
   const billing = clubBilling(club);
@@ -503,7 +536,7 @@ publicRouter.get('/clubs/:slug/trainers', async (req, res) => {
   }).safeParse(req.query);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
 
-  const club = await loadClub(req.params.slug);
+  const club = await loadClubForRead(req.params.slug);
   if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
 
   const { start, end } = parsed.data;
@@ -596,7 +629,7 @@ publicRouter.get('/clubs/:slug/availability', async (req, res) => {
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST', details: parsed.error.flatten() });
   const { date, courtId } = parsed.data;
 
-  const club = await loadClub(req.params.slug);
+  const club = await loadClubForRead(req.params.slug);
   if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
 
   // Онлайн-запис вимкнено — сітки просто немає. Порожній список кортів, а не

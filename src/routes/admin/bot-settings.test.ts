@@ -50,6 +50,7 @@ const FOREIGN = '99999999-9999-4999-8999-999999999999';
 const T1 = '33333333-3333-4333-8333-333333333333';
 
 const PLAN3 = { tier: 3, featTrainers: true, featGroups: true, featAnalytics: true };
+const PLAN1 = { tier: 1, featTrainers: false, featGroups: false, featAnalytics: false };
 const clubRow = (over: Record<string, unknown> = {}) => ({
   name: 'Squash', slug: 'squash', address: 'вул. Київська, 1', phone: '+380671112233',
   timezone: 'Europe/Kyiv', botSettings: {}, plan: PLAN3, ...over,
@@ -129,11 +130,23 @@ describe('GET /bot-settings', () => {
     expect(prisma.customer.count.mock.calls.every((c) => c[0].where.clubId === 'club-1')).toBe(true);
   });
 
-  it('тариф без Telegram: читання працює, planAllows=false', async () => {
-    prisma.club.findUnique.mockResolvedValue(clubRow({ plan: { ...PLAN3, tier: 2 } }));
+  it('клуб без плану: читання працює, planAllows=false, analyticsAllowed=false', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow({ plan: null }));
     const res = await request(app).get('/api/admin/bot-settings');
     expect(res.status).toBe(200);
     expect(res.body.planAllows).toBe(false);
+    expect(res.body.analyticsAllowed).toBe(false);
+  });
+
+  it('«Броні» (tier 1): Telegram є, аналітики в Telegram немає', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow({ plan: PLAN1 }));
+    const res = await request(app).get('/api/admin/bot-settings');
+    expect(res.body).toMatchObject({ planAllows: true, analyticsAllowed: false });
+  });
+
+  it('«Аналітика» (tier 3): analyticsAllowed=true', async () => {
+    const res = await request(app).get('/api/admin/bot-settings');
+    expect(res.body).toMatchObject({ planAllows: true, analyticsAllowed: true });
   });
 
   it('бот не підключений: botReady=false, clubLink=null', async () => {
@@ -181,12 +194,35 @@ describe('PUT /bot-settings', () => {
     expect(res.body.settings.displayName).toBeNull();
   });
 
-  it('тариф без Telegram — 403 PLAN_REQUIRED, нічого не пишемо', async () => {
-    prisma.club.findUnique.mockResolvedValue(clubRow({ plan: { ...PLAN3, tier: 2 } }));
+  it('клуб без плану — 403 PLAN_REQUIRED, нічого не пишемо', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow({ plan: null }));
     const res = await request(app).put('/api/admin/bot-settings').send(body());
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({ error: 'PLAN_REQUIRED', feature: 'telegram' });
     expect(prisma.club.update).not.toHaveBeenCalled();
+  });
+
+  it('«Броні»: зберегти налаштування можна, а увімкнути повернення клієнтів — ні', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow({ plan: PLAN1 }));
+
+    const ok = await request(app).put('/api/admin/bot-settings').send(body({ showPhone: false }));
+    expect(ok.status).toBe(200);
+
+    prisma.club.update.mockClear();
+    const res = await request(app).put('/api/admin/bot-settings').send(body({
+      winback: { ...defaultBotSettings().winback, enabled: true },
+    }));
+    expect(res.status).toBe(403);
+    expect(res.body).toMatchObject({ error: 'PLAN_REQUIRED', feature: 'analytics' });
+    expect(prisma.club.update).not.toHaveBeenCalled();
+  });
+
+  it('«Аналітика»: повернення клієнтів вмикається', async () => {
+    const res = await request(app).put('/api/admin/bot-settings').send(body({
+      winback: { ...defaultBotSettings().winback, enabled: true },
+    }));
+    expect(res.status).toBe(200);
+    expect(res.body.settings.winback.enabled).toBe(true);
   });
 
   it('клуб без плану — теж 403', async () => {

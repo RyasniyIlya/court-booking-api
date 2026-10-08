@@ -262,15 +262,15 @@ describe('лист очікування', () => {
     prisma.block.findMany.mockResolvedValue([]);
   });
 
-  it('сповіщає тільки клуб на тарифі 3 (Аналітика/Telegram)', async () => {
+  it('сповіщає клуби на будь-якому тарифі, крім клубу без плану', async () => {
     prisma.waitlistEntry.findMany.mockResolvedValue([
       entry('t3', 'k1', '2001', PLAN3, '<u>Корт</u>'),
       entry('t2', 'k2', '2002', PLAN2),
       entry('none', 'k3', '2003', null),
     ]);
 
-    expect(await runWaitlistTick(NOW)).toBe(1);
-    expect(messages().map((m) => m.chat)).toEqual(['2001']);
+    expect(await runWaitlistTick(NOW)).toBe(2);
+    expect(messages().map((m) => m.chat)).toEqual(['2001', '2002']);
     expect(messages()[0].text).toContain('&lt;u&gt;Корт&lt;/u&gt;');
     expect(messages()[0].text).toContain('Клуб &lt;b&gt;');
   });
@@ -311,8 +311,13 @@ describe('запрошення у відкриту гру', () => {
     expect(messages()[0].text).toContain('Клуб &amp; Co');
   });
 
-  it('на нижчому тарифі нічого не шле', async () => {
+  it('на тарифі «Команда» теж шле — Telegram відкритий з найнижчого тарифу', async () => {
     await inviteToMatch(match(PLAN2), new Date('2026-10-18T10:00:00Z'));
+    expect(messages().map((m) => m.chat)).toEqual(['3001']);
+  });
+
+  it('клубу без плану нічого не шле', async () => {
+    await inviteToMatch(match(null), new Date('2026-10-18T10:00:00Z'));
     expect(transport()).toEqual([]);
   });
 });
@@ -331,6 +336,15 @@ describe('дайджест', () => {
   beforeEach(() => {
     prisma.user.findMany.mockImplementation(async ({ where }: { where: any }) =>
       users.filter((u) => (!where.role || u.role === where.role) && u.tgChatId));
+  });
+
+  it('клуб на «Бронях» (без аналітики) зведення не отримує', async () => {
+    const base = { tier: 1, featTrainers: false, featGroups: false, featAnalytics: false };
+    prisma.user.findMany.mockResolvedValue([
+      { id: 'o9', role: 'OWNER', tgChatId: '4009', club: { id: 'c9', name: 'Z', timezone: 'Europe/Kyiv', plan: base } },
+    ]);
+    expect(await runDigestTick(evening())).toBe(0);
+    expect(transport()).toEqual([]);
   });
 
   it('отримувачі — лише OWNER', async () => {

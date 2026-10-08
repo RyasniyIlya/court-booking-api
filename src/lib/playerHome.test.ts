@@ -112,8 +112,8 @@ describe('loadClubHome', () => {
     expect(prisma.customer.update).not.toHaveBeenCalled();
   });
 
-  it('після пониження тарифу налаштування власника не діють — типовий текст', async () => {
-    prisma.club.findFirst.mockResolvedValue(club({ plan: { ...PLAN3, tier: 2 } }));
+  it('без тарифу налаштування власника не діють — типовий текст', async () => {
+    prisma.club.findFirst.mockResolvedValue(club({ plan: null }));
     const view = await loadClubHome('club-1', null);
     expect(view!.text).not.toContain('Свій текст');
     expect(view!.text).toContain('Це бот клубу Squash');

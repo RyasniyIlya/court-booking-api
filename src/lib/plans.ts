@@ -7,6 +7,7 @@ export type PlanFeatures = {
   groups: boolean;
   /** Поглиблена аналітика і картотека клієнтів */
   analytics: boolean;
+  /** Telegram-бот і Mini App: доступні на будь-якому призначеному тарифі */
   telegram: boolean;
   /** Нейронний менеджер для гравців і нейроаналітик для власника */
   ai: boolean;
@@ -41,11 +42,24 @@ export function planFeatures(plan: PlanLike): PlanFeatures {
     trainers: plan.featTrainers,
     groups: plan.featGroups,
     analytics: plan.featAnalytics,
-    telegram: plan.tier === 3,
-    /* Найвищий тариф, разом із Telegram: обидва — «розумний» шар поверх
-       базових броней, і окремого прапорця в базі для нього не заводимо. */
+    /* Telegram-бот — із найнижчого тарифу: будь-який призначений план його
+       відкриває (боти, нагадування, «приду», Mini App, лист очікування).
+       Без плану лишається BASE_FEATURES, тобто закрито. Прапорця в базі
+       не заводимо — рахуємо від наявності плану. */
+    telegram: Boolean(plan),
+    /* ШІ — лише найвищий тариф («Аналітика»). Аналітичні виводи в Telegram
+       (зведення, /analytics, win-back) додатково вимагають `analytics`. */
     ai: plan.tier === 3,
   };
+}
+
+/**
+ * Аналітичні виводи в Telegram (щоденне зведення, /analytics, win-back):
+ * бот на тарифі є, а Pro-аналітика — лише на «Аналітика».
+ */
+export function telegramAnalytics(plan: PlanLike): boolean {
+  const f = planFeatures(plan);
+  return f.telegram && f.analytics;
 }
 
 /**

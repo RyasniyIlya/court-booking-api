@@ -105,8 +105,8 @@ export async function notifyBooking(params: Params): Promise<void> {
   });
   if (!booking) return;
 
-  /* Telegram — можливість максимального пакета. Перевірка тут, а не в
-     кожному місці виклику: інакше клуб на молодшому тарифі отримував би
+  /* Telegram — можливість будь-якого тарифу (без плану закрито). Перевірка
+     тут, а не в кожному місці виклику: інакше клуб без тарифу отримував би
      повідомлення рівно з тих шляхів, де про неї забули. */
   const { club } = booking;
   if (!planFeatures(club.plan).telegram) return;

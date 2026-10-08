@@ -157,13 +157,13 @@ it('незнайомий чат екрана не бачить', async () => {
 
 /* Та сама перевірка тарифу, що й на решті команд: після зниження пакета
    бот мовчить, а не пропонує налаштувати те, чого вже немає. */
-it('на молодшому тарифі екран не відкривається', async () => {
+it('без тарифу екран не відкривається', async () => {
   mocks.findUnique.mockResolvedValue(me({
-    club: { id: 'club', name: 'Клуб', timezone: 'Europe/Kyiv', plan: { tier: 2 } },
+    club: { id: 'club', name: 'Клуб', timezone: 'Europe/Kyiv', plan: null },
   }));
 
   await handleUpdate(command());
 
-  expect(mocks.sendMessage.mock.calls[0][1]).toContain('максимальному');
+  expect(mocks.sendMessage.mock.calls[0][1]).toContain('після підключення тарифу');
   expect(mocks.update).not.toHaveBeenCalled();
 });

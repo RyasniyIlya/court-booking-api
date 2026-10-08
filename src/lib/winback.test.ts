@@ -143,13 +143,18 @@ describe('runWinbackTick', () => {
     });
   });
 
-  it('поза денним вікном, при вимкненому поверненні й без тарифу Telegram — мовчить', async () => {
+  it('поза денним вікном, при вимкненому поверненні й без тарифу «Аналітика» — мовчить', async () => {
     expect(await runWinbackTick(new Date('2026-09-30T02:00:00Z'))).toBe(0);
 
     prisma.club.findMany.mockResolvedValue([club({ botSettings: winbackOn({ enabled: false }) })]);
     expect(await runWinbackTick(NOW)).toBe(0);
 
-    prisma.club.findMany.mockResolvedValue([club({ plan: { ...PLAN, tier: 2 } }), club({ plan: null })]);
+    /* «Броні» й «Команда» (Telegram є, аналітики немає) та клуб без плану */
+    prisma.club.findMany.mockResolvedValue([
+      club({ plan: { ...PLAN, tier: 1, featTrainers: false, featGroups: false, featAnalytics: false } }),
+      club({ plan: { ...PLAN, tier: 2, featAnalytics: false } }),
+      club({ plan: null }),
+    ]);
     expect(await runWinbackTick(NOW)).toBe(0);
 
     expect(sendReminderMessage).not.toHaveBeenCalled();

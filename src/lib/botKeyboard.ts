@@ -83,13 +83,14 @@ export function playerKeyboard() {
  * телефоні. is_persistent — щоб вона не ховалась після кожного
  * натискання, це саме той випадок, коли нею користуються постійно.
  */
-export function replyKeyboard(role: Role) {
+export function replyKeyboard(role: Role, analytics = true) {
   const rows = isTrainer(role)
     ? [[BTN_SESSIONS], [BTN_SETTINGS, BTN_HELP]]
     : [
       [BTN_TODAY, BTN_YESTERDAY],
       [BTN_WEEK, BTN_REVENUE],
-      [BTN_STAFF, BTN_ANALYTICS],
+      /* Кнопка аналітики — лише там, де вона в тарифі. */
+      analytics ? [BTN_STAFF, BTN_ANALYTICS] : [BTN_STAFF],
       [BTN_SETTINGS, BTN_HELP],
     ];
 
@@ -229,4 +230,7 @@ export const COMMANDS_GUEST = [
   { command: 'help', description: 'Що я вмію' },
 ];
 
-export const commandsFor = (role: Role) => (isTrainer(role) ? COMMANDS_TRAINER : COMMANDS_OWNER);
+export const commandsFor = (role: Role, analytics = true) =>
+  isTrainer(role)
+    ? COMMANDS_TRAINER
+    : analytics ? COMMANDS_OWNER : COMMANDS_OWNER.filter((c) => c.command !== 'analytics');

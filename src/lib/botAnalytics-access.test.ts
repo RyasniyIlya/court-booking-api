@@ -8,10 +8,11 @@ vi.mock('./botPassword', () => ({ changePassword: vi.fn(), parseNewPassword: vi.
 vi.mock('./digest', () => ({ dayDigest: mocks.day, digestText: vi.fn(), WEEKDAY_FULL: [], weekReport: vi.fn(), weekText: vi.fn() }));
 vi.mock('./sections', () => ({ revenueBreakdown: vi.fn(), revenueText: vi.fn(), staffReport: vi.fn(), staffText: vi.fn() }));
 const { handleUpdate } = await import('./botHandlers');
+const PRO = { tier: 3, featTrainers: true, featGroups: true, featAnalytics: true };
 const update = (type = 'private') => ({ update_id: 1, message: { message_id: 1, from: { id: 123 }, chat: { id: 123, type }, text: '/analytics yesterday' } });
 beforeEach(() => { vi.clearAllMocks(); mocks.report.mockResolvedValue(['page 1', 'page 2']); });
 it.each(['TRAINER', 'ADMIN', 'unknown'])('denies role %s before loading analytics', async role => {
-  mocks.findUnique.mockResolvedValue({ role, club: { id: 'club', plan: { tier: 3 } } });
+  mocks.findUnique.mockResolvedValue({ role, club: { id: 'club', plan: PRO } });
   await handleUpdate(update());
   expect(mocks.report).not.toHaveBeenCalled();
 });
@@ -21,34 +22,47 @@ it('denies unauthenticated chats', async () => {
   expect(mocks.report).not.toHaveBeenCalled();
 });
 it('denies group chats even for an owner', async () => {
-  mocks.findUnique.mockResolvedValue({ role: 'OWNER', club: { id: 'club', plan: { tier: 3 } } });
+  mocks.findUnique.mockResolvedValue({ role: 'OWNER', club: { id: 'club', plan: PRO } });
   await handleUpdate(update('group'));
   expect(mocks.report).not.toHaveBeenCalled();
 });
 it.each(['OWNER'])('sends all pages for %s using the linked club only', async role => {
-  mocks.findUnique.mockResolvedValue({ role, club: { id: 'club', plan: { tier: 3 } } });
+  mocks.findUnique.mockResolvedValue({ role, club: { id: 'club', plan: PRO } });
   await handleUpdate(update());
   expect(mocks.report).toHaveBeenCalledWith('club', 'yesterday');
   expect(mocks.sendMessage).toHaveBeenCalledTimes(2);
   expect(mocks.sendMessage.mock.calls[1][1]).toBe('page 2');
 });
 
-it.each([null, {tier:1}, {tier:2}])('blocks existing Telegram connections after downgrade to %s', async plan => {
- mocks.findUnique.mockResolvedValue({role:'OWNER',club:{id:'club',plan}});
+it('blocks existing Telegram connections of a club without a plan', async () => {
+ mocks.findUnique.mockResolvedValue({role:'OWNER',club:{id:'club',plan:null}});
  await handleUpdate(update());
  expect(mocks.report).not.toHaveBeenCalled();
- expect(mocks.sendMessage.mock.calls[0][1]).toContain('максимальному');
+ expect(mocks.sendMessage.mock.calls[0][1]).toContain('після підключення тарифу');
 });
-it.each([null, {tier:1}, {tier:2}])('blocks old report buttons for %s', async plan => {
- mocks.findUnique.mockResolvedValue({role:'OWNER',club:{id:'club',plan}});
+it.each([{tier:1},{tier:2,featTrainers:true,featGroups:true}])('refuses /analytics below the top tier: %s', async plan => {
+ mocks.findUnique.mockResolvedValue({role:'OWNER',club:{id:'club',plan:{featTrainers:false,featGroups:false,featAnalytics:false,...plan}}});
+ await handleUpdate(update());
+ expect(mocks.report).not.toHaveBeenCalled();
+ expect(mocks.sendMessage).toHaveBeenCalledTimes(1);
+ expect(mocks.sendMessage.mock.calls[0][1]).toBe('Аналітика в Telegram входить у тариф «Аналітика».');
+});
+it('hides the analytics button from the keyboard below the top tier', async () => {
+ mocks.findUnique.mockResolvedValue({role:'OWNER',club:{id:'club',plan:{tier:1,featTrainers:false,featGroups:false,featAnalytics:false}}});
+ await handleUpdate(update());
+ const labels = mocks.sendMessage.mock.calls[0][2].keyboard.flat().map((b: { text: string }) => b.text);
+ expect(labels).not.toContain('🔎 Аналітика');
+ expect(labels).toContain('📊 Сьогодні');
+});
+it('blocks old report buttons for a club without a plan', async () => {
+ mocks.findUnique.mockResolvedValue({role:'OWNER',club:{id:'club',plan:null}});
  await handleUpdate({update_id:1,callback_query:{id:'q',from:{id:123},data:'day:0',message:{message_id:1,chat:{id:123,type:'private'}}}});
  expect(mocks.day).not.toHaveBeenCalled();
- expect(mocks.answerCallback).toHaveBeenCalledWith('q',expect.stringContaining('максимальному'));
+ expect(mocks.answerCallback).toHaveBeenCalledWith('q',expect.stringContaining('після підключення тарифу'));
 });
-it.each([1,2,3])('trainer schedule requires maximum tier: %s', async tier => {
+it.each([1,2,3])('trainer schedule is available on any tier: %s', async tier => {
  mocks.findUnique.mockResolvedValue({role:'TRAINER',trainerId:'trainer-1',club:{id:'club',name:'Club',timezone:'Europe/Kyiv',plan:{tier}}});
  mocks.bookings.mockResolvedValue([]);
  await handleUpdate({...update(),message:{...update().message,text:'/today'}});
- if(tier===3) expect(mocks.bookings).toHaveBeenCalledWith(expect.objectContaining({where:expect.objectContaining({trainerId:'trainer-1'})}));
- else expect(mocks.bookings).not.toHaveBeenCalled();
+ expect(mocks.bookings).toHaveBeenCalledWith(expect.objectContaining({where:expect.objectContaining({trainerId:'trainer-1'})}));
 });

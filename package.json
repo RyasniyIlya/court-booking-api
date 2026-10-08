@@ -4,6 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
+    "test:federation:product": "tsx scripts/verify-federation-product.mjs",
+    "dev:federation": "tsx scripts/dev-isolated.mjs --federation",
     "test:federation:migration": "node scripts/verify-federation-migration.mjs",
     "test:federation:linking": "tsx scripts/verify-player-linking.mjs",
     "dev": "tsx watch src/index.ts",
@@ -33,6 +35,7 @@
     "compression": "^1.8.2",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
+    "exceljs": "^4.4.0",
     "express": "^5.2.1",
     "express-rate-limit": "^8.6.2",
     "jsonwebtoken": "^9.0.3",

@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto';
 import { paymentPlanSchema } from '../../lib/settlements';
 import { isTournament, tournamentTitle } from '../../lib/tournamentPay';
 import { z } from 'zod';
+import { SPORTS, defaultTeamSize, sportError } from '../../lib/sport';
+import { buildTournamentSettings, type TournamentSettings } from '../../lib/sportRules';
 import { DateTime } from 'luxon';
 
 import { prisma, isSlotTakenError } from '../../lib/db';
@@ -281,6 +283,7 @@ bookingsRouter.post(
   requireAuth,
   requireStaff,
   async (req, res) => {
+    if (req.body?.tournamentScope === 'FEDERATION' || req.body?.federationId) return res.status(403).json({ error: 'FEDERATION_ONLY' });
     const parsed = z
       .object({
         courtId: z.string().uuid(),
@@ -373,6 +376,17 @@ bookingsRouter.post(
           .enum(SKILL_LEVELS)
           .nullish(),
 
+        /* Вид спорту й формат турніру (1 = одиночний, 2 = парний); зміст має
+           лише для турніру — інакше ігноруються. */
+        /* Клубний турнір: false = «Без рейтингу» (товариський); типово true. */
+        rated: z.boolean().optional(),
+        tournamentSport: z.enum(SPORTS).nullish(),
+        tournamentTeamSize: z.union([z.literal(1), z.literal(2)]).optional(),
+        /* До скількох виграних сетів іде матч; без значення — дефолт клубу. */
+        tournamentSetsToWin: z.number().int().min(1).max(3).optional(),
+        /* Налаштування за правилами спорту (lib/sportRules.ts); без них — типові для спорту. */
+        tournamentSettings: z.record(z.string(), z.unknown()).optional(),
+
         /* Прокат — лише для приватної броні. Ручна priceTotal вище — це
            ціна корту й тренера; прокат додається до неї зверху, щоб
            rentalTotal лишався рівно сумою рядків. */
@@ -458,6 +472,27 @@ bookingsRouter.post(
       return res.status(400).json({
         error: 'TOO_LONG',
       });
+    }
+
+    /* Турнір: вид спорту + формат за правилами lib/sport.ts. */
+    const tourney = isTournament(d);
+    const tSport = tourney ? (d.tournamentSport ?? null) : null;
+    let tTeamSize = tourney ? (d.tournamentTeamSize ?? defaultTeamSize(tSport)) : 1;
+    if (tourney && (tSport || d.tournamentTeamSize)) {
+      const clubSports = (await prisma.club.findUnique({ where: { id: clubId }, select: { sports: true } }))?.sports ?? [];
+      const bad = sportError(tSport, tTeamSize, clubSports);
+      if (bad) return res.status(400).json({ error: bad });
+    }
+
+    let tSetsToWin = tourney
+      ? (d.tournamentSetsToWin ?? (await prisma.club.findUnique({ where: { id: clubId }, select: { defaultSetsToWin: true } }))?.defaultSetsToWin ?? 3)
+      : null;
+    let tSettings: TournamentSettings | null = null;
+    if (tourney) {
+      const built = buildTournamentSettings(tSport, { settings: d.tournamentSettings, teamSize: d.tournamentTeamSize, setsToWin: tSetsToWin });
+      if (!built.ok) return res.status(400).json({ error: built.error });
+      tSettings = built.settings;
+      if (tSettings) { tTeamSize = built.teamSize; tSetsToWin = built.setsToWin; }
     }
 
     const court = await prisma.court.findFirst({
@@ -620,6 +655,7 @@ bookingsRouter.post(
                 ? (d.title ?? OPEN_MATCH_TITLE)
                 : null,
               isOpenMatch: d.isOpenMatch,
+              ...(tourney ? { tournamentRated: d.rated ?? true, tournamentSport: tSport, tournamentTeamSize: tTeamSize, tournamentSetsToWin: tSetsToWin, ...(tSettings ? { tournamentSettings: tSettings } : {}) } : {}),
               levelMin: d.levelMin ?? null,
               levelMax: d.levelMax ?? null,
               pricePerSeat: isGroup
@@ -727,6 +763,7 @@ bookingsRouter.patch(
   '/bookings/:id',
   requireAuth,
   async (req, res) => {
+    if (req.body?.tournamentScope === 'FEDERATION' || req.body?.federationId) return res.status(403).json({ error: 'FEDERATION_ONLY' });
     const parsed = z
       .object({
         paymentPlan: paymentPlanSchema.optional(),
@@ -833,6 +870,8 @@ bookingsRouter.patch(
       });
     }
 
+    if (booking.tournamentScope === 'FEDERATION') return res.status(403).json({ error: 'FEDERATION_ONLY' });
+    if (booking.ratingsAppliedAt && (p.status === 'CANCELLED' || p.title !== undefined)) return res.status(409).json({ error: 'RATINGS_LOCKED' });
     // Тренер на рівні 2 закриває власне заняття — і тільки його. Список
     // /bookings йому і так віддається звужений по trainerId, але PATCH
     // ходить по конкретному id: без цієї перевірки досить було б підглянути

@@ -1,4 +1,4 @@
-import { planFeatures } from './plans';
+import { planFeatures, telegramAnalytics } from './plans';
 import { DateTime } from 'luxon';
 import { telegramHtml } from './telegramHtml';
 
@@ -246,7 +246,7 @@ async function linkByCode(chatId: string, code: string): Promise<string> {
     return 'Код протух — вони живуть 15 хвилин. Увійдіть командою <code>/login пошта пароль</code>.';
   }
 
-  if (!planFeatures(user.club.plan).telegram) return 'Telegram-бот доступний лише в максимальному пакеті.';
+  if (!planFeatures(user.club.plan).telegram) return 'Telegram-бот доступний після підключення тарифу.';
 
   const linked = await prisma.$transaction(async tx => {
     const consumed = await tx.user.updateMany({
@@ -260,7 +260,7 @@ async function linkByCode(chatId: string, code: string): Promise<string> {
   });
   if (!linked) return 'Код уже використаний або протух. Отримайте новий код у кабінеті.';
 
-  return `Підключено до клубу <b>${telegramHtml(user.club.name)}</b>.\n\n${menuFor(user.role)}`;
+  return `Підключено до клубу <b>${telegramHtml(user.club.name)}</b>.\n\n${menuFor(user.role, telegramAnalytics(user.club.plan))}`;
 }
 
 /**
@@ -376,7 +376,7 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
   }
 
   if (!planFeatures(me.club.plan).telegram) {
-    await answerCallback(q.id, 'Telegram-бот доступний лише в максимальному пакеті.');
+    await answerCallback(q.id, 'Telegram-бот доступний після підключення тарифу.');
     return;
   }
 
@@ -501,8 +501,9 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
     const me = await userByChat(chatId);
 
     if (me) {
-      await setMyCommands(commandsFor(me.role), chatId);
-      await sendMessage(chatId, reply, replyKeyboard(me.role));
+      const analytics = telegramAnalytics(me.club.plan);
+      await setMyCommands(commandsFor(me.role, analytics), chatId);
+      await sendMessage(chatId, reply, replyKeyboard(me.role, analytics));
     } else {
       await sendMessage(chatId, reply);
     }
@@ -525,7 +526,7 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
 
     const reply = await changePassword(chatId, password);
     const me = await userByChat(chatId);
-    await sendMessage(chatId, reply, me ? replyKeyboard(me.role) : undefined);
+    await sendMessage(chatId, reply, me ? replyKeyboard(me.role, telegramAnalytics(me.club.plan)) : undefined);
     return;
   }
 
@@ -616,8 +617,9 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
     const linked = await userByChat(chatId);
 
     if (linked) {
-      await setMyCommands(commandsFor(linked.role), chatId);
-      await sendMessage(chatId, reply, replyKeyboard(linked.role));
+      const analytics = telegramAnalytics(linked.club.plan);
+      await setMyCommands(commandsFor(linked.role, analytics), chatId);
+      await sendMessage(chatId, reply, replyKeyboard(linked.role, analytics));
     } else {
       await sendMessage(chatId, reply);
     }
@@ -652,14 +654,19 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
   }
 
   if (cmd !== '/logout' && !planFeatures(me.club.plan).telegram) {
-    await sendMessage(chatId, 'Telegram-бот доступний лише в максимальному пакеті.', removeKeyboard);
+    await sendMessage(chatId, 'Telegram-бот доступний після підключення тарифу.', removeKeyboard);
     return;
   }
 
-  const keyboard = replyKeyboard(me.role);
-  const menu = menuFor(me.role);
+  const analyticsOk = telegramAnalytics(me.club.plan);
+  const keyboard = replyKeyboard(me.role, analyticsOk);
+  const menu = menuFor(me.role, analyticsOk);
 
   if (cmd === '/analytics') {
+    if (!analyticsOk) {
+      await sendMessage(chatId, 'Аналітика в Telegram входить у тариф «Аналітика».', keyboard);
+      return;
+    }
     if (msg.chat.type !== 'private' || me.role !== 'OWNER') {
       await sendMessage(chatId, 'Аналітика доступна власнику лише в особистому чаті з ботом.');
       return;
@@ -679,7 +686,7 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
   }
 
   if (cmd === '/help' || cmd === '/start') {
-    await setMyCommands(commandsFor(me.role), chatId);
+    await setMyCommands(commandsFor(me.role, analyticsOk), chatId);
     await sendMessage(chatId, `Клуб <b>${telegramHtml(me.club.name)}</b>.\n\n${menu}`, keyboard);
     return;
   }

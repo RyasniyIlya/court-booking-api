@@ -19,13 +19,13 @@ for (const role of ['OWNER','ADMIN','TRAINER']) {
  it.each([null,1,2,3])(role + ' Telegram API tier %s', async tier => {
   mocks.club.mockResolvedValue({plan:tier ? {tier,featTrainers:tier>=2,featGroups:tier>=2,featAnalytics:tier===3}:null});
   const res = await request(app).post('/telegram/link').set('Authorization','Bearer '+token(role)).send({currentPassword:'fixture-password'});
-  expect(res.status).toBe(tier===3?200:402);
-  if(tier===3) expect(res.body.code).toMatch(/^[A-Z0-9]{6}$/);
+  expect(res.status).toBe(tier?200:402);
+  if(tier) expect(res.body.code).toMatch(/^[A-Z0-9]{6}$/);
   else { expect(res.body).toMatchObject({error:'PLAN_REQUIRED',feature:'telegram'}); expect(mocks.update).not.toHaveBeenCalled(); }
  });
 }
-it('does not disclose connection status on lower tiers', async () => {
- mocks.club.mockResolvedValue({plan:{tier:2}});
+it('does not disclose connection status for a club without a plan', async () => {
+ mocks.club.mockResolvedValue({plan:null});
  expect((await request(app).get('/telegram').set('Authorization','Bearer '+token('OWNER'))).status).toBe(402);
  expect(mocks.user).toHaveBeenCalledTimes(1); // Authentication only, no connection details.
 });

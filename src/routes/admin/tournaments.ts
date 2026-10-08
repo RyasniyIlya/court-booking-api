@@ -3,12 +3,16 @@ import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
 import { recordChanges, type Change } from '../../lib/changeLog';
+import { buildTournamentSettings, scoringFromSettings } from '../../lib/sportRules';
 import { isTournament } from '../../lib/tournamentPay';
 import {
   applyPatches, buildBracket, isFinished, planPropagation, resolveMatchUpdate, sweepWalkovers,
   type BracketMatch, type MatchStatus, type SetScore,
 } from '../../lib/tournamentBracket';
 import { requireAuth, param } from './shared';
+import { finalizeTournament, RatingError, tournamentResults } from '../../lib/tournamentRating';
+import { notifyOnWrite } from '../../lib/tournamentLive';
+import { linkCustomerPlayer } from '../../lib/players';
 
 /**
  * Керування турніром: учасники, сітка, рахунок, зняття, завершення.
@@ -19,6 +23,8 @@ import { requireAuth, param } from './shared';
  * одному рахунок мовчки, а побачать 409 і свіжий матч.
  */
 export const tournamentsRouter = Router();
+// Живе табло: після успішного запису штовхаємо глядачів (fire-and-forget).
+tournamentsRouter.use('/tournaments', notifyOnWrite());
 
 const TOURNAMENT = 'TOURNAMENT';
 const MATCH_STATUSES = ['PENDING', 'SCHEDULED', 'LIVE', 'DONE', 'WALKOVER', 'RETIRED'] as const;
@@ -46,11 +52,15 @@ const asBracket = (m: Row): BracketMatch => ({
 });
 
 type Booking = {
+  clubId?: string;
+  tournamentScope?: 'CLUB' | 'INTERCLUB' | 'FEDERATION'; federationId?: string | null; ratingsAppliedAt?: Date | null; tournamentRated?: boolean;
   id: string; title: string | null; capacity: number | null; trainerId: string | null;
   tournamentStatus: 'DRAFT' | 'RUNNING' | 'FINISHED' | null; tournamentFormat: string | null;
   thirdPlace: boolean; startTime: Date; courtId: string;
+  tournamentSport?: 'PADEL' | 'TENNIS' | 'SQUASH' | null; tournamentTeamSize?: number; tournamentSetsToWin?: number | null; tournamentSettings?: unknown;
 };
 
+const pairName = (a: string, b: string) => `${a} / ${b}`.slice(0, 80);
 const isStaff = (req: Request) => req.auth!.role === 'OWNER' || req.auth!.role === 'ADMIN';
 
 /** Турнір клубу з токена + доступ: персонал або тренер цього турніру. */
@@ -60,8 +70,10 @@ async function loadBooking(
   const booking = await prisma.booking.findFirst({
     where: { id: opts.bookingId ?? param(req, 'bookingId'), clubId: req.auth!.clubId },
     select: {
-      id: true, title: true, capacity: true, trainerId: true, tournamentStatus: true,
+      id: true, clubId: true, title: true, capacity: true, trainerId: true, tournamentStatus: true,
       tournamentFormat: true, thirdPlace: true, startTime: true, courtId: true,
+      tournamentScope: true, federationId: true, ratingsAppliedAt: true, tournamentRated: true,
+      tournamentSport: true, tournamentTeamSize: true, tournamentSetsToWin: true, tournamentSettings: true,
     },
   }) as Booking | null;
   if (!booking || !isTournament(booking)) {
@@ -80,35 +92,51 @@ async function loadBooking(
 
 type Db = typeof prisma;
 
-async function payload(db: Db, booking: Booking) {
-  const [entries, matches] = await Promise.all([
+/** `pre` — уже відомий стан (entries за seed asc, matches за round/slot asc): без повторних запитів. */
+async function payload(
+  db: Db, booking: Booking,
+  pre?: { entries: Awaited<ReturnType<Db['tournamentEntry']['findMany']>>; matches: Row[] },
+) {
+  const [entries, matches] = pre ? [pre.entries, pre.matches] : await Promise.all([
     db.tournamentEntry.findMany({ where: { bookingId: booking.id }, orderBy: { seed: 'asc' } }),
     db.tournamentMatch.findMany({ where: { bookingId: booking.id }, orderBy: [{ round: 'asc' }, { slot: 'asc' }] }),
   ]);
   return {
     tournament: {
-      id: booking.id, title: booking.title, startTime: booking.startTime, courtId: booking.courtId,
+      id: booking.id, clubId: booking.clubId, title: booking.title, startTime: booking.startTime, courtId: booking.courtId,
       status: booking.tournamentStatus, format: booking.tournamentFormat, thirdPlace: booking.thirdPlace,
+      scope: booking.tournamentScope, rated: booking.tournamentRated ?? true, ratingsAppliedAt: booking.ratingsAppliedAt,
+      sport: booking.tournamentSport ?? null, teamSize: booking.tournamentTeamSize ?? 1, setsToWin: booking.tournamentSetsToWin ?? null, settings: booking.tournamentSettings ?? null,
     },
     entries: entries.map((e) => ({
-      id: e.id, name: e.name, seed: e.seed, seatId: e.seatId, customerId: e.customerId, withdrawnAt: e.withdrawnAt,
+      id: e.id, name: e.name, seed: e.seed, seatId: e.seatId, customerId: e.customerId, playerId: e.playerId, partnerPlayerId: e.partnerPlayerId ?? null, withdrawnAt: e.withdrawnAt,
     })),
     matches: (matches as unknown as Row[]).map(matchDto),
+    results: await tournamentResults(db, booking),
   };
 }
 
-async function actorOf(req: Request) {
-  const user = await prisma.user.findUniqueOrThrow({
+async function actorOf(req: Request, db: Pick<Db, 'user'> = prisma) {
+  const user = await db.user.findUniqueOrThrow({
     where: { id: req.auth!.userId }, select: { email: true, role: true },
   });
   return { userId: req.auth!.userId, email: user.email, role: user.role ?? req.auth!.role };
 }
 
+async function lockTournament(tx: import('@prisma/client').Prisma.TransactionClient, booking: Booking, status?: string) {
+  if (!booking.tournamentScope) return;
+  await tx.$queryRaw`SELECT id FROM "Booking" WHERE id = ${booking.id}::uuid FOR UPDATE`;
+  const fresh = await tx.booking.findUniqueOrThrow({ where: { id: booking.id } });
+  if (fresh.ratingsAppliedAt) throw new RatingError('RATINGS_LOCKED');
+  if (status && fresh.tournamentStatus !== status) throw new RatingError('TOURNAMENT_LOCKED');
+  if (fresh.status === 'CANCELLED' || fresh.status === 'EXPIRED') throw new RatingError('TOURNAMENT_LOCKED');
+}
+
 const log = async (
-  db: Pick<Db, 'changeLog'>, req: Request, bookingId: string, changes: Change[], reason?: string,
+  db: Pick<Db, 'changeLog' | 'user'>, req: Request, bookingId: string, changes: Change[], reason?: string,
 ) => {
   const all = reason ? [...changes, { field: 'reason', before: null, after: reason }] : changes;
-  await recordChanges(db, { clubId: req.auth!.clubId, entity: TOURNAMENT, entityId: bookingId }, await actorOf(req), all);
+  await recordChanges(db, { clubId: req.auth!.clubId, entity: TOURNAMENT, entityId: bookingId }, await actorOf(req, db), all);
 };
 
 // ── GET ───────────────────────────────────────────────────────────────
@@ -119,12 +147,33 @@ tournamentsRouter.get('/tournaments/:bookingId', requireAuth, async (req, res) =
   res.json(await payload(prisma, booking));
 });
 
+// ── Налаштування турніру (лише поки DRAFT) ──
+const settingsSchema = z.object({ settings: z.record(z.string(), z.unknown()) });
+tournamentsRouter.patch('/tournaments/:bookingId/settings', requireAuth, async (req, res) => {
+  const booking = await loadBooking(req, res, { staffOnly: true });
+  if (!booking) return;
+  const p = settingsSchema.safeParse(req.body);
+  if (!p.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  if (booking.tournamentStatus !== 'DRAFT') return res.status(409).json({ error: 'NOT_DRAFT' });
+  const built = buildTournamentSettings(booking.tournamentSport, { settings: p.data.settings });
+  if (!built.ok || !built.settings) return res.status(400).json({ error: built.ok ? 'SPORT_REQUIRED' : built.error });
+  const upd = await prisma.booking.updateMany({
+    where: { id: booking.id, clubId: req.auth!.clubId, tournamentStatus: 'DRAFT' },
+    data: { tournamentSettings: built.settings, tournamentTeamSize: built.teamSize, tournamentSetsToWin: built.setsToWin },
+  });
+  if (!upd.count) return res.status(409).json({ error: 'NOT_DRAFT' });
+  res.json({ settings: built.settings, teamSize: built.teamSize, setsToWin: built.setsToWin });
+});
+
 // ── Учасники ──────────────────────────────────────────────────────────
 const entriesSchema = z.object({
   entries: z.array(z.object({
     name: z.string().trim().min(1).max(80),
     seatId: z.string().uuid().nullish(),
     customerId: z.string().uuid().nullish(),
+    playerId: z.string().uuid().nullish(),
+    /* Партнер пари (лише для парного турніру, teamSize = 2). */
+    partnerPlayerId: z.string().uuid().nullish(),
   })).max(64),
   shuffle: z.boolean().optional(),
 });
@@ -135,6 +184,7 @@ tournamentsRouter.put('/tournaments/:bookingId/entries', requireAuth, async (req
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
   const booking = await loadBooking(req, res, { staffOnly: true });
   if (!booking) return;
+  if (booking.tournamentScope === 'FEDERATION') return res.status(403).json({ error: 'FEDERATION_MANAGES_ENTRIES' });
   if (booking.tournamentStatus === 'RUNNING' || booking.tournamentStatus === 'FINISHED') {
     return res.status(409).json({ error: booking.tournamentStatus === 'FINISHED' ? 'TOURNAMENT_FINISHED' : 'TOURNAMENT_LOCKED' });
   }
@@ -154,6 +204,36 @@ tournamentsRouter.put('/tournaments/:bookingId/entries', requireAuth, async (req
   }
 
   const result = await prisma.$transaction(async (tx) => {
+    await lockTournament(tx, booking);
+    if (booking.tournamentScope) {
+      const fresh = await tx.booking.findUniqueOrThrow({ where: { id: booking.id } });
+      if (fresh.tournamentStatus && fresh.tournamentStatus !== 'DRAFT') throw new RatingError('TOURNAMENT_LOCKED');
+    }
+    const doubles = (booking.tournamentTeamSize ?? 1) === 2;
+    for (const e of list) {
+      if (e.seatId) {
+        const seat = await tx.bookingSeat.findFirst({ where: { id: e.seatId, bookingId: booking.id }, select: { customerId: true } });
+        if (!seat || (e.customerId && e.customerId !== seat.customerId)) throw new RatingError('BAD_SEAT');
+        e.customerId = seat.customerId;
+      }
+      if (e.customerId) {
+        const player = await linkCustomerPlayer(tx, e.customerId, req.auth!.clubId);
+        if (e.playerId && e.playerId !== player.id) throw new RatingError('BAD_PLAYER');
+        e.playerId = player.id;
+      }
+      if (e.playerId && !await tx.clubPlayerRating.findFirst({ where: { clubId: req.auth!.clubId, playerId: e.playerId, active: true } })) throw new RatingError('BAD_PLAYER');
+      if (!doubles) e.partnerPlayerId = null;
+      else {
+        // Пара: обидва гравці обовʼязкові, партнер — теж учасник клубу; назва «A / B».
+        if (!e.playerId || !e.partnerPlayerId || e.partnerPlayerId === e.playerId) throw new RatingError('PARTNER_REQUIRED');
+        if (!await tx.clubPlayerRating.findFirst({ where: { clubId: req.auth!.clubId, playerId: e.partnerPlayerId, active: true } })) throw new RatingError('BAD_PLAYER');
+        const [a, c] = await Promise.all([tx.player.findUnique({ where: { id: e.playerId } }), tx.player.findUnique({ where: { id: e.partnerPlayerId } })]);
+        if (!a || !c) throw new RatingError('BAD_PLAYER');
+        e.name = pairName(a.name, c.name);
+      }
+    }
+    const playerIds = list.flatMap(e => [e.playerId, e.partnerPlayerId]).filter(Boolean);
+    if (new Set(playerIds).size !== playerIds.length) throw new RatingError('DUPLICATE_PLAYER');
     const before = await tx.tournamentEntry.findMany({ where: { bookingId: booking.id }, orderBy: { seed: 'asc' }, select: { name: true } });
     await tx.tournamentEntry.deleteMany({ where: { bookingId: booking.id } });
     if (list.length) {
@@ -161,6 +241,7 @@ tournamentsRouter.put('/tournaments/:bookingId/entries', requireAuth, async (req
         data: list.map((e, i) => ({
           bookingId: booking.id, clubId: req.auth!.clubId, name: e.name, seed: i + 1,
           seatId: e.seatId ?? null, customerId: e.customerId ?? null,
+          playerId: e.playerId ?? null, partnerPlayerId: e.partnerPlayerId ?? null,
         })),
       });
     }
@@ -182,11 +263,19 @@ tournamentsRouter.post('/tournaments/:bookingId/start', requireAuth, async (req,
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
   const booking = await loadBooking(req, res, { staffOnly: true });
   if (!booking) return;
+  if (booking.tournamentScope === 'FEDERATION') return res.status(403).json({ error: 'FEDERATION_MANAGES_ENTRIES' });
   if (booking.tournamentStatus !== 'DRAFT') {
     return res.status(409).json({ error: booking.tournamentStatus ? 'ALREADY_STARTED' : 'NO_ENTRIES' });
   }
 
   const entries = await prisma.tournamentEntry.findMany({ where: { bookingId: booking.id }, orderBy: { seed: 'asc' }, select: { id: true } });
+  if (booking.tournamentScope) {
+    const unlinked = await prisma.tournamentEntry.count({ where: { bookingId: booking.id, playerId: null } });
+    if (unlinked) return res.status(409).json({ error: 'PLAYERS_REQUIRED' });
+    if ((booking.tournamentTeamSize ?? 1) === 2 && await prisma.tournamentEntry.count({ where: { bookingId: booking.id, partnerPlayerId: null } })) {
+      return res.status(409).json({ error: 'PARTNER_REQUIRED' });
+    }
+  }
   if (entries.length < 2) return res.status(400).json({ error: 'TOO_FEW_ENTRIES' });
 
   const thirdPlace = !!parsed.data.thirdPlace && entries.length >= 4;
@@ -195,6 +284,7 @@ tournamentsRouter.post('/tournaments/:bookingId/start', requireAuth, async (req,
   const by = (await actorOf(req)).email;
 
   const result = await prisma.$transaction(async (tx) => {
+    await lockTournament(tx, booking, 'DRAFT');
     await tx.tournamentMatch.createMany({
       data: matches.map((m) => ({
         id: m.id, bookingId: booking.id, clubId: req.auth!.clubId, round: m.round, slot: m.slot,
@@ -230,16 +320,26 @@ const patchSchema = z.object({
 });
 
 tournamentsRouter.patch('/tournaments/matches/:id', requireAuth, async (req, res) => {
+  if (!isStaff(req)) return res.status(403).json({ error: 'FORBIDDEN' });
   const parsed = patchSchema.safeParse(req.body);
   const id = z.string().uuid().safeParse(param(req, 'id'));
   if (!parsed.success || !id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
   const body = parsed.data;
+
+  // Незалежні читання стартують одразу й паралельно; відповіді/помилки — у тому ж порядку, що й раніше.
+  const actorP = actorOf(req);
+  actorP.catch(() => undefined);
+  const courtP = body.courtId
+    ? prisma.court.findFirst({ where: { id: body.courtId, clubId: req.auth!.clubId }, select: { id: true } })
+    : null;
+  courtP?.catch(() => undefined);
 
   const found = await prisma.tournamentMatch.findFirst({
     where: { id: id.data, clubId: req.auth!.clubId },
   }) as (Row & { bookingId: string }) | null;
   if (!found) return res.status(404).json({ error: 'NOT_FOUND' });
 
+  res.locals.tournamentId = found.bookingId;
   const booking = await loadBooking(req, res, { bookingId: found.bookingId });
   if (!booking) return;
   if (!isStaff(req) && (body.courtId !== undefined || body.scheduledAt !== undefined || body.note !== undefined)) {
@@ -248,16 +348,23 @@ tournamentsRouter.patch('/tournaments/matches/:id', requireAuth, async (req, res
   if (booking.tournamentStatus === 'FINISHED') return res.status(409).json({ error: 'TOURNAMENT_FINISHED' });
   if (booking.tournamentStatus !== 'RUNNING') return res.status(409).json({ error: 'NOT_RUNNING' });
 
-  if (body.courtId) {
-    const court = await prisma.court.findFirst({ where: { id: body.courtId, clubId: req.auth!.clubId }, select: { id: true } });
+  if (courtP) {
+    const court = await courtP;
     if (!court) return res.status(400).json({ error: 'BAD_COURT' });
   }
 
-  const actor = await actorOf(req);
+  const actor = await actorP;
 
   const outcome = await prisma.$transaction(async (tx) => {
+    // Finalization and score writes lock the same booking, preventing a stale score
+    // write after ratings have already been calculated.
+    if (booking.tournamentScope) {
+      await tx.$queryRaw`SELECT id FROM "Booking" WHERE id = ${booking.id}::uuid FOR UPDATE`;
+      const fresh = await tx.booking.findUniqueOrThrow({ where: { id: booking.id } });
+      if (fresh.tournamentStatus !== 'RUNNING' || fresh.ratingsAppliedAt) return { status: 409 as const, body: { error: 'TOURNAMENT_FINISHED' } };
+    }
     const rows = await tx.tournamentMatch.findMany({ where: { bookingId: booking.id } }) as unknown as Row[];
-    const entries = await tx.tournamentEntry.findMany({ where: { bookingId: booking.id }, select: { id: true, name: true } });
+    const entries = await tx.tournamentEntry.findMany({ where: { bookingId: booking.id }, orderBy: { seed: 'asc' } });
     const nameOf = (eid: string | null) => entries.find((e) => e.id === eid)?.name ?? null;
     const cur = rows.find((r) => r.id === found.id);
     if (!cur) return { status: 404 as const, body: { error: 'NOT_FOUND' } };
@@ -266,7 +373,8 @@ tournamentsRouter.patch('/tournaments/matches/:id', requireAuth, async (req, res
     }
 
     const resolved = resolveMatchUpdate(asBracket(cur), {
-      sets: body.sets, winner: body.winner, status: body.status,
+      sets: body.sets, winner: body.winner, status: body.status, setsToWin: booking.tournamentSetsToWin ?? null,
+      scoring: scoringFromSettings(booking.tournamentSport, booking.tournamentSettings),
     });
     if (!resolved.ok) return { status: 400 as const, body: { error: resolved.error } };
 
@@ -322,6 +430,18 @@ tournamentsRouter.patch('/tournaments/matches/:id', requireAuth, async (req, res
     const after = snap({ sets: resolved.sets, status: resolved.status, winnerEntryId: resolved.winnerEntryId });
     if (JSON.stringify(before) !== JSON.stringify(after)) changes.push({ field: label(cur), before, after });
 
+    // Стан після запису виводимо в пам'яті — без повторного читання матчів/учасників.
+    const state = new Map<string, Row>(rows.map((r) => [r.id, r]));
+    state.set(cur.id, {
+      ...cur,
+      sets: resolved.sets, status: resolved.status, winnerEntryId: resolved.winnerEntryId,
+      updatedBy: actor.email, version: cur.version + 1,
+      startedAt: data.startedAt as Date | null, finishedAt: data.finishedAt as Date | null,
+      ...(body.courtId !== undefined ? { courtId: body.courtId } : {}),
+      ...(body.scheduledAt !== undefined ? { scheduledAt: data.scheduledAt as Date | null } : {}),
+      ...(body.note !== undefined ? { note: data.note as string | null } : {}),
+    });
+
     for (const { id: tid, patch } of plan.patches) {
       const target = rows.find((r) => r.id === tid)!;
       const tdata: Record<string, unknown> = { updatedBy: actor.email, version: { increment: 1 } };
@@ -329,24 +449,36 @@ tournamentsRouter.patch('/tournaments/matches/:id', requireAuth, async (req, res
       if ('entryBId' in patch) tdata.entryBId = patch.entryBId ?? null;
       if (patch.reset) Object.assign(tdata, { sets: [], winnerEntryId: null, status: 'PENDING', startedAt: null, finishedAt: null });
       await tx.tournamentMatch.update({ where: { id: tid }, data: tdata as never });
+      const prevT = state.get(tid)!;
+      state.set(tid, {
+        ...prevT, updatedBy: actor.email, version: prevT.version + 1,
+        ...('entryAId' in patch ? { entryAId: patch.entryAId ?? null } : {}),
+        ...('entryBId' in patch ? { entryBId: patch.entryBId ?? null } : {}),
+        ...(patch.reset ? { sets: [], winnerEntryId: null, status: 'PENDING' as MatchStatus, startedAt: null, finishedAt: null } : {}),
+      });
       if (patch.reset) {
         changes.push({ field: label(target), before: snap(target), after: { sets: [], status: 'PENDING', winner: null } });
       }
     }
     /* Прохід міг поставити проти знятого учасника — одразу WO, у цій самій транзакції. */
-    const rowsNow = await tx.tournamentMatch.findMany({ where: { bookingId: booking.id } }) as unknown as Row[];
-    const entriesNow = await tx.tournamentEntry.findMany({ where: { bookingId: booking.id } });
-    const out = new Set(entriesNow.filter((e) => e.withdrawnAt).map((e) => e.id));
+    const rowsNow = rows.map((r) => state.get(r.id)!);
+    const out = new Set(entries.filter((e) => e.withdrawnAt).map((e) => e.id));
     if (out.size) {
       for (const m of sweepWalkovers(rowsNow.map(asBracket), out, booking.thirdPlace)) {
         const o = rowsNow.find((r) => r.id === m.id)!;
+        const finishedAt = isFinished(m) ? (o.finishedAt ?? now) : o.finishedAt;
         await tx.tournamentMatch.update({
           where: { id: m.id },
           data: {
             entryAId: m.entryAId, entryBId: m.entryBId, winnerEntryId: m.winnerEntryId, status: m.status,
-            finishedAt: isFinished(m) ? (o.finishedAt ?? now) : o.finishedAt,
+            finishedAt,
             updatedBy: actor.email, version: { increment: 1 },
           } as never,
+        });
+        const prevM = state.get(m.id)!;
+        state.set(m.id, {
+          ...prevM, entryAId: m.entryAId, entryBId: m.entryBId, winnerEntryId: m.winnerEntryId, status: m.status,
+          finishedAt, updatedBy: actor.email, version: prevM.version + 1,
         });
         if (m.status !== o.status) {
           changes.push({
@@ -356,9 +488,18 @@ tournamentsRouter.patch('/tournaments/matches/:id', requireAuth, async (req, res
         }
       }
     }
-    if (changes.length || body.reason) await log(tx as unknown as Db, req, booking.id, changes, body.reason);
+    if (changes.length || body.reason) {
+      // actor вже відомий — без повторного читання користувача (як у log()).
+      await recordChanges(
+        tx as unknown as Db,
+        { clubId: req.auth!.clubId, entity: TOURNAMENT, entityId: booking.id },
+        actor,
+        body.reason ? [...changes, { field: 'reason', before: null, after: body.reason }] : changes,
+      );
+    }
 
-    const reloaded = await payload(tx as unknown as Db, booking);
+    const finalMatches = [...state.values()].sort((x, y) => x.round - y.round || x.slot - y.slot);
+    const reloaded = await payload(tx as unknown as Db, booking, { entries, matches: finalMatches });
     return { status: 200 as const, body: { ...reloaded, match: reloaded.matches.find((m) => m.id === cur.id) } };
   });
 
@@ -372,10 +513,12 @@ tournamentsRouter.post('/tournaments/:bookingId/withdraw/:entryId', requireAuth,
   const reason = z.string().trim().max(300).optional().safeParse(req.body?.reason);
   const booking = await loadBooking(req, res, { staffOnly: true });
   if (!booking) return;
+  if (booking.tournamentScope === 'FEDERATION') return res.status(403).json({ error: 'FEDERATION_MANAGES_ENTRIES' });
   if (booking.tournamentStatus === 'FINISHED') return res.status(409).json({ error: 'TOURNAMENT_FINISHED' });
   if (booking.tournamentStatus !== 'RUNNING') return res.status(409).json({ error: 'NOT_RUNNING' });
 
   const result = await prisma.$transaction(async (tx) => {
+    await lockTournament(tx, booking, 'RUNNING');
     const entries = await tx.tournamentEntry.findMany({ where: { bookingId: booking.id } });
     const entry = entries.find((e) => e.id === entryId.data);
     if (!entry) return { status: 404 as const, body: { error: 'NOT_FOUND' } };
@@ -385,7 +528,7 @@ tournamentsRouter.post('/tournaments/:bookingId/withdraw/:entryId', requireAuth,
     const withdrawn = new Set(entries.filter((e) => e.withdrawnAt || e.id === entry.id).map((e) => e.id));
     const rows = await tx.tournamentMatch.findMany({ where: { bookingId: booking.id } }) as unknown as Row[];
     const changed = sweepWalkovers(rows.map(asBracket), withdrawn, booking.thirdPlace);
-    const actor = await actorOf(req);
+    const actor = await actorOf(req, tx as unknown as Db);
     const now = new Date();
     const changes: Change[] = [{ field: 'withdraw', before: null, after: entry.name }];
     for (const m of changed) {
@@ -416,6 +559,13 @@ tournamentsRouter.post('/tournaments/:bookingId/withdraw/:entryId', requireAuth,
 tournamentsRouter.post('/tournaments/:bookingId/finish', requireAuth, async (req, res) => {
   const booking = await loadBooking(req, res, { staffOnly: true });
   if (!booking) return;
+  if (booking.tournamentScope === 'FEDERATION') return res.status(403).json({ error: 'FEDERATION_FINALIZES' });
+  if (booking.tournamentScope) {
+    try {
+      await prisma.$transaction(tx => finalizeTournament(tx, booking.id, req.auth!.userId), { timeout: 30_000 });
+      return res.json(await payload(prisma, { ...booking, tournamentStatus: 'FINISHED', ratingsAppliedAt: new Date() }));
+    } catch (e) { if (e instanceof RatingError) return res.status(409).json({ error: e.message }); throw e; }
+  }
   if (booking.tournamentStatus === 'FINISHED') return res.status(409).json({ error: 'TOURNAMENT_FINISHED' });
   if (booking.tournamentStatus !== 'RUNNING') return res.status(409).json({ error: 'NOT_RUNNING' });
   const rows = await prisma.tournamentMatch.findMany({ where: { bookingId: booking.id } }) as unknown as Row[];
@@ -436,8 +586,10 @@ tournamentsRouter.post('/tournaments/:bookingId/reopen', requireAuth, async (req
   if (req.auth!.role !== 'OWNER') return res.status(403).json({ error: 'FORBIDDEN' });
   const booking = await loadBooking(req, res, { staffOnly: true });
   if (!booking) return;
+  if (booking.ratingsAppliedAt || booking.tournamentScope === 'FEDERATION') return res.status(409).json({ error: 'RATINGS_LOCKED' });
   if (booking.tournamentStatus !== 'FINISHED') return res.status(409).json({ error: 'NOT_FINISHED' });
   const out = await prisma.$transaction(async (tx) => {
+    await lockTournament(tx, booking, 'FINISHED');
     await tx.booking.update({ where: { id: booking.id }, data: { tournamentStatus: 'RUNNING' } });
     await log(tx as unknown as Db, req, booking.id, [{ field: 'status', before: 'FINISHED', after: 'RUNNING' }]);
     return payload(tx as unknown as Db, { ...booking, tournamentStatus: 'RUNNING' });
@@ -450,10 +602,12 @@ tournamentsRouter.delete('/tournaments/:bookingId/bracket', requireAuth, async (
   const reason = z.string().trim().min(1).max(300).optional().safeParse(req.body?.reason ?? req.query.reason);
   const booking = await loadBooking(req, res, { staffOnly: true });
   if (!booking) return;
+  if (booking.tournamentScope === 'FEDERATION') return res.status(403).json({ error: 'FEDERATION_MANAGES_ENTRIES' });
   if (booking.tournamentStatus === 'FINISHED') return res.status(409).json({ error: 'TOURNAMENT_FINISHED' });
   if (booking.tournamentStatus !== 'RUNNING') return res.status(409).json({ error: 'NOT_RUNNING' });
 
   const out = await prisma.$transaction(async (tx) => {
+    await lockTournament(tx, booking, 'RUNNING');
     const rows = await tx.tournamentMatch.findMany({ where: { bookingId: booking.id } }) as unknown as Row[];
     // Bye (одного учасника немає) — не зіграний матч, його скидання нічого не губить.
     const played = rows.filter((m) => isFinished(m) && m.entryAId && m.entryBId);
@@ -470,4 +624,9 @@ tournamentsRouter.delete('/tournaments/:bookingId/bracket', requireAuth, async (
     return { status: 200 as const, body: await payload(tx as unknown as Db, { ...booking, tournamentStatus: 'DRAFT' }) };
   });
   res.status(out.status).json(out.body);
+});
+
+tournamentsRouter.use((err: unknown, _req: Request, res: Response, next: import('express').NextFunction) => {
+  if (err instanceof RatingError || (err instanceof Error && err.message.startsWith('PLAYER_'))) return res.status(409).json({ error: (err as Error).message });
+  next(err);
 });

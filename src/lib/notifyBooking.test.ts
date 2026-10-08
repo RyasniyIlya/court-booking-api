@@ -146,9 +146,10 @@ describe('notifyBooking', () => {
     }));
   });
 
-  /* Telegram — можливість максимального пакета. Перевірка живе в одному
-     місці саме для того, щоб її не забули в черговому маршруті. */
-  it('на молодшому тарифі не йде нікуди, включно з групою', async () => {
+  /* Telegram — можливість будь-якого тарифу; без нього (planFeatures.telegram
+     = false, тут мок) не йде нікуди. Перевірка живе в одному місці саме для
+     того, щоб її не забули в черговому маршруті. */
+  it('коли Telegram у плані закритий, не йде нікуди, включно з групою', async () => {
     prisma.booking.findUnique.mockResolvedValue(booking({
       club: { id: 'club-1', plan: 'lite', timezone: 'Europe/Kyiv', telegramChatId: 'club-chat' },
     }));

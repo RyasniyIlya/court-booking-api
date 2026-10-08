@@ -1,5 +1,5 @@
 import { withSendSummary } from './telegramSafety';
-import { planFeatures } from './plans';
+import { telegramAnalytics } from './plans';
 import { DateTime } from 'luxon';
 
 import { prisma } from './db';
@@ -68,7 +68,9 @@ async function runDigestTickInner(now: DateTime = DateTime.now()): Promise<numbe
   let delivered = 0;
 
   for (const p of people) {
-    if (!p.tgChatId || !planFeatures(p.club.plan).telegram) continue;
+    /* Щоденне зведення — аналітика: лише тариф «Аналітика». Telegram на
+       нижчому тарифі є, а Pro-аналітики немає — тоді мовчимо. */
+    if (!p.tgChatId || !telegramAnalytics(p.club.plan)) continue;
 
     const local = now.setZone(p.club.timezone);
 

@@ -27,7 +27,7 @@ beforeEach(() => {
 it('віддає сітку з іменами й стороною переможця, без телефонів', async () => {
   const r = await request(app).get(`/tournaments/${ID}`);
   expect(r.status).toBe(200);
-  expect(r.headers['cache-control']).toBe('public, max-age=5, s-maxage=5, must-revalidate');
+  expect(r.headers['cache-control']).toBe('public, max-age=0, s-maxage=1, must-revalidate');
   expect(r.body).toMatchObject({ status: 'RUNNING', court: { name: 'Корт 1' }, club: { brandColor: '#123456' } });
   expect(r.body.entries).toEqual([{ name: 'Іван', seed: 1 }, { name: 'Олег', seed: 2 }]);
   expect(r.body.matches[0]).toMatchObject({ a: 'Іван', b: 'Олег', winner: 'B', court: 'Корт 2', status: 'DONE' });
@@ -39,4 +39,19 @@ it('віддає сітку з іменами й стороною перемож
 it('не турнір або скасований — 404', async () => {
   prisma.booking.findUnique.mockResolvedValue({ id: ID, title: 'Йога', capacity: 8, status: 'CONFIRMED' });
   expect((await request(app).get(`/tournaments/${ID}`)).status).toBe(404);
+});
+
+it('settings у публічному DTO: збережені або null для старого турніру', async () => {
+  expect((await request(app).get(`/tournaments/${ID}`)).body.settings).toBeNull();
+  const cur = await prisma.booking.findUnique();
+  prisma.booking.findUnique.mockResolvedValue({ ...cur, tournamentSettings: { teamSize: 1, setsToWin: 2, pointsToWin: 11 } });
+  expect((await request(app).get(`/tournaments/${ID}`)).body.settings).toEqual({ teamSize: 1, setsToWin: 2, pointsToWin: 11 });
+});
+
+it('GET /sport-rules: конфіг трьох видів, кеш 1 год', async () => {
+  const r = await request(app).get('/sport-rules');
+  expect(r.status).toBe(200);
+  expect(r.headers['cache-control']).toBe('public, max-age=3600');
+  expect(r.body.sports.map((s: { sport: string }) => s.sport)).toEqual(['PADEL', 'TENNIS', 'SQUASH']);
+  expect(r.body.sports[2]).toMatchObject({ teamSizes: [1], defaults: { setsToWin: 3, pointsToWin: 11 } });
 });

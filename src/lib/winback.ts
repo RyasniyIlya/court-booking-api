@@ -2,7 +2,7 @@ import { withSendSummary } from './telegramSafety';
 import { DateTime } from 'luxon';
 
 import { prisma } from './db';
-import { planFeatures } from './plans';
+import { telegramAnalytics } from './plans';
 import { botReady, sendReminderMessage } from './telegram';
 import { playerSchedulerEnabled } from './playerRemind';
 import {
@@ -215,7 +215,8 @@ async function runWinbackTickInner(now: Date = new Date()): Promise<number> {
   let delivered = 0;
 
   for (const club of clubs) {
-    if (!planFeatures(club.plan).telegram) continue;
+    /* Повернення клієнтів — сегментна автоматизація, шар «Аналітики». */
+    if (!telegramAnalytics(club.plan)) continue;
     const settings = normalizeBotSettings(club.botSettings);
     if (!settings.winback.enabled) continue;
     if (!inSendWindow(now, club.timezone)) continue;

@@ -1,4 +1,4 @@
-import { planFeatures } from './plans';
+import { planFeatures, telegramAnalytics } from './plans';
 import { telegramHtml } from './telegramHtml';
 import bcrypt from 'bcryptjs';
 import { checkPassword } from './passwordCheck';
@@ -74,10 +74,16 @@ export function resetThrottle() {
  * лишається поруч тим самим рядком — щоб не пояснювати одне й те саме
  * двома окремими списками.
  */
-const MENU_OWNER = [
+const MENU_OWNER_ANALYTICS = [
   '🔎 <b>Аналітика</b> — корти, суми, завантаження, оплати й скасування',
   '<code>/analytics today</code> · <code>/analytics yesterday</code>',
   '<code>/analytics week</code> · <code>/analytics month</code> · <code>/analytics YYYY-MM-DD</code>',
+];
+
+/** Щоденне зведення — теж аналітика тарифу «Аналітика» */
+const MENU_OWNER_DIGEST = '<i>Щовечора зведення дня приходить саме, без запиту.</i>';
+
+const MENU_OWNER_LINES = [
   '📊 <b>Сьогодні</b> — виручка, броні, нові клієнти',
   '📅 <b>Вчора</b> — те саме за попередній день',
   '📈 <b>Тиждень</b> — графік із перемикачем на 2 і 4 тижні',
@@ -85,7 +91,7 @@ const MENU_OWNER = [
   '👥 <b>Персонал</b> — хто скільки провів занять і заробив',
   '',
   '<i>Кнопки під полем вводу роблять те саме, що /today, /yesterday і /week.</i>',
-  '<i>Щовечора зведення дня приходить саме, без запиту.</i>',
+  '{{digest}}',
   '⚙️ <b>Сповіщення</b> — нові броні, нагадування про турніри й групові',
   '',
   '<i>Кожна нова бронь приходить сюди одразу, а перед турніром і груповим</i>',
@@ -94,7 +100,13 @@ const MENU_OWNER = [
   '/settings — налаштувати сповіщення',
   '/newpassword новий пароль — змінити пароль кабінету',
   '/logout — відключити цей чат',
-].join('\n');
+];
+
+const MENU_OWNER_FULL = [...MENU_OWNER_ANALYTICS, ...MENU_OWNER_LINES]
+  .join('\n')
+  .replace('{{digest}}', MENU_OWNER_DIGEST);
+/* Без «Аналітики» в тарифі: ні блоку /analytics, ні рядка про вечірнє зведення. */
+const MENU_OWNER_BASE = MENU_OWNER_LINES.filter((l) => l !== '{{digest}}').join('\n');
 
 const MENU_TRAINER = [
   '📋 <b>Мої заняття</b> — ваш розклад на сьогодні',
@@ -110,7 +122,8 @@ const MENU_TRAINER = [
   '/logout — відключити цей чат',
 ].join('\n');
 
-export const menuFor = (role: string) => (role === 'TRAINER' ? MENU_TRAINER : MENU_OWNER);
+export const menuFor = (role: string, analytics = true) =>
+  role === 'TRAINER' ? MENU_TRAINER : analytics ? MENU_OWNER_FULL : MENU_OWNER_BASE;
 
 /**
  * Перевірити пошту з паролем і привʼязати чат до акаунта.
@@ -160,7 +173,7 @@ export async function loginByPassword(
      цього відсікання «усе інше» дісталось би й бухгалтеру. */
   if (user.role === 'ACCOUNTANT') return 'Ця роль працює тільки в кабінеті на сайті. Фінанси — у розділі «Каса».';
 
-  if (!planFeatures(user.club.plan).telegram) return 'Telegram-бот доступний лише в максимальному пакеті.';
+  if (!planFeatures(user.club.plan).telegram) return 'Telegram-бот доступний після підключення тарифу.';
 
   /* Чат міг належати іншій людині клубу. Відвʼязуємо старого власника
      мовчки: unique-індекс на tgChatId інакше просто впаде, і людина
@@ -175,7 +188,7 @@ export async function loginByPassword(
     `✅ Вхід виконано`,
     `🎾 <b>${telegramHtml(user.club.name)}</b>`,
     '',
-    menuFor(user.role),
+    menuFor(user.role, telegramAnalytics(user.club.plan)),
   ].join('\n');
 }
 

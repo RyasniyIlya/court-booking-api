@@ -30,8 +30,9 @@ function fixture() {
       }),
       findUniqueOrThrow: vi.fn(async ({ where }: any) => [...players.values()].find((p) => p.id === where.id)!),
     },
+    club: { findUnique: vi.fn(async () => ({ sports: [] })) },
     clubPlayerRating: {
-      upsert: vi.fn(async ({ create }: any) => { ratings.add(`${create.clubId}/${create.playerId}`); }),
+      upsert: vi.fn(async ({ create }: any) => { ratings.add(`${create.clubId}/${create.playerId}/${create.sport}`); }),
     },
   };
   return { db, tx: db as unknown as Prisma.TransactionClient, players, customers, ratings };

@@ -21,7 +21,7 @@ const PLAN2 = { tier: 2, featTrainers: true, featGroups: true, featAnalytics: fa
 const clubs = [
   { id: 'club-a', slug: 'squash', name: 'Squash Arena', address: 'вул. Київська, 1', phone: '+380671112233', timezone: 'Europe/Kyiv', botSettings: {}, plan: PLAN3 },
   { id: 'club-b', slug: 'padel', name: 'Padel Club', address: null, phone: null, timezone: 'Europe/Kyiv', botSettings: {}, plan: PLAN3 },
-  { id: 'club-c', slug: 'basic', name: 'Basic Club', address: null, phone: null, timezone: 'Europe/Kyiv', botSettings: {}, plan: PLAN2 },
+  { id: 'club-c', slug: 'basic', name: 'Basic Club', address: null, phone: null, timezone: 'Europe/Kyiv', botSettings: {}, plan: null },
 ];
 let cards: Card[] = [];
 let staff: Record<string, unknown> | null = null;
@@ -147,7 +147,7 @@ describe('/start і /book підключеного гравця', () => {
     expect(sent()[0].text).toContain('Padel Club');
   });
 
-  it('картка клубу без тарифу Telegram не рахується — показуємо звичайний вибір клубу', async () => {
+  it('картка клубу без тарифу не рахується — показуємо звичайний вибір клубу', async () => {
     cards = [card({ clubId: 'club-c' })];
     await say('/start');
     expect(allText()).toContain('Оберіть клуб');

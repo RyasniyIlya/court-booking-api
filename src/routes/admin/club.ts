@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { z } from 'zod';
+import { sportsSchema } from '../../lib/sport';
 
 import { prisma } from '../../lib/db';
 import { KNOWN_PROVIDERS, providerFor, publicBase } from '../../lib/payments';
@@ -64,6 +65,8 @@ clubRouter.get(
       partnerCompany: club.partner ? (club.partner.company ?? club.partner.name) : null,
       name: club.name,
       slug: club.slug,
+      sports: club.sports,
+      defaultSetsToWin: club.defaultSetsToWin,
       timezone: club.timezone,
       phone: club.phone,
       address: club.address,
@@ -223,6 +226,12 @@ clubRouter.patch(
             .trim()
             .max(64)
             .optional(),
+
+        /* Види спорту клубу (Падел/Теніс/Сквош). */
+        sports: sportsSchema.optional(),
+
+        /* Формат матчу за замовчуванням: до скількох виграних сетів. */
+        defaultSetsToWin: z.number().int().min(1).max(3).optional(),
 
         slotMinutes:
           z.number()

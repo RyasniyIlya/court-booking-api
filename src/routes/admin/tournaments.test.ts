@@ -22,8 +22,15 @@ const prisma = {
   booking: {
     findFirst: vi.fn(async ({ where }: Rec) => (where.id === db.booking.id && where.clubId === db.booking.clubId ? { ...db.booking } : null)),
     update: vi.fn(async ({ data }: Rec) => { Object.assign(db.booking, data); return db.booking; }),
+    updateMany: vi.fn(async ({ where, data }: Rec) => {
+      if (where.tournamentStatus && db.booking.tournamentStatus !== where.tournamentStatus) return { count: 0 };
+      Object.assign(db.booking, data); return { count: 1 };
+    }),
   },
   bookingSeat: { findMany: vi.fn(async () => []) },
+  clubPlayerRating: { findFirst: vi.fn(async () => ({ playerId: 'x' })) },
+  player: { findUnique: vi.fn(async ({ where }: Rec) => ({ id: where.id, name: `Г${where.id.slice(-1)}` })) },
+  ratingChange: { findMany: vi.fn(async () => []) },
   court: { findFirst: vi.fn(async ({ where }: Rec) => (where.id === COURT ? { id: COURT } : null)) },
   user: { findUniqueOrThrow: vi.fn(async () => ({ email: 'moder@club.test', role: 'ADMIN' })) },
   changeLog: { createMany: vi.fn(async () => ({ count: 1 })) },
@@ -275,7 +282,7 @@ describe('права', () => {
     expect((await get()).status).toBe(403);
   });
 
-  it('тренер свого турніру читає й вводить рахунок, але не корт і не склад', async () => {
+  it('тренер свого турніру читає, але не вводить рахунок, корт чи склад', async () => {
     const body = await running();
     auth.role = 'TRAINER';
     auth.trainerId = 'mine';
@@ -283,7 +290,7 @@ describe('права', () => {
     expect((await get()).status).toBe(200);
     const m = find(body, 1, 0);
     expect((await patch(m.id, { version: 0, courtId: COURT })).status).toBe(403);
-    expect((await win(m.id)).status).toBe(200);
+    expect((await win(m.id)).status).toBe(403);
     expect((await put(['a', 'b'])).status).toBe(403);
     expect((await start()).status).toBe(403);
   });
@@ -292,5 +299,91 @@ describe('права', () => {
     auth.clubId = 'other';
     expect((await get()).status).toBe(404);
     auth.clubId = 'club';
+  });
+});
+
+describe('налаштування турніру (tournamentSettings)', () => {
+  const sq = { teamSize: 1, setsToWin: 2, pointsToWin: 11 };
+  beforeEach(() => { db.booking.tournamentSport = 'SQUASH'; db.booking.tournamentSettings = sq; db.booking.tournamentSetsToWin = 2; });
+  const sets = (...p: number[][]) => p.map(([a, b]) => ({ a, b }));
+
+  it('авто-DONE лише при завершених сетах і переможці за matchWinner', async () => {
+    const m = find(await running(), 1, 0);
+    let r = await patch(m.id, { version: 0, sets: sets([11, 5], [11, 10]) });
+    expect([r.status, r.body.match.status]).toEqual([200, 'PENDING']);
+    r = await patch(m.id, { version: 1, sets: sets([11, 5], [12, 10]) });
+    expect([r.status, r.body.match.status, r.body.match.winnerEntryId]).toEqual([200, 'DONE', m.entryAId]);
+  });
+  it('LIVE дозволяє незавершений останній сет', async () => {
+    const m = find(await running(), 1, 0);
+    const r = await patch(m.id, { version: 0, status: 'LIVE', sets: sets([11, 5], [3, 2]) });
+    expect([r.status, r.body.match.status]).toEqual([200, 'LIVE']);
+  });
+  it('DONE без фінального рахунку — 400 SCORE_NOT_FINAL', async () => {
+    const m = find(await running(), 1, 0);
+    const r = await patch(m.id, { version: 0, status: 'DONE', sets: sets([11, 5]) });
+    expect([r.status, r.body.error]).toEqual([400, 'SCORE_NOT_FINAL']);
+    const r2 = await patch(m.id, { version: 0, winner: 'A' });
+    expect([r2.status, r2.body.error]).toEqual([400, 'SCORE_NOT_FINAL']);
+  });
+  it('зайві сети — 400 TOO_MANY_SETS', async () => {
+    const m = find(await running(), 1, 0);
+    const r = await patch(m.id, { version: 0, sets: sets([11, 5], [11, 6], [11, 7]) });
+    expect([r.status, r.body.error]).toEqual([400, 'TOO_MANY_SETS']);
+  });
+  it('некоректний сет — 400 BAD_SET_SCORE', async () => {
+    const m = find(await running(), 1, 0);
+    let r = await patch(m.id, { version: 0, sets: sets([12, 5]) });
+    expect([r.status, r.body.error]).toEqual([400, 'BAD_SET_SCORE']);
+    r = await patch(m.id, { version: 0, sets: sets([11, 10], [11, 5]) });
+    expect([r.status, r.body.error]).toEqual([400, 'BAD_SET_SCORE']);
+  });
+  it('WALKOVER звільнений від перевірки рахунку', async () => {
+    const m = find(await running(), 1, 0);
+    const r = await patch(m.id, { version: 0, status: 'WALKOVER', winner: 'A', sets: sets([3, 1]) });
+    expect([r.status, r.body.match.status]).toEqual([200, 'WALKOVER']);
+  });
+  it('settings = null — стара поведінка (будь-який рахунок)', async () => {
+    db.booking.tournamentSettings = null; db.booking.tournamentSetsToWin = null;
+    const m = find(await running(), 1, 0);
+    const r = await patch(m.id, { version: 0, sets: sets([12, 5], [3, 1]) });
+    expect([r.status, r.body.match.status]).toEqual([200, 'DONE']);
+  });
+  it('PATCH settings: у DRAFT пише settings, teamSize і setsToWin; пізніше — 409 NOT_DRAFT', async () => {
+    db.booking.tournamentStatus = 'DRAFT';
+    const url = `/tournaments/${BID}/settings`;
+    let r = await request(app).patch(url).send({ settings: { teamSize: 1, setsToWin: 1, pointsToWin: 15 } });
+    expect([r.status, r.body.setsToWin]).toEqual([200, 1]);
+    expect(db.booking.tournamentSettings).toEqual({ teamSize: 1, setsToWin: 1, pointsToWin: 15 });
+    expect(db.booking.tournamentSetsToWin).toBe(1);
+    r = await request(app).patch(url).send({ settings: { teamSize: 2, setsToWin: 1 } });
+    expect([r.status, r.body.error]).toEqual([400, 'BAD_TEAM_SIZE']);
+    db.booking.tournamentStatus = 'RUNNING';
+    r = await request(app).patch(url).send({ settings: sq });
+    expect([r.status, r.body.error]).toEqual([409, 'NOT_DRAFT']);
+  });
+  it('GET віддає settings', async () => {
+    expect((await get()).body.tournament.settings).toEqual(sq);
+  });
+});
+
+describe('парний турнір 2×2', () => {
+  const P = (n: number) => `00000000-0000-4000-8000-00000000000${n}`;
+  const putTeams = (list: Rec[]) => request(app).put(`/tournaments/${BID}/entries`).send({ entries: list.map((e) => ({ name: 'x', ...e })) });
+  beforeEach(() => { db.booking.tournamentTeamSize = 2; });
+
+  it('пари зберігаються з партнером і назвою «A / B»', async () => {
+    const r = await putTeams([{ playerId: P(1), partnerPlayerId: P(2) }, { playerId: P(3), partnerPlayerId: P(4) }]);
+    expect(r.status).toBe(200);
+    expect(r.body.tournament.teamSize).toBe(2);
+    expect(r.body.entries[0]).toMatchObject({ name: "Г1 / Г2", playerId: P(1), partnerPlayerId: P(2) });
+  });
+  it('без партнера — 409 PARTNER_REQUIRED', async () => {
+    const r = await putTeams([{ playerId: P(1) }, { playerId: P(3), partnerPlayerId: P(4) }]);
+    expect([r.status, r.body.error]).toEqual([409, 'PARTNER_REQUIRED']);
+  });
+  it('той самий гравець у двох парах — 409 DUPLICATE_PLAYER', async () => {
+    const r = await putTeams([{ playerId: P(1), partnerPlayerId: P(2) }, { playerId: P(3), partnerPlayerId: P(1) }]);
+    expect([r.status, r.body.error]).toEqual([409, 'DUPLICATE_PLAYER']);
   });
 });

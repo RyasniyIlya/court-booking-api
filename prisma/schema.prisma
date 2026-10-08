@@ -81,11 +81,16 @@ enum UserRole {
 
 /// Спортивний клуб = один тенант SaaS
 model Club {
+  clubRatingRules        Json               @default("{\"win\":10,\"first\":30,\"second\":20,\"third\":10}")
   playerRatings          ClubPlayerRating[]
   federationPartnerships ClubFederation[]
   interclubTournaments   TournamentClub[]
   ratingChanges          RatingChange[]
   settlementSettings     Json               @default("{}")
+  /// Види спорту клубу; порожньо = не обрано (без обмежень).
+  sports                 Sport[]            @default([])
+  /// Скільки сетів треба виграти в матчі турніру за замовчуванням (1/2/3).
+  defaultSetsToWin       Int                @default(3)
   /// Цілі й пороги екрана аналітики: { occupancy, cancellation, retention }, %.
   /// null = дефолти веб-клієнта. Форма — lib/analyticsThresholds.ts.
   analyticsThresholds    Json?
@@ -411,6 +416,13 @@ enum Attendance {
 
 /// Фон під кабінетом і під сторінкою клубу. Enum, а не вільний рядок: значення
 /// потрапляє у верстку, і база сама не прийме нічого поза білим списком.
+/// Вид спорту клубу/турніру. Сквош — лише 1×1; теніс і падел — 1×1 або 2×2 (lib/sport.ts).
+enum Sport {
+  PADEL
+  TENNIS
+  SQUASH
+}
+
 enum BackdropStyle {
   GRADIENT
   TABLE_TENNIS
@@ -930,7 +942,21 @@ model CourtPhoto {
 }
 
 model Booking {
+  ratingsAppliedAt   DateTime?             @db.Timestamptz(3)
+  tournamentGender   String?
+  tournamentCategory String?
+  tournamentAgeCategory String?
+  tournamentDescription String?
   tournamentScope    TournamentScope      @default(CLUB)
+  /// false = клубний турнір без рейтингу (товариський); федеративний завжди true.
+  tournamentRated    Boolean              @default(true)
+  /// Вид спорту турніру і формат: 1 = одиночний, 2 = парний.
+  tournamentSport    Sport?
+  tournamentTeamSize Int                  @default(1)
+  /// До скількох виграних сетів іде матч турніру; null = legacy (більше сетів).
+  tournamentSetsToWin Int?
+  /// Налаштування турніру за правилами спорту (lib/sportRules.ts); null = legacy-турнір.
+  tournamentSettings Json?
   federationId       String?              @db.Uuid
   federation         Federation?          @relation(fields: [federationId], references: [id], onDelete: Restrict)
   federationCode     String?
@@ -1194,6 +1220,9 @@ enum TournamentMatchStatus {
 model TournamentEntry {
   playerId    String?           @db.Uuid
   player      Player?           @relation(fields: [playerId], references: [id], onDelete: Restrict)
+  /// Партнер у парному турнірі (2×2); playerId — перший гравець пари.
+  partnerPlayerId String?       @db.Uuid
+  partner     Player?           @relation("EntryPartner", fields: [partnerPlayerId], references: [id], onDelete: Restrict)
   id          String            @id @default(uuid()) @db.Uuid
   bookingId   String            @db.Uuid
   booking     Booking           @relation(fields: [bookingId], references: [id], onDelete: Cascade)
@@ -1212,6 +1241,7 @@ model TournamentEntry {
 
   @@unique([bookingId, seed])
   @@index([playerId])
+  @@index([partnerPlayerId])
   @@index([clubId])
 }
 
@@ -1582,6 +1612,7 @@ model Customer {
   /// одна людина може ходити у два клуби — це різні картки.
   @@unique([clubId, phone])
   @@index([playerId])
+  @@index([clubId, playerId])
   /// Звіт «що приводить нових клієнтів» групує саме за цією парою.
   @@index([clubId, firstChannel])
   @@index([clubId, phoneTail])
@@ -2406,6 +2437,13 @@ enum FederationPartnershipStatus {
 
 /// Platform identity. Matching a phone does not confer authentication rights.
 model Player {
+  avatarUrl             String?
+  bio                   String?
+  gender                String?
+  birthDate             DateTime?          @db.Date
+  ageCategory           String?
+  skillLevel            String?
+  publicProfile         Boolean            @default(true)
   id                    String             @id @default(uuid()) @db.Uuid
   phone                 String             @unique
   name                  String
@@ -2421,15 +2459,45 @@ model Player {
   customers             Customer[]
   clubRatings           ClubPlayerRating[]
   tournamentEntries     TournamentEntry[]
+  partnerEntries        TournamentEntry[]  @relation("EntryPartner")
   ratingChanges         RatingChange[]
+  federationRatings     FederationPlayerRating[]
   createdAt             DateTime           @default(now()) @db.Timestamptz(3)
   updatedAt             DateTime           @updatedAt @db.Timestamptz(3)
 
   @@unique([federationId, federationPlayerCode])
   @@index([eloFederation, id])
+  @@index([federationId, eloFederation, id])
+}
+
+/// ELO гравця в межах федерації (= один вид спорту). Player.eloFederation лишається дзеркалом для сквош-федерацій.
+model FederationPlayerRating {
+  federationId String     @db.Uuid
+  playerId     String     @db.Uuid
+  federation   Federation @relation(fields: [federationId], references: [id], onDelete: Restrict)
+  player       Player     @relation(fields: [playerId], references: [id], onDelete: Restrict)
+  elo          Int        @default(1200)
+  matchCount   Int        @default(0)
+  lastMatchAt  DateTime?  @db.Timestamptz(3)
+  updatedAt    DateTime   @updatedAt @db.Timestamptz(3)
+
+  @@id([federationId, playerId])
+  @@index([federationId, elo(sort: Desc)])
+  @@index([playerId])
 }
 
 model ClubPlayerRating {
+  /// Клубні очки окремо за видом спорту (старі рядки = SQUASH).
+  sport       Sport             @default(SQUASH)
+  points      Int               @default(0)
+  wins        Int               @default(0)
+  tournamentWins Int            @default(0)
+  group       String?
+  category    String?
+  title       String?
+  status      String?
+  achievements String[]         @default([])
+  active      Boolean           @default(true)
   clubId      String            @db.Uuid
   playerId    String            @db.Uuid
   club        Club              @relation(fields: [clubId], references: [id], onDelete: Restrict)
@@ -2441,21 +2509,57 @@ model ClubPlayerRating {
   manualLevel String?
   updatedAt   DateTime          @updatedAt @db.Timestamptz(3)
 
-  @@id([clubId, playerId])
+  @@id([clubId, playerId, sport])
   @@index([clubId, eloClub, playerId])
+  @@index([clubId, points, playerId])
   @@index([playerId])
 }
 
 model Federation {
+  accounts     FederationAccount[]
   id           String           @id @default(uuid()) @db.Uuid
   name         String
   code         String           @unique
   logoUrl      String?
+  /// Федерація належить одному виду спорту; її ELO окремий (FederationPlayerRating).
+  sport        Sport            @default(SQUASH)
+  /// Налаштування ELO (lib/federationRating.ts); NULL = типові.
+  ratingSettings Json?
+  settingsLog  FederationSettingsLog[]
   players      Player[]
+  playerRatings FederationPlayerRating[]
   tournaments  Booking[]
   partnerships ClubFederation[]
   createdAt    DateTime         @default(now()) @db.Timestamptz(3)
   updatedAt    DateTime         @updatedAt @db.Timestamptz(3)
+}
+
+/// Журнал змін налаштувань федерації: хто, коли, було/стало.
+model FederationSettingsLog {
+  id           String     @id @default(uuid()) @db.Uuid
+  federationId String     @db.Uuid
+  federation   Federation @relation(fields: [federationId], references: [id], onDelete: Cascade)
+  field        String
+  before       Json?
+  after        Json?
+  actorEmail   String
+  at           DateTime   @default(now()) @db.Timestamptz(3)
+
+  @@index([federationId, at])
+}
+
+model FederationAccount {
+  id           String     @id @default(uuid()) @db.Uuid
+  federationId String     @db.Uuid
+  federation   Federation @relation(fields: [federationId], references: [id], onDelete: Restrict)
+  email        String     @unique
+  name         String
+  passwordHash String
+  active       Boolean    @default(true)
+  loginFails   Int        @default(0)
+  lockedUntil  DateTime?   @db.Timestamptz(3)
+  createdAt    DateTime   @default(now()) @db.Timestamptz(3)
+  @@index([federationId])
 }
 
 model ClubFederation {
@@ -2493,6 +2597,8 @@ model RatingChange {
   clubId             String?          @db.Uuid
   club               Club?            @relation(fields: [clubId], references: [id], onDelete: Restrict)
   ratingType         RatingType
+  /// Вид спорту зміни (NULL у старих рядках = сквош).
+  sport              Sport?
   kind               RatingChangeKind
   before             Int
   after              Int

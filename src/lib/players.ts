@@ -1,5 +1,6 @@
 import type { Prisma } from '@prisma/client';
 import { normalizePhone } from './phone';
+import { defaultClubSport } from './sportRating';
 
 /** Foundation for imports/backfill. Call inside a transaction; never grants login rights.
  * Existing links and player names are preserved, and ambiguous phone changes fail closed.
@@ -28,10 +29,13 @@ export async function linkCustomerPlayer(db: Prisma.TransactionClient, customerI
     // Throwing rolls back the caller's transaction; retry with the fresh card.
     if (linked.count !== 1) throw new Error('PLAYER_LINK_CONFLICT');
   }
+  // Членство клубу = рядок у ClubPlayerRating; за замовчуванням у першому спорті клубу (інакше сквош).
+  const club = await db.club.findUnique({ where: { id: customer.clubId }, select: { sports: true } });
+  const sport = defaultClubSport(club?.sports);
   await db.clubPlayerRating.upsert({
-    where: { clubId_playerId: { clubId: customer.clubId, playerId: player.id } },
+    where: { clubId_playerId_sport: { clubId: customer.clubId, playerId: player.id, sport } },
     update: {},
-    create: { clubId: customer.clubId, playerId: player.id },
+    create: { clubId: customer.clubId, playerId: player.id, sport },
   });
   return player;
 }

@@ -126,3 +126,49 @@ describe('resolveMatchUpdate: статус DONE', () => {
       .toEqual({ ok: false, error: 'WINNER_REQUIRED' });
   });
 });
+
+describe('resolveMatchUpdate: setsToWin', () => {
+  const cur = { entryAId: 'a', entryBId: 'b', sets: [], winnerEntryId: null, status: 'LIVE' as const };
+  const s = (...p: Array<[number, number]>) => p.map(([a, b]) => ({ a, b }));
+
+  it('1:0 за сетами не завершує матч до 2 перемог', () => {
+    const r = resolveMatchUpdate(cur, { sets: s([6, 1]), setsToWin: 2 });
+    expect(r).toMatchObject({ ok: true, status: 'LIVE', winnerEntryId: null });
+  });
+
+  it('2:0 завершує матч автоматично', () => {
+    const r = resolveMatchUpdate(cur, { sets: s([6, 1], [6, 2]), setsToWin: 2 });
+    expect(r).toMatchObject({ ok: true, status: 'DONE', winnerEntryId: 'a' });
+  });
+
+  it('2:1 завершує, 1:1 — ні', () => {
+    expect(resolveMatchUpdate(cur, { sets: s([6, 1], [2, 6], [6, 3]), setsToWin: 2 }))
+      .toMatchObject({ status: 'DONE', winnerEntryId: 'a' });
+    expect(resolveMatchUpdate(cur, { sets: s([6, 1], [2, 6]), setsToWin: 2 }))
+      .toMatchObject({ status: 'LIVE', winnerEntryId: null });
+  });
+
+  it('DONE без вирішального рахунку — SCORE_NOT_FINAL', () => {
+    expect(resolveMatchUpdate(cur, { sets: s([6, 1]), status: 'DONE', setsToWin: 2 }))
+      .toEqual({ ok: false, error: 'SCORE_NOT_FINAL' });
+  });
+
+  it('сет після вирішального і понад 2N-1 — TOO_MANY_SETS', () => {
+    expect(resolveMatchUpdate(cur, { sets: s([6, 1], [6, 2], [6, 3]), setsToWin: 2 }))
+      .toEqual({ ok: false, error: 'TOO_MANY_SETS' });
+    expect(resolveMatchUpdate(cur, { sets: s([6, 1], [1, 6], [6, 1], [1, 6]), setsToWin: 2 }))
+      .toEqual({ ok: false, error: 'TOO_MANY_SETS' });
+    expect(resolveMatchUpdate(cur, { sets: s([6, 1], [6, 2]), setsToWin: 1 }))
+      .toEqual({ ok: false, error: 'TOO_MANY_SETS' });
+  });
+
+  it('WALKOVER/RETIRED звільнені від порога', () => {
+    expect(resolveMatchUpdate(cur, { sets: s([6, 1]), status: 'RETIRED', winner: 'A', setsToWin: 3 }))
+      .toMatchObject({ ok: true, status: 'RETIRED', winnerEntryId: 'a' });
+  });
+
+  it('null лишає стару поведінку', () => {
+    expect(resolveMatchUpdate(cur, { sets: s([6, 1]), setsToWin: null }))
+      .toMatchObject({ status: 'DONE', winnerEntryId: 'a' });
+  });
+});

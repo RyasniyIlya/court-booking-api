@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { planFeatures, clubPrice } from './plans';
+import { planFeatures, clubPrice, telegramAnalytics } from './plans';
 
 describe('clubPrice — індивідуальна ціна б’є ціну плану', () => {
   const plan = { price: 900_00 };
@@ -34,14 +34,26 @@ const base = { tier: 1, featTrainers: false, featGroups: false, featAnalytics: f
 const team = { tier: 2, featTrainers: true, featGroups: true, featAnalytics: false };
 const pro = { tier: 3, featTrainers: true, featGroups: true, featAnalytics: true };
 describe('subscription packages', () => {
- it.each([null, undefined, base])('does not grant paid features without a paid package: %s', plan => {
+ it.each([null, undefined])('does not grant paid features without a package: %s', plan => {
  expect(planFeatures(plan)).toEqual({trainers:false, groups:false, analytics:false, telegram:false, ai:false});
+ expect(telegramAnalytics(plan)).toBe(false);
  });
- it('team includes trainers and groups only', () => expect(planFeatures(team)).toEqual({trainers:true,groups:true,analytics:false,telegram:false,ai:false}));
- it('maximum includes Telegram and the AI manager', () => expect(planFeatures(pro)).toEqual({trainers:true,groups:true,analytics:true,telegram:true,ai:true}));
- it('analytics on a custom lower tier does not grant Telegram or AI', () => {
+ it('base (tier 1) includes Telegram, but not trainers, groups, analytics or AI', () => {
+ expect(planFeatures(base)).toEqual({trainers:false, groups:false, analytics:false, telegram:true, ai:false});
+ expect(telegramAnalytics(base)).toBe(false);
+ });
+ it('team includes trainers, groups and Telegram, but not analytics or AI', () => {
+ expect(planFeatures(team)).toEqual({trainers:true,groups:true,analytics:false,telegram:true,ai:false});
+ expect(telegramAnalytics(team)).toBe(false);
+ });
+ it('maximum includes Telegram, analytics in Telegram and the AI manager', () => {
+ expect(planFeatures(pro)).toEqual({trainers:true,groups:true,analytics:true,telegram:true,ai:true});
+ expect(telegramAnalytics(pro)).toBe(true);
+ });
+ it('analytics on a custom lower tier does not grant AI', () => {
  const f = planFeatures({...base,featAnalytics:true});
- expect(f.telegram).toBe(false);
+ expect(f.telegram).toBe(true);
+ expect(f.analytics).toBe(true);
  expect(f.ai).toBe(false);
  });
 });
