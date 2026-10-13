@@ -12,6 +12,8 @@
     "dev:safe": "node scripts/dev-local.mjs",
     "dev:isolated": "tsx scripts/dev-isolated.mjs",
     "build": "tsc",
+    "build:scripts": "tsc -p tsconfig.scripts.json",
+    "demo:stand:reset": "tsx scripts/demo-stand-reset.ts",
     "start": "node dist/index.js",
     "db:migrate": "prisma migrate dev",
     "db:seed": "tsx prisma/seed.ts",

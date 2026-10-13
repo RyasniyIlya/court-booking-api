@@ -20,9 +20,7 @@
  */
 import { PrismaClient } from '@prisma/client';
 
-const prisma = new PrismaClient();
-
-const PLANS = [
+export const PLANS = [
   {
     code: 'base',
     name: 'Броні',
@@ -58,7 +56,8 @@ const PLANS = [
   },
 ] as const;
 
-async function main() {
+/** Створює/оновлює каталог планів. Експортовано для scripts/demo-stand-reset.ts. */
+export async function initPlans(prisma: PrismaClient) {
   for (const p of PLANS) {
     const { code, price, ...rest } = p;
 
@@ -82,9 +81,12 @@ async function main() {
   );
 }
 
-main()
-  .catch((e) => {
-    console.error(e);
-    process.exit(1);
-  })
-  .finally(() => prisma.$disconnect());
+if (require.main === module) {
+  const prisma = new PrismaClient();
+  initPlans(prisma)
+    .catch((e) => {
+      console.error(e);
+      process.exit(1);
+    })
+    .finally(() => prisma.$disconnect());
+}

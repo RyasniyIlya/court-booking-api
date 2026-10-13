@@ -11,6 +11,7 @@ import jwt from 'jsonwebtoken';
 import { JWT_SECRET } from '../../lib/authSecret';
 import { prisma } from '../../lib/db';
 import { planFeatures, type PlanFeatures } from '../../lib/plans';
+import { demoGuard } from '../../lib/demo';
 
 /* -------------------------------------------------------------------------- */
 /* AUTH                                                                       */
@@ -27,6 +28,8 @@ export type Auth = {
   role: string;
   /// Тільки для role === 'TRAINER'. Яку картку тренера бачить цей акаунт.
   trainerId: string | null;
+  /// true лише для токена з /api/demo/session: його можна обмежувати (lib/demo.ts).
+  demo?: boolean;
 };
 
 declare global {
@@ -76,6 +79,7 @@ export async function requireAuth(
       SECRET,
       { algorithms: ['HS256'] },
     ) as Partial<Auth> & { credentialVersion?: string };
+    const isDemo = payload.demo === true;
 
     if (
       typeof payload.userId !== 'string' ||
@@ -88,13 +92,19 @@ export async function requireAuth(
     }
 
     const user = await prisma.user.findUnique({ where: { id: payload.userId },
-      select: { id: true, clubId: true, role: true, trainerId: true, passwordHash: true } });
+      select: { id: true, clubId: true, role: true, trainerId: true, passwordHash: true, email: true } });
     if (!user || user.clubId !== payload.clubId || !payload.credentialVersion ||
         payload.credentialVersion !== credentialVersion(user.passwordHash)) {
       return res.status(401).json({ error: 'SESSION_REVOKED' });
     }
-    req.auth = { userId: user.id, clubId: user.clubId, role: user.role, trainerId: user.trainerId };
+    /* demo:true у токені довіряємо лише для вигаданих акаунтів: навіть якщо
+       такий токен якось видали б справжньому користувачу, він не пройде. */
+    if (isDemo && !String(user.email ?? '').toLowerCase().endsWith('@demo.test')) {
+      return res.status(401).json({ error: 'INVALID_TOKEN' });
+    }
+    req.auth = { userId: user.id, clubId: user.clubId, role: user.role, trainerId: user.trainerId, ...(isDemo ? { demo: true } : {}) };
 
+    if (isDemo) return demoGuard(req, res, next);
     next();
   } catch {
     return res.status(401).json({

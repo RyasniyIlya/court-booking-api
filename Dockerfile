@@ -18,6 +18,13 @@ COPY tsconfig.json ./
 COPY src ./src
 RUN npm run build
 
+# Скрипт скидання демо-стенду (cron kort-demo-reset) збирається окремим tsc у dist-scripts:
+# tsx у runtime-образі немає (devDependencies), а rootDir основної збірки — src, тож
+# CMD і dist/index.js це не зачіпає. Запуск: node dist-scripts/scripts/demo-stand-reset.js
+COPY scripts/demo-stand-reset.ts scripts/demo-online.ts scripts/plans-init.ts ./scripts/
+COPY tsconfig.scripts.json ./
+RUN npm run build:scripts
+
 # ---- runtime ----
 FROM node:22-slim AS runtime
 WORKDIR /app
@@ -34,6 +41,7 @@ RUN npm ci --omit=dev
 COPY --from=build /app/node_modules/.prisma ./node_modules/.prisma
 COPY --from=build /app/node_modules/@prisma ./node_modules/@prisma
 COPY --from=build /app/dist ./dist
+COPY --from=build /app/dist-scripts ./dist-scripts
 COPY prisma ./prisma
 
 # Не запускаємо від root

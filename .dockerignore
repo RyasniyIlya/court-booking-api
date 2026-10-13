@@ -5,3 +5,4 @@ dist
 *.md
 widget
 docker-compose.yml
+dist-scripts

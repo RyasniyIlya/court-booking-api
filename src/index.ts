@@ -18,6 +18,7 @@ import { playerProfilesRouter, publicFederationRouter } from './routes/playerPro
 import { requireFederationAuth } from './lib/federationAuth';
 import { requirePlatformAuth } from './lib/platformAuth';
 import { payRouter } from './routes/pay';
+import { demoRouter } from './routes/demo';
 import { startExpirySweeper } from './lib/expire';
 import { startBot, telegramWebhookSecret } from './lib/botRunner';
 import { startDigestScheduler } from './lib/digestScheduler';
@@ -59,7 +60,7 @@ app.use((req, res, next) => {
   }
   // Персональні дані не мають осідати в спільних кешах. Це лише значення
   // за замовчуванням: маршрут, що ставить свій Cache-Control, перекриє його.
-  if (req.path.startsWith('/api/admin') || req.path.startsWith('/api/platform') || req.path.startsWith('/api/partner') || req.path.startsWith('/api/federation')) {
+  if (req.path.startsWith('/api/admin') || req.path.startsWith('/api/platform') || req.path.startsWith('/api/partner') || req.path.startsWith('/api/federation') || req.path.startsWith('/api/demo')) {
     res.set('Cache-Control', 'no-store');
   }
   next();
@@ -128,7 +129,7 @@ app.use('/api/platform', cors({
 }));
 
 // Кабінет партнера (будівельники кортів) — той самий origin-allowlist.
-app.use(['/api/partner', '/api/federation'], cors({
+app.use(['/api/partner', '/api/federation', '/api/demo'], cors({
   origin(origin, cb) {
     if (!origin) return cb(null, true);
     if (adminOrigins.includes(origin.replace(/\/+$/, ''))) return cb(null, true);
@@ -157,6 +158,7 @@ app.use('/api/platform', platformCrmRouter);
 app.use('/api/platform', platformAnalyticsRouter);
 app.use('/api/partner', partnerRouter);
 app.use('/api/federation', federationRouter);
+app.use('/api/demo', demoRouter);
 
 /**
  * Вебхук Telegram. Це єдиний шлях для вхідних команд: фоновий polling

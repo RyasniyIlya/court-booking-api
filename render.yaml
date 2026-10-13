@@ -69,5 +69,9 @@ services:
       - key: PLATFORM_ADMIN_PASSWORD_HASH
         sync: false
 
+      # DEMO_LOGIN (вхід у демо без пароля) тут НЕ задається — без нього POST /api/demo/session
+      # на проді віддає 404. Демо живе окремо: kort-demo-api описаний у landing-page/render.yaml
+      # (репозиторій court-booking-lending), з ОКРЕМОЮ базою.
+
       - key: PORT
         value: 3000

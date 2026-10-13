@@ -15,6 +15,7 @@ service-account*.json
 # ── Залежності і збірка ─────────────────────────────────────────────────
 node_modules/
 dist/
+dist-scripts/
 build/
 *.tsbuildinfo
 
