@@ -207,6 +207,11 @@ describe('booking.cancel / booking.reschedule', () => {
     expect(patchAdminBooking).not.toHaveBeenCalled();
   });
 
+  it('онлайн-оплата в дорозі (PENDING) — скасування відхиляється', async () => {
+    state.booking = { ...future(), payment: { status: 'PENDING', amount: 90000 } };
+    expect((await code(propose('booking.cancel', { bookingId: UUID(20), reason: 'x' })))?.[1]).toMatch(/триває онлайн-оплата/);
+  });
+
   it('вже скасована між пропозицією й підтвердженням — FAILED', async () => {
     state.booking = future();
     const a = await propose('booking.cancel', { bookingId: UUID(20), reason: 'x' });
@@ -335,6 +340,19 @@ describe('добовий ліміт AUTO', () => {
       /* Людина може підтвердити те, що вийшло за ліміт. */
       const pending = state.actions.find((a) => a.status === 'PENDING')!;
       expect(await approveAction(pending.id, OWNER)).toMatchObject({ status: 'EXECUTED', decidedById: 'u-owner' });
+    } finally {
+      delete process.env.AI_AUTO_DAILY_CAP;
+    }
+  });
+
+  it('паралельні пропозиції не перевищують ліміт (claim, потім підрахунок)', async () => {
+    process.env.AI_AUTO_DAILY_CAP = '2';
+    try {
+      state.policy = { bookings: 'AUTO' };
+      const rows = await Promise.all(Array.from({ length: 6 }, () => propose('booking.create', payload())));
+      expect(rows.filter((r) => r.status === 'EXECUTED').length).toBeLessThanOrEqual(2);
+      expect(createAdminBooking.mock.calls.length).toBeLessThanOrEqual(2);
+      expect(state.actions.filter((a) => a.status === 'PENDING' && a.decidedAt !== null)).toHaveLength(0);
     } finally {
       delete process.env.AI_AUTO_DAILY_CAP;
     }

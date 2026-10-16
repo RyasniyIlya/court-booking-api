@@ -189,6 +189,8 @@ export function scopeMode(perms: AiPermissions, scope: ActionScope | 'reports'):
   return perms[scope];
 }
 
+/* Навмисно: make_report доступний і TRAINER/ACCOUNTANT, якщо власник відкрив їм `reports` —
+   звіти лише читають, а колонки й типи звітів звужуються за правами ролі (reportFile.ts). */
 /** Ролі, що руками керують бронями й турнірами; решта (бухгалтер, тренер) модель на дії не наставить. */
 const OPERATING_ROLES = ['OWNER', 'ADMIN'];
 

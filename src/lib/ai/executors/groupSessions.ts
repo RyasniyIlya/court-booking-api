@@ -96,7 +96,7 @@ registerExecutor('groupSession.create', {
     const problem = await slotProblem(clubId, court.id, new Date(p.start), new Date(p.end), await clubTimezone(clubId));
     if (problem) throw new ActionFailedError(problem);
 
-    const input = createBookingSchema.parse({
+    const parsed = createBookingSchema.safeParse({
       courtId: court.id,
       start: p.start,
       end: p.end,
@@ -105,6 +105,8 @@ registerExecutor('groupSession.create', {
       pricePerSeat: p.pricePerSeat,
       trainerId: p.trainerId,
     });
+    if (!parsed.success) throw new ActionFailedError('Некоректні дані заняття: перевірте назву, місця, ціну й час.');
+    const input = parsed.data;
     const body = unwrapOutcome(await createAdminBooking(input, actor)) as { id: string };
     return { bookingId: body.id };
   },

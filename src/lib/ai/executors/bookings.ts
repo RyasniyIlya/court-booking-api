@@ -74,6 +74,7 @@ function cancelProblem(b: LoadedBooking): string | null {
   if (!(ACTIVE as readonly string[]).includes(b.status)) return 'Бронь уже скасована або завершена.';
   if (b.startTime.getTime() < Date.now()) return 'Бронь уже минула.';
   const paid = totals(b.ledgerEntries, b.payment?.status === 'PAID' ? b.payment.amount : 0).net;
+  if (b.payment?.status === 'PENDING') return 'За цю бронь триває онлайн-оплата. ІІ не скасовує такі броні: дочекайтеся результату оплати або скасуйте її в кабінеті.';
   if (paid > 0) return `Бронь оплачена (${uah(paid)}). ІІ не скасовує оплачені броні: скасуйте її в кабінеті й вирішіть, чи повертати гроші.`;
   return null;
 }
@@ -114,7 +115,7 @@ registerExecutor('booking.create', {
     const problem = await slotProblem(clubId, court.id, new Date(p.start), new Date(p.end), await clubTimezone(clubId));
     if (problem) throw new ActionFailedError(problem);
 
-    const input = createBookingSchema.parse({
+    const parsed = createBookingSchema.safeParse({
       courtId: court.id,
       start: p.start,
       end: p.end,
@@ -122,6 +123,8 @@ registerExecutor('booking.create', {
       customerPhone: customer?.phone ?? p.customerPhone,
       comment: p.note,
     });
+    if (!parsed.success) throw new ActionFailedError('Некоректні дані броні: перевірте клієнта, час і корт.');
+    const input = parsed.data;
     const body = unwrapOutcome(await createAdminBooking(input, actor)) as { id: string; priceTotal: number; status: string };
     return { bookingId: body.id, status: body.status, price: uah(body.priceTotal) };
   },

@@ -158,12 +158,21 @@ export async function proposeAction(opts: {
     },
   });
   if (mode !== 'AUTO') return row;
-  /* Стеля AUTO: понад ліміт дія не губиться, а чекає людину, як у режимі ASK. */
-  if (!executor.readOnly && (await autoUsedToday(opts.clubId)) >= autoDailyCap()) return row;
-
   /* AUTO: рішення прийняла політика, тому decidedById лишається порожнім. */
   const claimed = await claim(row.id, opts.clubId, null);
-  return claimed ? runClaimed(row.id, opts.clubId) : row;
+  if (!claimed) return row;
+
+  /* Стеля AUTO без блокувань: спершу «забираємо» слот, потім рахуємо. Якщо разом із нашим
+     рядком уже понад ліміт — повертаємо його в PENDING (чекає людину, як у режимі ASK).
+     Паралельні пропозиції можуть відкотити одна одну обидві, але ліміт не перевищать ніколи. */
+  if (!executor.readOnly && (await autoUsedToday(opts.clubId)) > autoDailyCap()) {
+    await prisma.aiAction.updateMany({
+      where: { id: row.id, clubId: opts.clubId, status: 'PENDING', decidedById: null },
+      data: { decidedAt: null },
+    });
+    return { ...row };
+  }
+  return runClaimed(row.id, opts.clubId);
 }
 
 /** Атомарний перехід: рядок «забирає» лише один виклик, тому подвійний клік не виконає дію двічі. */
@@ -204,7 +213,11 @@ async function runClaimed(id: string, clubId: string) {
       result: (result ?? Prisma.JsonNull) as Prisma.InputJsonValue,
     });
   } catch (e) {
-    return fail(e instanceof Error ? e.message : 'EXECUTION_FAILED');
+    /* У журнал і в чергу власника йде лише відомий збій з українським текстом; сирий
+       текст винятку (SQL, zod, мережа) — тільки в лог сервера. */
+    if (e instanceof ActionFailedError) return fail(e.message);
+    console.error('[ai] action failed', action.kind, e);
+    return fail('Не вдалося виконати дію. Спробуйте ще раз або зробіть це в кабінеті.');
   }
 }
 

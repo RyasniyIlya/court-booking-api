@@ -70,8 +70,9 @@ function localIso(date: unknown, time: unknown, tz: string, name: string): strin
 /** Початок і кінець; кінець «до опівночі» чи за північ (≤ початку) — наступної доби. */
 function interval(a: Record<string, unknown>, tz: string) {
   const start = localIso(a.date, a.start_time, tz, 'start');
-  let endDt = DateTime.fromISO(localIso(a.date, a.end_time, tz, 'end'));
-  const startDt = DateTime.fromISO(start);
+  /* zone: tz обовʼязково: без неї +1 доба рахується в поясі сервера й зсуває кінець на годину при зміні часу. */
+  let endDt = DateTime.fromISO(localIso(a.date, a.end_time, tz, 'end'), { zone: tz });
+  const startDt = DateTime.fromISO(start, { zone: tz });
   if (endDt <= startDt) endDt = endDt.plus({ days: 1 });
   return { start, end: endDt.toISO()! };
 }

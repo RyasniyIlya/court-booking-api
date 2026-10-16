@@ -150,6 +150,14 @@ describe('відповіді інструментів-дій', () => {
     expect(proposeAction.mock.calls[0][0].payload.end).toBe('2026-10-24T00:00:00.000+03:00');
   });
 
+  it('кінець за північ у ніч переходу на зимовий час (2026-10-25, Київ) лишається опівночею', async () => {
+    proposeAction.mockResolvedValue(row({}));
+    await tool('propose_booking').run({ ...booking, date: '2026-10-25', start_time: '23:00', end_time: '00:00' });
+    expect(proposeAction.mock.calls[0][0].payload).toMatchObject({
+      start: '2026-10-25T23:00:00.000+02:00', end: '2026-10-26T00:00:00.000+02:00',
+    });
+  });
+
   it('make_report: закритий звіт відхиляється до журналу, дати за замовчуванням — 30 днів', async () => {
     await expect(tool('make_report', perms({ readFinance: false })).run({ type: 'revenue' })).rejects.toThrow(/потребує доступу до даних про фінанси/);
     await expect(tool('make_report', perms({ readCustomers: false })).run({ type: 'customers' })).rejects.toThrow(/клієнтів/);

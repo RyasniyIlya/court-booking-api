@@ -41,7 +41,7 @@ const prisma = {
 };
 vi.mock('../db', () => ({ prisma }));
 
-const { ACTION_TTL_MS, AiActionError, approveAction, expireStaleActions, proposeAction, registerExecutor, rejectAction, resetExecutors } = await import('./actions');
+const { ACTION_TTL_MS, ActionFailedError, AiActionError, approveAction, expireStaleActions, proposeAction, registerExecutor, rejectAction, resetExecutors } = await import('./actions');
 
 const execute = vi.fn(async (_clubId: string, payload: unknown) => ({ done: payload }));
 const owner = { id: 'owner-1', clubId: 'club-1' };
@@ -86,8 +86,20 @@ describe('proposeAction', () => {
 
   it('AUTO, виконавець упав — FAILED з повідомленням, без винятку', async () => {
     state.policy = { bookings: 'AUTO' };
-    execute.mockRejectedValue(new Error('Слот зайнятий'));
+    execute.mockRejectedValue(new ActionFailedError('Слот зайнятий'));
     expect(await propose()).toMatchObject({ status: 'FAILED', error: 'Слот зайнятий' });
+  });
+
+  it('невідомий виняток не потрапляє в журнал сирим текстом', async () => {
+    state.policy = { bookings: 'AUTO' };
+    const spy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    execute.mockRejectedValue(new Error('select * from "Booking" failed'));
+    const a = await propose();
+    expect(a.status).toBe('FAILED');
+    expect(a.error).not.toMatch(/select/);
+    expect(a.error).toMatch(/Не вдалося виконати/);
+    expect(spy).toHaveBeenCalled();
+    spy.mockRestore();
   });
 
   it('режим береться для ролі запитувача: ADMIN без доступу — відмова, з доступом — перетин з власником', async () => {
@@ -142,7 +154,7 @@ describe('approveAction / rejectAction', () => {
 
   it('виконавець упав при підтвердженні — FAILED з помилкою', async () => {
     const p = await propose();
-    execute.mockRejectedValue(new Error('boom'));
+    execute.mockRejectedValue(new ActionFailedError('boom'));
     expect(await approveAction(p.id, owner)).toMatchObject({ status: 'FAILED', error: 'boom' });
   });
 
