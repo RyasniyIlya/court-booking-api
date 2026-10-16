@@ -6,6 +6,7 @@ const state = { actions: [] as Row[], policy: null as Row | null, seq: 0 };
 
 const matches = (row: Row, where: Row) => Object.entries(where).every(([k, v]) => {
   if (v && typeof v === 'object' && 'lte' in v) return row[k] <= v.lte;
+  if (v && typeof v === 'object' && 'gt' in v) return row[k] > v.gt;
   return row[k] === v;
 });
 
@@ -21,7 +22,7 @@ const prisma = {
       const r = state.actions.find((a) => matches(a, where));
       return r ? { ...r } : null;
     }),
-    findUniqueOrThrow: vi.fn(async ({ where }: { where: Row }) => ({ ...state.actions.find((a) => a.id === where.id)! })),
+    findFirstOrThrow: vi.fn(async ({ where }: { where: Row }) => ({ ...state.actions.find((a) => matches(a, where))! })),
     updateMany: vi.fn(async ({ where, data }: { where: Row; data: Row }) => {
       const hit = state.actions.filter((a) => matches(a, where));
       hit.forEach((a) => Object.assign(a, data));
@@ -174,5 +175,14 @@ describe('approveAction / rejectAction', () => {
     state.actions[0].expiresAt = new Date(Date.now() - 1000);
     await expireStaleActions('club-1');
     expect(state.actions.map((a) => a.status)).toEqual(['EXPIRED', 'PENDING']);
+  });
+});
+
+describe('claim і клуб', () => {
+  it('прострочену дію claim не бере навіть без попередньої перевірки', async () => {
+    const p = await propose();
+    state.actions[0].expiresAt = new Date(Date.now() - 1000);
+    expect(await code(approveAction(p.id, owner))).toBe('AI_ACTION_EXPIRED');
+    expect(state.actions[0].decidedAt).toBeNull();
   });
 });

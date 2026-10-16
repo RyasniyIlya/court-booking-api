@@ -11,7 +11,7 @@ import request from 'supertest';
 const prisma = {
   club: { findUnique: vi.fn() },
   aiAgentPolicy: { findUnique: vi.fn(), upsert: vi.fn() },
-  aiAction: { findMany: vi.fn(), findFirst: vi.fn(), updateMany: vi.fn(), update: vi.fn(), findUniqueOrThrow: vi.fn(), create: vi.fn() },
+  aiAction: { findMany: vi.fn(), findFirst: vi.fn(), updateMany: vi.fn(), update: vi.fn(), findFirstOrThrow: vi.fn(), create: vi.fn() },
 };
 vi.mock('../../lib/db', () => ({ prisma }));
 /* Ключ Gemini може бути в .env розробника: тест не має ходити ні в модель, ні в БД за знімком. */
@@ -136,7 +136,7 @@ describe('журнал дій', () => {
   it('reject власника проходить і повертає дію', async () => {
     prisma.aiAction.findFirst.mockResolvedValue({ id: ID, clubId: 'club-1', status: 'PENDING', expiresAt: new Date(Date.now() + 60_000) });
     prisma.aiAction.updateMany.mockResolvedValue({ count: 1 });
-    prisma.aiAction.findUniqueOrThrow.mockResolvedValue({ id: ID, status: 'REJECTED' });
+    prisma.aiAction.findFirstOrThrow.mockResolvedValue({ id: ID, status: 'REJECTED' });
     const res = await request(app).post(`/api/admin/ai/actions/${ID}/reject`);
     expect(res.status).toBe(200);
     expect(res.body.action.status).toBe('REJECTED');

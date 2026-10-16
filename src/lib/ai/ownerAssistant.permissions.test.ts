@@ -10,6 +10,9 @@ vi.mock('../sections', () => ({ revenueBreakdown: vi.fn(), staffReport: vi.fn() 
 vi.mock('./outlook', () => ({ bookingOutlook: vi.fn() }));
 
 import { loadClubLoadProfile } from '../clubLoad';
+import { loadCustomerHealth } from './customerHealth';
+import { dayDigest } from '../digest';
+import { bookingOutlook } from './outlook';
 import { revenueBreakdown, staffReport } from '../sections';
 import { describeSnapshot, ownerSuggestions, snapshotHeadline, type ClubSnapshot } from './ownerContext';
 import { ownerSystemPrompt, ownerTools, resetLoadHeatmapCache, type OwnerClub } from './ownerAssistant';
@@ -108,5 +111,55 @@ describe('знімок без фінансів', () => {
     expect(snapshotHeadline(snap, false)).not.toMatch(/грн|тиждень/);
     expect(ownerSuggestions(snap, false).join(' ')).not.toMatch(/виручка/);
     expect(ownerSuggestions(snap, true).join(' ')).toMatch(/виручка/);
+  });
+});
+
+describe('вміст відповідей без прав', () => {
+  const tool = (name: string, p: ReturnType<typeof perms>) => ownerTools(club, undefined, p).find((t) => t.decl.name === name)!;
+
+  it('get_booking_outlook без readFinance не віддає суми броней', async () => {
+    vi.mocked(bookingOutlook).mockResolvedValue([
+      { date: '2026-10-17', weekday: 'сб', booked: 4, revenue_booked_uah: 2400, usual_for_weekday: 5 },
+    ] as never);
+    const closed: any = await tool('get_booking_outlook', perms({ readFinance: false })).run({});
+    expect(closed[0]).toEqual({ date: '2026-10-17', weekday: 'сб', booked: 4, usual_for_weekday: 5 });
+    expect(JSON.stringify(closed)).not.toMatch(/revenue|2400/);
+    const open: any = await tool('get_booking_outlook', perms({})).run({});
+    expect(open[0].revenue_booked_uah).toBe(2400);
+  });
+
+  it('get_customer_health без readFinance не віддає гроші під ризиком, але лишає кількість', async () => {
+    vi.mocked(loadCustomerHealth).mockResolvedValue({
+      totalCustomers: 40, segments: { NEW: 5, ACTIVE: 20, FADING: 10, LOST: 5 },
+      thresholds: { activeDays: 30, fadingDays: 90, newVisits: 5 },
+      last30d: { active: 25, new: 5, returning: 15, reactivated: 2, retentionPct: 60 },
+      atRisk: 10, atRiskValueUah: 12000,
+    } as never);
+    const closed: any = await tool('get_customer_health', perms({ readFinance: false })).run({});
+    expect(closed.at_risk).toBe(10);
+    expect(JSON.stringify(closed)).not.toMatch(/at_risk_value|12000/);
+    const open: any = await tool('get_customer_health', perms({})).run({});
+    expect(open.at_risk_value_uah).toBe(12000);
+  });
+
+  it('get_day_summary без readCustomers не віддає нових клієнтів', async () => {
+    vi.mocked(dayDigest).mockResolvedValue({ bookings: 3, revenue: 150000, newCustomers: 7, topCourt: null, prevRevenue: null } as never);
+    const closed: any = await tool('get_day_summary', perms({ readCustomers: false })).run({});
+    expect(closed.bookings).toBe(3);
+    expect(JSON.stringify(closed)).not.toMatch(/new_customers/);
+    const open: any = await tool('get_day_summary', perms({})).run({});
+    expect(open.new_customers).toBe(7);
+  });
+
+  it('знімок без readCustomers не називає нових клієнтів (з фінансами й без)', () => {
+    const snap = {
+      date: '2026-10-16', courts: 4, planName: null,
+      today: { bookings: 7, revenueUah: 100, newCustomers: 9, topCourt: null }, yesterdayRevenueUah: null,
+      week: { revenueUah: 1, prevRevenueUah: 1, changePct: 0, bookings: 5 }, pending: 0, weakestDay: null, strongestDay: null,
+    } as ClubSnapshot;
+    for (const fin of [true, false]) {
+      expect(describeSnapshot(snap, fin, false)).not.toMatch(/клієнтів|9/);
+      expect(describeSnapshot(snap, fin, true)).toMatch(/нових клієнтів 9/);
+    }
   });
 });

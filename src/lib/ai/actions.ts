@@ -87,13 +87,13 @@ export async function proposeAction(opts: {
 
   /* AUTO: рішення прийняла політика, тому decidedById лишається порожнім. */
   const claimed = await claim(row.id, opts.clubId, null);
-  return claimed ? runClaimed(row.id) : row;
+  return claimed ? runClaimed(row.id, opts.clubId) : row;
 }
 
 /** Атомарний перехід: рядок «забирає» лише один виклик, тому подвійний клік не виконає дію двічі. */
 async function claim(id: string, clubId: string, decidedById: string | null): Promise<boolean> {
   const { count } = await prisma.aiAction.updateMany({
-    where: { id, clubId, status: 'PENDING', decidedAt: null },
+    where: { id, clubId, status: 'PENDING', decidedAt: null, expiresAt: { gt: new Date() } },
     data: { decidedAt: new Date(), decidedById },
   });
   return count === 1;
@@ -104,8 +104,8 @@ async function finish(id: string, data: Prisma.AiActionUncheckedUpdateInput) {
 }
 
 /** Виконує вже «забрану» дію. Помилка виконавця — статус FAILED, а не виняток назовні. */
-async function runClaimed(id: string) {
-  const action = await prisma.aiAction.findUniqueOrThrow({ where: { id } });
+async function runClaimed(id: string, clubId: string) {
+  const action = await prisma.aiAction.findFirstOrThrow({ where: { id, clubId } });
   const executor = executors.get(action.kind);
   const fail = (error: string) => finish(id, { status: 'FAILED', error: error.slice(0, ERROR_MAX) });
 
@@ -144,7 +144,7 @@ async function loadOwn(id: string, owner: Owner) {
 export async function approveAction(id: string, owner: Owner) {
   await loadOwn(id, owner);
   if (!(await claim(id, owner.clubId, owner.id))) throw new AiActionError('AI_ACTION_NOT_PENDING');
-  return runClaimed(id);
+  return runClaimed(id, owner.clubId);
 }
 
 export async function rejectAction(id: string, owner: Owner) {
@@ -154,7 +154,7 @@ export async function rejectAction(id: string, owner: Owner) {
     data: { status: 'REJECTED', decidedAt: new Date(), decidedById: owner.id },
   });
   if (count !== 1) throw new AiActionError('AI_ACTION_NOT_PENDING');
-  return prisma.aiAction.findUniqueOrThrow({ where: { id } });
+  return prisma.aiAction.findFirstOrThrow({ where: { id, clubId: owner.clubId } });
 }
 
 /** Прострочені PENDING → EXPIRED перед показом черги, щоб власник не бачив кнопок, які вже не спрацюють. */

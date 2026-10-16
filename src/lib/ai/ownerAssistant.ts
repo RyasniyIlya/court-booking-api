@@ -105,7 +105,7 @@ export function resetCustomerHealthCache(): void {
 
 async function customerHealth(clubId: string) {
   const hit = customerHealthCache.get(clubId);
-  if (hit && Date.now() - hit.at < CUSTOMER_HEALTH_TTL_MS) return hit.data;
+  if (hit && Date.now() - hit.at < CUSTOMER_HEALTH_TTL_MS) return hit.data as Record<string, unknown>;
 
   const s = await loadCustomerHealth(clubId);
   const data = {
@@ -121,7 +121,7 @@ async function customerHealth(clubId: string) {
     how_to_see_names: 'Кабінет → Клієнти → «Під ризиком» (сегмент «Згасає»; at_risk = segments.FADING — те саме число).',
   };
   customerHealthCache.set(clubId, { at: Date.now(), data });
-  return data;
+  return data as Record<string, unknown>;
 }
 
 /**
@@ -189,7 +189,8 @@ export function ownerTools(club: OwnerClub, generate?: GenerateFn, perms: Effect
         const d = await dayDigest(club.id, club.timezone, day);
         return {
           date: day.toFormat('yyyy-MM-dd'),
-          bookings: d.bookings, court_revenue_uah: uah(d.revenue), new_customers: d.newCustomers,
+          bookings: d.bookings, court_revenue_uah: uah(d.revenue),
+          ...(perms.readCustomers ? { new_customers: d.newCustomers } : {}),
           top_court: d.topCourt, prev_day_court_revenue_uah: d.prevRevenue == null ? null : uah(d.prevRevenue),
         };
       },
@@ -242,7 +243,12 @@ export function ownerTools(club: OwnerClub, generate?: GenerateFn, perms: Effect
         description: 'Броні наперед по днях порівняно зі звичайним для цього дня тижня (середнє за 8 тижнів). Основа для прогнозу й порад: де завал, а де діра.',
         parameters: { type: 'object', properties: { days: { type: 'integer', description: 'Від 1 до 14, типово 7' } } },
       },
-      run: async (a) => bookingOutlook(club, intArg(a.days, 1, 14, 7)),
+      run: async (a) => {
+        const days = await bookingOutlook(club, intArg(a.days, 1, 14, 7));
+        if (perms.readFinance) return days;
+        /* Нейтральний інструмент, але в кожному дні є сума броней — без readFinance її знімаємо. */
+        return days.map(({ revenue_booked_uah: _hidden, ...d }) => d);
+      },
     },
     {
       decl: {
@@ -263,7 +269,13 @@ export function ownerTools(club: OwnerClub, generate?: GenerateFn, perms: Effect
         description: 'Скільки клієнтів у клубі і в якому вони стані (новачки, постійні, згасають, втрачені), рух за останні 30 днів (активні, нові, повернулися), одне число at_risk — «під ризиком» (= сегмент «згасають», останній візит 30–90 днів тому) і скільки грошей на місяць під цим ризиком. Без імен і телефонів — щоб побачити людей, порадь фільтр у кабінеті.',
         parameters: { type: 'object', properties: {} },
       },
-      run: async () => customerHealth(club.id),
+      run: async () => {
+        const data = await customerHealth(club.id);
+        if (perms.readFinance) return data;
+        /* Кеш спільний для ролей: гроші під ризиком знімаємо на виході. */
+        const { at_risk_value_uah: _hidden, ...rest } = data;
+        return rest;
+      },
     },
     {
       decl: {
@@ -378,7 +390,7 @@ export async function ownerAssistant(opts: {
     snapshot = null;
   }
   const { reply, steps, tokens } = await runAssistant({
-    system: ownerSystemPrompt(opts.club, describeSnapshot(snapshot, perms.readFinance), perms, opts.role),
+    system: ownerSystemPrompt(opts.club, describeSnapshot(snapshot, perms.readFinance, perms.readCustomers), perms, opts.role),
     history: toHistory(opts.messages),
     tools: ownerTools(opts.club, opts.generate, perms),
     maxOutputTokens: 1500,

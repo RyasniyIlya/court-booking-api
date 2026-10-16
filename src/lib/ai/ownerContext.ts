@@ -125,12 +125,12 @@ const signed = (pct: number) => `${pct > 0 ? '+' : pct < 0 ? '−' : ''}${Math.a
  * `finance:false` — без жодної гривні (виручка, тариф, зміна до минулого
  * тижня): знімок кладеться в промпт цілком, тож закриту область прибираємо тут.
  */
-export function describeSnapshot(s: ClubSnapshot | null, finance = true): string {
+export function describeSnapshot(s: ClubSnapshot | null, finance = true, customers = true): string {
   if (!s) return '';
-  if (!finance) return describeSnapshotNoFinance(s);
+  if (!finance) return describeSnapshotNoFinance(s, customers);
   const lines = [
     `Дата: ${s.date}. Активних кортів: ${s.courts}.${s.planName ? ` Тариф: ${s.planName}.` : ''}`,
-    `Сьогодні: ${s.today.bookings} підтверджених броней, виручка корту (без тренера й прокату) ${money(s.today.revenueUah)}, нових клієнтів ${s.today.newCustomers}${s.today.topCourt ? `, найзавантаженіший корт — ${s.today.topCourt}` : ''}.`,
+    `Сьогодні: ${s.today.bookings} підтверджених броней, виручка корту (без тренера й прокату) ${money(s.today.revenueUah)}${customers ? `, нових клієнтів ${s.today.newCustomers}` : ''}${s.today.topCourt ? `, найзавантаженіший корт — ${s.today.topCourt}` : ''}.`,
   ];
   if (s.yesterdayRevenueUah != null) lines.push(`Вчора: виручка корту ${money(s.yesterdayRevenueUah)}.`);
   lines.push(
@@ -147,10 +147,10 @@ ${lines.join('\n')}
 </club_snapshot>`;
 }
 
-function describeSnapshotNoFinance(s: ClubSnapshot): string {
+function describeSnapshotNoFinance(s: ClubSnapshot, customers: boolean): string {
   const lines = [
     `Дата: ${s.date}. Активних кортів: ${s.courts}.`,
-    `Сьогодні: ${s.today.bookings} підтверджених броней, нових клієнтів ${s.today.newCustomers}.`,
+    `Сьогодні: ${s.today.bookings} підтверджених броней${customers ? `, нових клієнтів ${s.today.newCustomers}` : ''}.`,
     `Останні 7 днів: ${s.week.bookings} броней.`,
     `Броні, що чекають підтвердження/оплати (PENDING): ${s.pending}.`,
   ];
