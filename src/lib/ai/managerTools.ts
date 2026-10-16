@@ -29,6 +29,9 @@ export type ProposedAction = {
   summary: string;
   status: string;
   error: string | null;
+  /** Для картки в кабінеті: деталі за видом дії (клієнт, період, учасники) — окрім тексту summary */
+  payload?: unknown;
+  result?: unknown;
 };
 
 export type ManagerContext = {
@@ -103,7 +106,7 @@ export function managerTools(club: OwnerClub, perms: EffectivePermissions, ctx: 
   async function propose(kind: string, payload: unknown) {
     try {
       const row = await proposeAction({ clubId: club.id, kind, payload, requester: ctx.requester });
-      ctx.collect({ id: row.id, kind: row.kind, summary: row.summary, status: row.status, error: row.error });
+      ctx.collect({ id: row.id, kind: row.kind, summary: row.summary, status: row.status, error: row.error, payload: row.payload, result: row.result });
       return outcome(row, ctx.requester.role);
     } catch (e) {
       if (e instanceof AiActionError && e.code === 'AI_ACTION_INVALID') throw new ToolInputError(e.detail ?? 'invalid request');
