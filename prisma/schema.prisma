@@ -94,6 +94,9 @@ model Club {
   /// Цілі й пороги екрана аналітики: { occupancy, cancellation, retention }, %.
   /// null = дефолти веб-клієнта. Форма — lib/analyticsThresholds.ts.
   analyticsThresholds    Json?
+  /// Права ІІ-менеджера (один рядок на клуб; немає рядка = типові) і журнал його дій.
+  aiPolicy               AiAgentPolicy?
+  aiActions              AiAction[]
 
   // ── Юридичні дані й оферта (docs/legal) ──────────────────────────────
   /// Коли власник прийняв оферту й умови обробки ПД, і яку версію (lib/legal.ts).
@@ -2622,4 +2625,65 @@ model RatingChange {
   @@index([clubId, playerId, effectiveAt])
   @@index([matchId, matchVersion])
   @@index([matchRefId])
+}
+
+/// Режим дії ІІ: OFF — заборонено, ASK — пропонує й чекає підтвердження власника, AUTO — виконує сам.
+enum AiMode {
+  OFF
+  ASK
+  AUTO
+}
+
+enum AiActionStatus {
+  PENDING
+  EXECUTED
+  REJECTED
+  FAILED
+  EXPIRED
+}
+
+/// Що власник дозволив ІІ в цьому клубі. Міняє тільки OWNER.
+/// Форма roleAccess і правила перетину ролей з власником — lib/ai/policy.ts;
+/// читати тільки через normalizePolicy: у базі може лежати що завгодно.
+model AiAgentPolicy {
+  id            String   @id @default(uuid()) @db.Uuid
+  clubId        String   @unique @db.Uuid
+  club          Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  readFinance   Boolean  @default(true)
+  readCustomers Boolean  @default(true)
+  readStaff     Boolean  @default(true)
+  reports       Boolean  @default(true)
+  bookings      AiMode   @default(ASK)
+  groupSessions AiMode   @default(ASK)
+  tournaments   AiMode   @default(ASK)
+  messaging     AiMode   @default(ASK)
+  /// Права інших ролей (ADMIN/TRAINER/ACCOUNTANT) — не ширші за власницькі.
+  roleAccess    Json     @default("{}")
+  updatedAt     DateTime @updatedAt @db.Timestamptz(3)
+  updatedById   String?  @db.Uuid
+}
+
+/// Журнал дій ІІ: пропозиція → рішення власника → виконання. Рядки не видаляються.
+model AiAction {
+  id            String         @id @default(uuid()) @db.Uuid
+  clubId        String         @db.Uuid
+  club          Club           @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  /// Тип дії з реєстру виконавців (lib/ai/actions.ts), напр. "booking.create".
+  kind          String
+  payload       Json
+  /// Людський опис для кнопки «Підтвердити» (укр., до 500 символів).
+  summary       String
+  status        AiActionStatus @default(PENDING)
+  requestedById String?        @db.Uuid
+  requestedRole UserRole
+  /// null при AUTO: рішення прийняла політика, а не людина.
+  decidedById   String?        @db.Uuid
+  decidedAt     DateTime?      @db.Timestamptz(3)
+  executedAt    DateTime?      @db.Timestamptz(3)
+  result        Json?
+  error         String?
+  createdAt     DateTime       @default(now()) @db.Timestamptz(3)
+  expiresAt     DateTime       @db.Timestamptz(3)
+
+  @@index([clubId, status, createdAt])
 }

@@ -1,4 +1,4 @@
-import { Router } from 'express';
+import { Router, type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
@@ -6,22 +6,42 @@ import { AiError, aiConfigured } from '../../lib/ai/gemini';
 import { BRIEF_REQUEST, ownerAssistant } from '../../lib/ai/ownerAssistant';
 import { loadOwnerSnapshot, ownerSuggestions, snapshotHeadline } from '../../lib/ai/ownerContext';
 import { envLimit, takeQuota } from '../../lib/ai/quota';
-import { requireAuth, requireFeature, requireRole } from './shared';
+import { AiActionError, approveAction, expireStaleActions, rejectAction } from '../../lib/ai/actions';
+import { effectivePermissions, policyBodySchema, type EffectivePermissions } from '../../lib/ai/policy';
+import { loadPolicy, savePolicy } from '../../lib/ai/policyStore';
+import { param, requireAuth, requireFeature, requireRole } from './shared';
 
 /**
- * Нейроаналітик власника.
+ * Нейроаналітик власника й права ІІ.
  *
- *   POST /api/admin/ai/chat   — розмова з аналітиком
- *   POST /api/admin/ai/brief  — ранкова сводка (готове завдання)
+ *   POST /api/admin/ai/chat    — розмова з аналітиком
+ *   POST /api/admin/ai/brief   — ранкова сводка (готове завдання)
+ *   GET  /api/admin/ai/status  — рядок-знімок і питання для кабінету
+ *   GET|PUT /api/admin/ai/policy        — що ІІ дозволено (тільки OWNER)
+ *   GET  /api/admin/ai/actions          — журнал/черга дій ІІ (тільки OWNER)
+ *   POST /api/admin/ai/actions/:id/approve|reject — рішення власника
  *
- * Тільки власник: у відповідях виручка й економіка клубу, модератору вони
- * за ролями недоступні — як і сторінка фінансів. Тариф «Аналітика».
+ * Розмова: власник завжди; інші ролі — лише якщо власник відкрив їм доступ у
+ * політиці, і тоді інструменти й знімок урізані до їхніх прав (виручка
+ * модератору за ролями недоступна — як і сторінка фінансів). Політику й
+ * чергу дій бачить і міняє тільки власник. Тариф «Аналітика».
  */
 export const aiRouter = Router();
 
 /* Строго з префіксом /ai: роутер монтується в корінь адмінки, і `use` без
    шляху відповів би 403 на запити до всіх роутів, що йдуть після нього. */
-aiRouter.use('/ai', requireAuth, requireRole('OWNER'), requireFeature('ai'));
+aiRouter.use('/ai', requireAuth, requireFeature('ai'));
+
+const ownerOnly = requireRole('OWNER');
+
+/** Доступ до розмови: власник завжди, інші ролі — за політикою. Права кладемо в res.locals. */
+async function aiAccess(req: Request, res: Response, next: NextFunction) {
+  const perms = effectivePermissions(await loadPolicy(req.auth!.clubId), req.auth!.role);
+  if (!perms.access) return res.status(403).json({ error: 'FORBIDDEN' });
+  res.locals.aiPerms = perms;
+  next();
+}
+const permsOf = (res: Response) => res.locals.aiPerms as EffectivePermissions;
 
 const chatSchema = z.object({
   messages: z.array(z.object({
@@ -42,6 +62,9 @@ async function ownerClub(clubId: string) {
 
 /** Сводка коштує кількох викликів із пошуком, тому кешуємо на пів години: відкрив двічі — заплатили раз. */
 const briefCache = new Map<string, { at: number; reply: string }>();
+/** Сводка залежить від прав: кеш однієї ролі не має віддаватись іншій, а після зміни політики — застарілий. */
+const briefKey = (clubId: string, p: EffectivePermissions) =>
+  `${clubId}:${[p.readFinance, p.readCustomers, p.readStaff].map(Number).join('')}`;
 const BRIEF_TTL_MS = 30 * 60_000;
 /** «Оновити» не має сенсу частіше: той самий знімок клубу (кеш 5 хв) дасть майже той самий текст за повну ціну повного прогону. */
 const BRIEF_MIN_REFRESH_MS = 5 * 60_000;
@@ -55,7 +78,8 @@ function fail(res: import('express').Response, e: unknown) {
 /* Статус + «голова» кабінету: рядок зі знімком і три питання під ситуацію.
    Без ключа Gemini в БД не ходимо взагалі. Знімок кешується на 5 хв, тож
    відкриття сторінки не б'є по БД щоразу. */
-aiRouter.get('/ai/status', async (req, res) => {
+aiRouter.get('/ai/status', aiAccess, async (req, res) => {
+  const perms = permsOf(res);
   if (!aiConfigured()) return res.json({ configured: false, headline: null, suggestions: [] });
   let snap = null;
   try {
@@ -64,10 +88,14 @@ aiRouter.get('/ai/status', async (req, res) => {
   } catch {
     snap = null;
   }
-  res.json({ configured: true, headline: snapshotHeadline(snap), suggestions: ownerSuggestions(snap) });
+  res.json({
+    configured: true,
+    headline: snapshotHeadline(snap, perms.readFinance),
+    suggestions: ownerSuggestions(snap, perms.readFinance),
+  });
 });
 
-aiRouter.post('/ai/chat', async (req, res) => {
+aiRouter.post('/ai/chat', aiAccess, async (req, res) => {
   const parsed = chatSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
   if (!aiConfigured()) return res.status(503).json({ error: 'AI_NOT_CONFIGURED' });
@@ -79,7 +107,7 @@ aiRouter.post('/ai/chat', async (req, res) => {
   }
 
   try {
-    const { reply, steps, tokens } = await ownerAssistant({ club, messages: parsed.data.messages });
+    const { reply, steps, tokens } = await ownerAssistant({ club, messages: parsed.data.messages, perms: permsOf(res), role: req.auth!.role });
     console.log(`[ai] owner chat steps=${steps} tokens=${tokens}`);
     res.json({ reply });
   } catch (e) {
@@ -87,13 +115,15 @@ aiRouter.post('/ai/chat', async (req, res) => {
   }
 });
 
-aiRouter.post('/ai/brief', async (req, res) => {
+aiRouter.post('/ai/brief', aiAccess, async (req, res) => {
+  const perms = permsOf(res);
   if (!aiConfigured()) return res.status(503).json({ error: 'AI_NOT_CONFIGURED' });
 
   const club = await ownerClub(req.auth!.clubId);
   if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
 
-  const cached = briefCache.get(club.id);
+  const key = briefKey(club.id, perms);
+  const cached = briefCache.get(key);
   /* refresh:true ігноруємо, якщо кеш свіжіший за 5 хв: знімок клубу (теж 5-хвилинний
      кеш) майже не встигає змінитись, а повний прогін із пошуком коштує як новий. */
   const fresh = req.body?.refresh === true && (!cached || Date.now() - cached.at >= BRIEF_MIN_REFRESH_MS);
@@ -105,11 +135,64 @@ aiRouter.post('/ai/brief', async (req, res) => {
   }
 
   try {
-    const { reply, steps, tokens } = await ownerAssistant({ club, messages: [{ role: 'user', content: BRIEF_REQUEST }] });
+    const { reply, steps, tokens } = await ownerAssistant({ club, messages: [{ role: 'user', content: BRIEF_REQUEST }], perms, role: req.auth!.role });
     console.log(`[ai] owner brief steps=${steps} tokens=${tokens}`);
-    briefCache.set(club.id, { at: Date.now(), reply });
+    briefCache.set(key, { at: Date.now(), reply });
     res.json({ reply, cached: false });
   } catch (e) {
     fail(res, e);
   }
 });
+
+/* ── Права ІІ і журнал дій: тільки власник ───────────────────────────────── */
+
+aiRouter.get('/ai/policy', ownerOnly, async (req, res) => {
+  const [policy, row] = await Promise.all([
+    loadPolicy(req.auth!.clubId),
+    prisma.aiAgentPolicy.findUnique({ where: { clubId: req.auth!.clubId }, select: { updatedAt: true } }),
+  ]);
+  res.json({ ...policy, updatedAt: row?.updatedAt ?? null });
+});
+
+aiRouter.put('/ai/policy', ownerOnly, async (req, res) => {
+  const parsed = policyBodySchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const { policy, updatedAt } = await savePolicy(req.auth!.clubId, parsed.data, req.auth!.userId);
+  res.json({ ...policy, updatedAt });
+});
+
+const actionsQuery = z.object({
+  status: z.enum(['PENDING', 'EXECUTED', 'REJECTED', 'FAILED', 'EXPIRED']).optional(),
+});
+const actionId = z.string().uuid();
+
+aiRouter.get('/ai/actions', ownerOnly, async (req, res) => {
+  const q = actionsQuery.safeParse(req.query);
+  if (!q.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const clubId = req.auth!.clubId;
+  await expireStaleActions(clubId);
+  const items = await prisma.aiAction.findMany({
+    where: { clubId, ...(q.data.status ? { status: q.data.status } : {}) },
+    orderBy: { createdAt: 'desc' },
+    take: 100,
+  });
+  res.json({ items });
+});
+
+function actionFail(res: Response, e: unknown) {
+  if (!(e instanceof AiActionError)) throw e;
+  const status = e.code === 'AI_ACTION_NOT_FOUND' ? 404 : e.code === 'AI_ACTION_FORBIDDEN' ? 403 : 409;
+  return res.status(status).json({ error: e.code });
+}
+
+for (const [verb, decide] of [['approve', approveAction], ['reject', rejectAction]] as const) {
+  aiRouter.post(`/ai/actions/:id/${verb}`, ownerOnly, async (req, res) => {
+    const id = actionId.safeParse(param(req, 'id'));
+    if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+    try {
+      res.json({ action: await decide(id.data, { id: req.auth!.userId, clubId: req.auth!.clubId }) });
+    } catch (e) {
+      actionFail(res, e);
+    }
+  });
+}
