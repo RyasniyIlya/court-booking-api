@@ -6,6 +6,8 @@ import compression from 'compression';
 import { publicRouter } from './routes/public';
 import { assistantRouter } from './routes/assistant';
 import { adminRouter } from './routes/admin';
+/* Виконавці ІІ-менеджера мають бути зареєстровані в проді, а не лише в тестах. */
+import './lib/ai/executors';
 import { analyticsRouter } from './routes/analytics';
 import { exportRouter } from './routes/export';
 import { financeRouter } from './routes/finance';

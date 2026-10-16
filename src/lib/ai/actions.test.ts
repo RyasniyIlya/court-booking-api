@@ -7,10 +7,13 @@ const state = { actions: [] as Row[], policy: null as Row | null, seq: 0 };
 const matches = (row: Row, where: Row) => Object.entries(where).every(([k, v]) => {
   if (v && typeof v === 'object' && 'lte' in v) return row[k] <= v.lte;
   if (v && typeof v === 'object' && 'gt' in v) return row[k] > v.gt;
+  if (v && typeof v === 'object' && 'gte' in v) return row[k] != null && row[k] >= v.gte;
+  if (v && typeof v === 'object' && 'notIn' in v) return !v.notIn.includes(row[k]);
   return row[k] === v;
 });
 
 const prisma = {
+  club: { findUnique: vi.fn(async () => ({ timezone: 'Europe/Kyiv' })) },
   aiAgentPolicy: { findUnique: vi.fn(async () => state.policy) },
   aiAction: {
     create: vi.fn(async ({ data }: { data: Row }) => {
@@ -28,6 +31,7 @@ const prisma = {
       hit.forEach((a) => Object.assign(a, data));
       return { count: hit.length };
     }),
+    count: vi.fn(async ({ where }: { where: Row }) => state.actions.filter((a) => matches(a, where)).length),
     update: vi.fn(async ({ where, data }: { where: Row; data: Row }) => {
       const r = state.actions.find((a) => a.id === where.id)!;
       Object.assign(r, data);
@@ -75,7 +79,7 @@ describe('proposeAction', () => {
   it('AUTO — виконується одразу, рішення без людини', async () => {
     state.policy = { bookings: 'AUTO' };
     const a = await propose();
-    expect(execute).toHaveBeenCalledWith('club-1', { court: 1 });
+    expect(execute).toHaveBeenCalledWith('club-1', { court: 1 }, expect.objectContaining({ requestedRole: 'OWNER', decidedById: null }));
     expect(a).toMatchObject({ status: 'EXECUTED', result: { done: { court: 1 } }, decidedById: null });
     expect(a.executedAt).toBeInstanceOf(Date);
   });

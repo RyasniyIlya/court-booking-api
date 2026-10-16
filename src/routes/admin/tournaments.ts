@@ -6,13 +6,14 @@ import { recordChanges, type Change } from '../../lib/changeLog';
 import { buildTournamentSettings, scoringFromSettings } from '../../lib/sportRules';
 import { isTournament } from '../../lib/tournamentPay';
 import {
-  applyPatches, buildBracket, isFinished, planPropagation, resolveMatchUpdate, sweepWalkovers,
+  applyPatches, isFinished, planPropagation, resolveMatchUpdate, sweepWalkovers,
   type BracketMatch, type MatchStatus, type SetScore,
 } from '../../lib/tournamentBracket';
 import { requireAuth, param } from './shared';
 import { finalizeTournament, RatingError, tournamentResults } from '../../lib/tournamentRating';
 import { notifyOnWrite } from '../../lib/tournamentLive';
 import { linkCustomerPlayer } from '../../lib/players';
+import { lockTournament, startTournamentBracket } from '../../lib/tournamentStart';
 
 /**
  * Керування турніром: учасники, сітка, рахунок, зняття, завершення.
@@ -121,15 +122,6 @@ async function actorOf(req: Request, db: Pick<Db, 'user'> = prisma) {
     where: { id: req.auth!.userId }, select: { email: true, role: true },
   });
   return { userId: req.auth!.userId, email: user.email, role: user.role ?? req.auth!.role };
-}
-
-async function lockTournament(tx: import('@prisma/client').Prisma.TransactionClient, booking: Booking, status?: string) {
-  if (!booking.tournamentScope) return;
-  await tx.$queryRaw`SELECT id FROM "Booking" WHERE id = ${booking.id}::uuid FOR UPDATE`;
-  const fresh = await tx.booking.findUniqueOrThrow({ where: { id: booking.id } });
-  if (fresh.ratingsAppliedAt) throw new RatingError('RATINGS_LOCKED');
-  if (status && fresh.tournamentStatus !== status) throw new RatingError('TOURNAMENT_LOCKED');
-  if (fresh.status === 'CANCELLED' || fresh.status === 'EXPIRED') throw new RatingError('TOURNAMENT_LOCKED');
 }
 
 const log = async (
@@ -263,47 +255,12 @@ tournamentsRouter.post('/tournaments/:bookingId/start', requireAuth, async (req,
   if (!parsed.success) return res.status(400).json({ error: 'BAD_REQUEST' });
   const booking = await loadBooking(req, res, { staffOnly: true });
   if (!booking) return;
-  if (booking.tournamentScope === 'FEDERATION') return res.status(403).json({ error: 'FEDERATION_MANAGES_ENTRIES' });
-  if (booking.tournamentStatus !== 'DRAFT') {
-    return res.status(409).json({ error: booking.tournamentStatus ? 'ALREADY_STARTED' : 'NO_ENTRIES' });
-  }
-
-  const entries = await prisma.tournamentEntry.findMany({ where: { bookingId: booking.id }, orderBy: { seed: 'asc' }, select: { id: true } });
-  if (booking.tournamentScope) {
-    const unlinked = await prisma.tournamentEntry.count({ where: { bookingId: booking.id, playerId: null } });
-    if (unlinked) return res.status(409).json({ error: 'PLAYERS_REQUIRED' });
-    if ((booking.tournamentTeamSize ?? 1) === 2 && await prisma.tournamentEntry.count({ where: { bookingId: booking.id, partnerPlayerId: null } })) {
-      return res.status(409).json({ error: 'PARTNER_REQUIRED' });
-    }
-  }
-  if (entries.length < 2) return res.status(400).json({ error: 'TOO_FEW_ENTRIES' });
-
-  const thirdPlace = !!parsed.data.thirdPlace && entries.length >= 4;
-  const matches = buildBracket(entries.map((e) => e.id), thirdPlace);
-  const now = new Date();
-  const by = (await actorOf(req)).email;
-
-  const result = await prisma.$transaction(async (tx) => {
-    await lockTournament(tx, booking, 'DRAFT');
-    await tx.tournamentMatch.createMany({
-      data: matches.map((m) => ({
-        id: m.id, bookingId: booking.id, clubId: req.auth!.clubId, round: m.round, slot: m.slot,
-        entryAId: m.entryAId, entryBId: m.entryBId, sets: m.sets as never,
-        winnerEntryId: m.winnerEntryId, status: m.status,
-        finishedAt: m.status === 'DONE' ? now : null, updatedBy: by,
-      })),
-    });
-    await tx.booking.update({
-      where: { id: booking.id },
-      data: { tournamentStatus: 'RUNNING', thirdPlace },
-    });
-    await log(tx as unknown as Db, req, booking.id, [
-      { field: 'status', before: 'DRAFT', after: 'RUNNING' },
-      { field: 'thirdPlace', before: booking.thirdPlace, after: thirdPlace },
-    ]);
-    return payload(tx as unknown as Db, { ...booking, tournamentStatus: 'RUNNING', thirdPlace });
-  });
-  res.json(result);
+  const out = await startTournamentBracket(
+    booking, parsed.data, { clubId: req.auth!.clubId, userId: req.auth!.userId },
+    (tx, state) => payload(tx as unknown as Db, { ...booking, ...state }),
+  );
+  if (!out.ok) return res.status(out.status).json({ error: out.error });
+  res.json(out.value);
 });
 
 // ── Матч ──────────────────────────────────────────────────────────────

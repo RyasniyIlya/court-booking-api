@@ -1,4 +1,5 @@
 import { Router, type NextFunction, type Request, type Response } from 'express';
+import type { UserRole } from '@prisma/client';
 import { z } from 'zod';
 
 import { prisma } from '../../lib/db';
@@ -6,7 +7,11 @@ import { AiError, aiConfigured } from '../../lib/ai/gemini';
 import { BRIEF_REQUEST, ownerAssistant } from '../../lib/ai/ownerAssistant';
 import { loadOwnerSnapshot, ownerSuggestions, snapshotHeadline } from '../../lib/ai/ownerContext';
 import { envLimit, takeQuota } from '../../lib/ai/quota';
+import '../../lib/ai/executors';
 import { AiActionError, approveAction, expireStaleActions, rejectAction } from '../../lib/ai/actions';
+import { ReportRefused, buildReportFile, reportParamsSchema } from '../../lib/ai/reportFile';
+import { XLSX_CONTENT_TYPE } from '../../lib/xlsx';
+import { recordChanges } from '../../lib/changeLog';
 import { effectivePermissions, policyBodySchema, type EffectivePermissions } from '../../lib/ai/policy';
 import { loadPolicy, savePolicy } from '../../lib/ai/policyStore';
 import { param, requireAuth, requireFeature, requireRole } from './shared';
@@ -20,6 +25,7 @@ import { param, requireAuth, requireFeature, requireRole } from './shared';
  *   GET|PUT /api/admin/ai/policy        — що ІІ дозволено (тільки OWNER)
  *   GET  /api/admin/ai/actions          — журнал/черга дій ІІ (тільки OWNER)
  *   POST /api/admin/ai/actions/:id/approve|reject — рішення власника
+ *   GET  /api/admin/ai/actions/:id/file — xlsx-звіт, зібраний на льоту за поточними правами того, хто качає
  *
  * Розмова: власник завжди; інші ролі — лише якщо власник відкрив їм доступ у
  * політиці, і тоді інструменти й знімок урізані до їхніх прав (виручка
@@ -107,9 +113,13 @@ aiRouter.post('/ai/chat', aiAccess, async (req, res) => {
   }
 
   try {
-    const { reply, steps, tokens } = await ownerAssistant({ club, messages: parsed.data.messages, perms: permsOf(res), role: req.auth!.role });
-    console.log(`[ai] owner chat steps=${steps} tokens=${tokens}`);
-    res.json({ reply });
+    const { reply, steps, tokens, actions } = await ownerAssistant({
+      club, messages: parsed.data.messages, perms: permsOf(res), role: req.auth!.role,
+      manager: { requester: { id: req.auth!.userId, role: req.auth!.role as UserRole } },
+    });
+    console.log(`[ai] owner chat steps=${steps} tokens=${tokens} actions=${actions.length}`);
+    /* actions — картки пропозицій під відповіддю: кабінет показує статус і кнопки. */
+    res.json({ reply, actions });
   } catch (e) {
     fail(res, e);
   }
@@ -196,3 +206,39 @@ for (const [verb, decide] of [['approve', approveAction], ['reject', rejectActio
     }
   });
 }
+
+/* ── Файл-звіт ───────────────────────────────────────────────────────────────
+   Файл не зберігається: в AiAction лежать лише параметри, а книга збирається тут,
+   на поточних даних і за ПОТОЧНИМИ правами того, хто качає (не того, хто просив).
+   Бачить дію свого клубу власник або той, хто її запросив; чужа й чужого клубу —
+   однаково 404, щоб не підказувати, що такий id існує. */
+aiRouter.get('/ai/actions/:id/file', aiAccess, async (req, res) => {
+  const id = actionId.safeParse(param(req, 'id'));
+  if (!id.success) return res.status(400).json({ error: 'BAD_REQUEST' });
+  const { clubId, userId, role } = req.auth!;
+
+  const action = await prisma.aiAction.findFirst({ where: { id: id.data, clubId, kind: 'report.xlsx' } });
+  if (!action || (role !== 'OWNER' && action.requestedById !== userId)) return res.status(404).json({ error: 'NOT_FOUND' });
+  if (action.status !== 'EXECUTED') return res.status(409).json({ error: 'AI_ACTION_NOT_READY' });
+  const params = reportParamsSchema.safeParse(action.payload);
+  if (!params.success) return res.status(422).json({ error: 'BAD_REPORT' });
+
+  try {
+    const { fileName, buffer } = await buildReportFile(clubId, params.data, permsOf(res));
+    /* Журнал до відправки, як у решти вивантажень: файл може містити персональні дані. */
+    const actor = await prisma.user.findFirst({ where: { id: userId, clubId }, select: { email: true } });
+    await recordChanges(
+      prisma,
+      { clubId, entity: 'AiReportExport', entityId: action.id },
+      { userId, email: actor?.email ?? '', role },
+      [{ field: 'export', before: null, after: params.data }],
+    );
+    res.setHeader('Content-Type', XLSX_CONTENT_TYPE);
+    res.setHeader('Content-Disposition', `attachment; filename="report.xlsx"; filename*=UTF-8''${encodeURIComponent(fileName)}`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(buffer);
+  } catch (e) {
+    if (e instanceof ReportRefused) return res.status(403).json({ error: 'REPORT_FORBIDDEN', message: e.message });
+    throw e;
+  }
+});

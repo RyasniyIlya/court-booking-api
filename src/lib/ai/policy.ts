@@ -155,7 +155,53 @@ export const toolScope: Record<string, ReadScope | null> = {
   get_booking_outlook: null,
   get_load_heatmap: null,
   web_lookup: null,
+  /* Етап 2: довідкові інструменти менеджера. Поля з іменами, телефонами й тренерами
+     гейтяться всередині, коли інструмент нейтральний; список клієнтів і тренерів — цілком. */
+  list_courts: null,
+  list_bookings: null,
+  list_tournaments: null,
+  find_customer: 'readCustomers',
+  list_trainers: 'readStaff',
+  /* Інструменти-дії: читання вони не потребують, їх відкриває режим дії (actionToolAllowed). */
+  propose_booking: null,
+  propose_cancel_booking: null,
+  propose_reschedule: null,
+  propose_group_session: null,
+  propose_cancel_group_session: null,
+  propose_tournament_bracket: null,
+  make_report: null,
 };
+
+/** Яке право відкриває інструмент-дію. Звіти — булеве `reports`, решта — режим дії. */
+export const actionToolScope: Record<string, ActionScope | 'reports'> = {
+  propose_booking: 'bookings',
+  propose_cancel_booking: 'bookings',
+  propose_reschedule: 'bookings',
+  propose_group_session: 'groupSessions',
+  propose_cancel_group_session: 'groupSessions',
+  propose_tournament_bracket: 'tournaments',
+  make_report: 'reports',
+};
+
+/** Режим права: булеве «звіти» — це або «сам» (вкл), або «заборонено». */
+export function scopeMode(perms: AiPermissions, scope: ActionScope | 'reports'): AiModeValue {
+  if (scope === 'reports') return perms.reports ? 'AUTO' : 'OFF';
+  return perms[scope];
+}
+
+/** Ролі, що руками керують бронями й турнірами; решта (бухгалтер, тренер) модель на дії не наставить. */
+const OPERATING_ROLES = ['OWNER', 'ADMIN'];
+
+/**
+ * Інструмент-дію модель бачить лише коли режим права НЕ OFF (звіти — коли reports=true) і
+ * роль у принципі може це робити. OFF = інструмента для моделі немає взагалі.
+ */
+export function actionToolAllowed(name: string, perms: EffectivePermissions, role: string): boolean {
+  const scope = actionToolScope[name];
+  if (!scope) return true;
+  if (!perms.access || scopeMode(perms, scope) === 'OFF') return false;
+  return scope === 'reports' || OPERATING_ROLES.includes(role);
+}
 
 export function toolAllowed(name: string, perms: EffectivePermissions): boolean {
   if (!perms.access) return false;

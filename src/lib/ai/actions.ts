@@ -1,8 +1,11 @@
 import { Prisma, type UserRole } from '@prisma/client';
 
 import { prisma } from '../db';
-import { effectivePermissions, type ActionScope } from './policy';
+import { DateTime } from 'luxon';
+
+import { effectivePermissions, scopeMode, type ActionScope } from './policy';
 import { loadPolicy } from './policyStore';
+import { envLimit } from './quota';
 
 /**
  * Журнал дій ІІ-менеджера: пропозиція → рішення власника → виконання.
@@ -19,10 +22,49 @@ import { loadPolicy } from './policyStore';
  * вимкнене зараз не має виконатись за вчорашнім дозволом.
  */
 
-export type ActionExecutor = {
-  scope: ActionScope;
-  execute(clubId: string, payload: unknown): Promise<unknown>;
+/** Право, під яке підпадає виконавець: дії мають режим OFF/ASK/AUTO, звіти — булеве «вкл/викл». */
+export type ExecutorScope = ActionScope | 'reports';
+
+/** Хто просив і хто підтвердив: виконавцю потрібен автор, щоб підписати дію в журналі броні. */
+export type ActionContext = {
+  actionId: string;
+  requestedById: string | null;
+  requestedRole: UserRole;
+  /** null — виконано за політикою AUTO, без людини */
+  decidedById: string | null;
 };
+
+export type ActionExecutor = {
+  scope: ExecutorScope;
+  /** Тільки читає: не змінює клуб, тож не рахується в добовому ліміті AUTO (звіти). */
+  readOnly?: boolean;
+  /**
+   * Перевірка payload і людський опис, зібраний кодом із ПЕРЕВІРЕНОГО payload
+   * (корт, час, імʼя), а не текстом від моделі. Некоректне — ActionInvalidError
+   * з українським поясненням, яке модель побачить і виправить запит.
+   */
+  prepare?(clubId: string, payload: unknown): Promise<{ payload: unknown; summary: string }>;
+  execute(clubId: string, payload: unknown, ctx: ActionContext): Promise<unknown>;
+};
+
+/** Некоректний запит до дії (на етапі пропозиції). */
+export class ActionInvalidError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ActionInvalidError';
+  }
+}
+
+/** Відомий збій виконання («слот уже зайнятий»): текст іде власнику в чергу як є. */
+export class ActionFailedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'ActionFailedError';
+  }
+}
+
+/** Режим права для виконавця: булеве «звіти» — це або «сам» (вкл), або «заборонено». */
+export const modeOf = scopeMode;
 
 const executors = new Map<string, ActionExecutor>();
 
@@ -40,13 +82,32 @@ export type AiActionErrorCode =
   | 'AI_ACTION_UNKNOWN_KIND'
   | 'AI_ACTION_NOT_FOUND'
   | 'AI_ACTION_NOT_PENDING'
-  | 'AI_ACTION_EXPIRED';
+  | 'AI_ACTION_EXPIRED'
+  | 'AI_ACTION_INVALID';
 
 export class AiActionError extends Error {
-  constructor(readonly code: AiActionErrorCode) {
+  /** detail — українське пояснення для моделі (лише AI_ACTION_INVALID) */
+  constructor(readonly code: AiActionErrorCode, readonly detail?: string) {
     super(code);
     this.name = 'AiActionError';
   }
+}
+
+/** Скільки дій за добу ІІ може виконати САМ (AUTO) у клубі; решта чекає людину. */
+const autoDailyCap = () => envLimit('AI_AUTO_DAILY_CAP', 20);
+
+/**
+ * Скільки AUTO-виконань клуб уже мав сьогодні (за часом клубу). Рахуємо з рядків
+ * журналу, а не з памʼяті: рестарт чи другий інстанс ліміт не обнуляють.
+ * AUTO-рядок — той, де рішення без людини (decidedById null) і є час рішення.
+ */
+async function autoUsedToday(clubId: string): Promise<number> {
+  const club = await prisma.club.findUnique({ where: { id: clubId }, select: { timezone: true } });
+  const dayStart = DateTime.now().setZone(club?.timezone ?? 'UTC').startOf('day').toJSDate();
+  const readOnlyKinds = [...executors.entries()].filter(([, e]) => e.readOnly).map(([kind]) => kind);
+  return prisma.aiAction.count({
+    where: { clubId, decidedById: null, decidedAt: { gte: dayStart }, ...(readOnlyKinds.length ? { kind: { notIn: readOnlyKinds } } : {}) },
+  });
 }
 
 /** Скільки пропозиція чекає рішення: стара пропозиція про «завтра ввечері» вже не про те. */
@@ -61,7 +122,8 @@ export async function proposeAction(opts: {
   clubId: string;
   kind: string;
   payload: unknown;
-  summary: string;
+  /** Лишається для виконавців без prepare (тести); з prepare текст будує код */
+  summary?: string;
   requester: Requester;
 }) {
   const executor = executors.get(opts.kind);
@@ -70,20 +132,34 @@ export async function proposeAction(opts: {
 
   const policy = await loadPolicy(opts.clubId);
   const perms = effectivePermissions(policy, opts.requester.role);
-  if (!perms.access || perms[executor.scope] === 'OFF') throw new AiActionError('AI_ACTION_FORBIDDEN');
+  const mode = modeOf(perms, executor.scope);
+  if (!perms.access || mode === 'OFF') throw new AiActionError('AI_ACTION_FORBIDDEN');
+
+  let payload = opts.payload;
+  let summary = opts.summary ?? opts.kind;
+  if (executor.prepare) {
+    try {
+      ({ payload, summary } = await executor.prepare(opts.clubId, opts.payload));
+    } catch (e) {
+      if (e instanceof ActionInvalidError) throw new AiActionError('AI_ACTION_INVALID', e.message);
+      throw e;
+    }
+  }
 
   const row = await prisma.aiAction.create({
     data: {
       clubId: opts.clubId,
       kind: opts.kind,
-      payload: opts.payload as Prisma.InputJsonValue,
-      summary: opts.summary.slice(0, SUMMARY_MAX),
+      payload: payload as Prisma.InputJsonValue,
+      summary: summary.slice(0, SUMMARY_MAX),
       requestedById: opts.requester.id,
       requestedRole: opts.requester.role,
       expiresAt: new Date(Date.now() + ACTION_TTL_MS),
     },
   });
-  if (perms[executor.scope] !== 'AUTO') return row;
+  if (mode !== 'AUTO') return row;
+  /* Стеля AUTO: понад ліміт дія не губиться, а чекає людину, як у режимі ASK. */
+  if (!executor.readOnly && (await autoUsedToday(opts.clubId)) >= autoDailyCap()) return row;
 
   /* AUTO: рішення прийняла політика, тому decidedById лишається порожнім. */
   const claimed = await claim(row.id, opts.clubId, null);
@@ -113,10 +189,15 @@ async function runClaimed(id: string, clubId: string) {
 
   const policy = await loadPolicy(action.clubId);
   const perms = effectivePermissions(policy, action.requestedRole);
-  if (!perms.access || perms[executor.scope] === 'OFF') return fail('AI_ACTION_FORBIDDEN');
+  if (!perms.access || modeOf(perms, executor.scope) === 'OFF') return fail('AI_ACTION_FORBIDDEN');
 
   try {
-    const result = await executor.execute(action.clubId, action.payload);
+    const result = await executor.execute(action.clubId, action.payload, {
+      actionId: action.id,
+      requestedById: action.requestedById,
+      requestedRole: action.requestedRole,
+      decidedById: action.decidedById,
+    });
     return await finish(id, {
       status: 'EXECUTED',
       executedAt: new Date(),
