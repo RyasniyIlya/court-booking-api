@@ -17,6 +17,8 @@
  *                     gemini-flash-lite-latest (див. aiFallbackModels).
  */
 
+import { sanitizeToolResult } from './piiMask';
+
 export type GeminiPart = {
   text?: string;
   /** Файл у запиті (зображення/PDF), base64. */
@@ -49,6 +51,12 @@ export type ToolDecl = {
 /** Інструмент: опис для моделі + що робить наш код, коли вона його викликала. */
 export type ToolDef = {
   decl: ToolDecl;
+  /**
+   * Результат містить ПУБЛІЧНИЙ контакт клубу (телефон на сайті), який модель
+   * має назвати гравцю, — тоді маскування номерів пропускаємо. Для контактів
+   * клієнтів це ніколи не вмикають.
+   */
+  publicContacts?: boolean;
   run: (args: Record<string, unknown>) => Promise<unknown>;
 };
 
@@ -167,7 +175,9 @@ export const callGemini: GenerateFn = async (body) => {
 /** Скільки символів відповіді інструмента віддаємо моделі. Більше — це вже дамп, а не відповідь. */
 const TOOL_RESULT_LIMIT = 12_000;
 
-function toolResponse(value: unknown): Record<string, unknown> {
+function toolResponse(raw: unknown, mask = true): Record<string, unknown> {
+  /* Телефони й пошта клієнтів до Gemini не йдуть з жодного інструмента (piiMask.ts). */
+  const value = mask ? sanitizeToolResult(raw) : raw;
   const text = JSON.stringify(value ?? null);
   if (text.length <= TOOL_RESULT_LIMIT) return { result: value ?? null };
   return { result: text.slice(0, TOOL_RESULT_LIMIT), truncated: true };
@@ -227,7 +237,7 @@ export async function runAssistant(opts: {
       const tool = byName.get(name);
       if (!tool) return { functionResponse: { name, response: { error: 'unknown tool' } } };
       try {
-        return { functionResponse: { name, response: toolResponse(await tool.run(functionCall!.args ?? {})) } };
+        return { functionResponse: { name, response: toolResponse(await tool.run(functionCall!.args ?? {}), !tool.publicContacts) } };
       } catch (e) {
         const message = e instanceof Error && e.name === 'ToolInputError' ? e.message : 'tool failed';
         return { functionResponse: { name, response: { error: message } } };

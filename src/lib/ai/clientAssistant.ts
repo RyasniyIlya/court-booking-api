@@ -80,6 +80,8 @@ export function clientTools(slug: string, fetchPublic: FetchPublic, actions: Ass
 
   return [
     {
+      /* Це публічний телефон клубу з сайту, його гравцю треба назвати — маскування не потрібне. */
+      publicContacts: true,
       decl: {
         name: 'get_club_info',
         description: 'Назва клубу, адреса, телефон, години роботи, список кортів з цінами за годину, правила оплати й акції. Викликай першим, коли треба знати корти або графік.',

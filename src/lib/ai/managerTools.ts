@@ -5,6 +5,7 @@ import { searchCondition } from '../customerRoster';
 import { prisma } from '../db';
 import { TOURNAMENT_PREFIX, isTournament } from '../tournamentPay';
 import { AiActionError, proposeAction } from './actions';
+import { shortName } from './executors/common';
 import { ToolInputError, type GenerateFn, type ToolDef } from './gemini';
 import type { OwnerClub } from './outlook';
 import { REPORT_LABELS, REPORT_TYPES, reportRefusal, type ReportType } from './reportFile';
@@ -193,8 +194,9 @@ export function managerTools(club: OwnerClub, perms: EffectivePermissions, ctx: 
           end: DateTime.fromJSDate(b.endTime).setZone(tz).toFormat('HH:mm'),
           status: b.status,
           title: b.title?.replace(TOURNAMENT_PREFIX, '') ?? undefined,
-          /* Імена клієнтів, тренери й ціни — лише в межах відкритих читань. */
-          ...(perms.readCustomers && b.customerName ? { customer: b.customerName } : {}),
+          /* Імена клієнтів, тренери й ціни — лише в межах відкритих читань. Клієнт — «Імʼя П.»:
+             прізвище й контакти до Gemini не йдуть (приватність), для дій вистачає id броні. */
+          ...(perms.readCustomers && b.customerName ? { customer: shortName(b.customerName) } : {}),
           ...(perms.readStaff && b.trainer ? { trainer: b.trainer.name } : {}),
           ...(perms.readFinance ? { price_uah: Math.round(b.priceTotal / 100) } : {}),
         }));
@@ -203,7 +205,7 @@ export function managerTools(club: OwnerClub, perms: EffectivePermissions, ctx: 
     {
       decl: {
         name: 'find_customer',
-        description: 'Знайти клієнта за імʼям або телефоном (до 8 збігів) з id, щоб поставити бронь на існуючу картку. Якщо збігів кілька — перепитай, котрий; не вгадуй.',
+        description: 'Знайти клієнта за імʼям або телефоном (до 8 збігів) з id, щоб поставити бронь на існуючу картку. Повертає id, імʼя з ініціалом і (за однофамільців) hint — останні 2 цифри; телефонів і пошти ти не бачиш і не вигадуй. Якщо збігів кілька — перепитай, котрий; не вгадуй. У propose_* передавай customer_id.',
         parameters: { type: 'object', properties: { query: { type: 'string', description: 'Імʼя або частина телефону, від 2 символів' } }, required: ['query'] },
       },
       run: async (a) => {
@@ -211,8 +213,16 @@ export function managerTools(club: OwnerClub, perms: EffectivePermissions, ctx: 
         if (q.length < 2) throw new ToolInputError('query is too short');
         const OR = searchCondition(q);
         if (!OR) return [];
+        /* Пошук за імʼям/телефоном іде тут, на сервері. Моделі віддаємо лише id, «Імʼя П.» і —
+           за однофамільців — останні 2 цифри номера, щоб власник міг розрізнити. Повний номер
+           і пошта до Gemini не потрапляють; картка в кабінеті бере їх із БД сама. */
         const rows = await prisma.customer.findMany({ where: { clubId: club.id, OR }, take: 8, orderBy: { name: 'asc' }, select: { id: true, name: true, phone: true } });
-        return rows;
+        const label = rows.map((r) => shortName(r.name));
+        return rows.map((r, i) => ({
+          id: r.id,
+          name: label[i],
+          ...(label.filter((l) => l === label[i]).length > 1 ? { hint: `…${r.phone.replace(/D/g, '').slice(-2)}` } : {}),
+        }));
       },
     },
     {

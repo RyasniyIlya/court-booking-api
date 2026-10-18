@@ -182,7 +182,32 @@ describe('довідники', () => {
     expect(closed[0]).toMatchObject({ id: 'b1', kind: 'private', court: 'Корт 2', start: '18:00', end: '19:00' });
     expect(JSON.stringify(closed)).not.toMatch(/Олена|Ігор|price/);
     const open: any = await tool('list_bookings').run({ date: '2026-10-23' });
-    expect(open[0]).toMatchObject({ customer: 'Олена Коваль', trainer: 'Ігор', price_uah: 900 });
+    expect(open[0]).toMatchObject({ customer: 'Олена К.', trainer: 'Ігор', price_uah: 900 });
+    /* Приватність: прізвище повністю й будь-які контакти до Gemini не йдуть. */
+    expect(JSON.stringify(open)).not.toMatch(/Коваль|\+380|@/);
+  });
+
+  it('find_customer: моделі йде лише id, «Імʼя П.» і hint за однофамільців — без телефону й пошти', async () => {
+    vi.mocked(prisma.customer.findMany).mockResolvedValue([
+      { id: '22222222-2222-4222-8222-222222222222', name: 'Володимир Олійник', phone: '+380000000007', email: 'v@example.com' },
+      { id: '33333333-3333-4333-8333-333333333333', name: 'Володимир Олійник', phone: '+380000000042', email: null },
+      { id: '44444444-4444-4444-8444-444444444444', name: 'Олена', phone: '+380991112233' },
+    ] as never);
+    const res: any = await tool('find_customer').run({ query: 'Володимир' });
+    expect(res).toEqual([
+      { id: '22222222-2222-4222-8222-222222222222', name: 'Володимир О.', hint: '…07' },
+      { id: '33333333-3333-4333-8333-333333333333', name: 'Володимир О.', hint: '…42' },
+      { id: '44444444-4444-4444-8444-444444444444', name: 'Олена' },
+    ]);
+    expect(JSON.stringify(res)).not.toMatch(/\+380|000000|@|Олійник/);
+  });
+
+  it('find_customer → propose_booking працює лише з customer_id', async () => {
+    proposeAction.mockResolvedValue({ id: 'a1', kind: 'booking.create', summary: 'Бронь: Корт 1, Володимир О.', status: 'PENDING', error: null });
+    const id = '22222222-2222-4222-8222-222222222222';
+    const res: any = await tool('propose_booking').run({ court_id: COURT, date: '2026-10-23', start_time: '18:00', end_time: '19:00', customer_id: id });
+    expect(proposeAction.mock.calls[0][0].payload).toMatchObject({ customerId: id, customerName: undefined, customerPhone: undefined });
+    expect(res.status).toBe('PENDING');
   });
 
   it('find_customer шукає тільки в клубі автора', async () => {
