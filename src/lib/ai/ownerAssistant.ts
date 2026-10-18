@@ -15,7 +15,7 @@ import type { ChatMessage } from './clientAssistant';
 import { bookingOutlook, type OwnerClub } from './outlook';
 import { describeSnapshot, loadOwnerSnapshot, type ClubSnapshot } from './ownerContext';
 import { actionToolAllowed, closedAreas, filterTools, FULL_ACCESS, type EffectivePermissions } from './policy';
-import { managerTools, type ManagerContext, type ProposedAction } from './managerTools';
+import { CHAT_MAX_PROPOSALS, managerTools, type ManagerContext, type ProposedAction } from './managerTools';
 
 /**
  * Нейроаналітик для власника клубу.
@@ -389,10 +389,10 @@ export async function ownerAssistant(opts: {
   /** Готовий знімок (щоб не рахувати двічі); без нього завантажимо самі */
   snapshot?: ClubSnapshot | null;
   /** Хто питає й куди складати пропозиції дій; без цього — лише аналітика, як раніше */
-  manager?: { requester: ManagerContext['requester'] };
+  manager?: { requester: ManagerContext['requester']; maxProposals?: number };
 }): Promise<{ reply: string; steps: number; tokens: number; actions: ProposedAction[] }> {
   const actions: ProposedAction[] = [];
-  const manager: ManagerContext | undefined = opts.manager && { requester: opts.manager.requester, collect: (a) => { actions.push(a); } };
+  const manager: ManagerContext | undefined = opts.manager && { requester: opts.manager.requester, maxProposals: opts.manager.maxProposals ?? CHAT_MAX_PROPOSALS, collect: (a) => { actions.push(a); } };
   const tools = ownerTools(opts.club, opts.generate, opts.perms ?? FULL_ACCESS, manager);
   const perms = opts.perms ?? FULL_ACCESS;
   /* Знімок — покращення, не умова: збій БД тут не має вбити розмову. */

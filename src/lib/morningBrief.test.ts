@@ -156,3 +156,27 @@ it('добовий ліміт запитів до ІІ вичерпано — с
   expect(mocks.assistant).not.toHaveBeenCalled();
   delete process.env.AI_OWNER_DAILY_LIMIT;
 });
+
+it('вичерпана квота НЕ спалює день: після її відновлення сводка приходить', async () => {
+  process.env.AI_OWNER_DAILY_LIMIT = '1';
+  takeQuota('owner', 'c1', 1);
+  expect(await runMorningBriefTick(at('2026-10-24T08:05:00'))).toBe(0);
+  expect(mocks.marks.size).toBe(0);
+  delete process.env.AI_OWNER_DAILY_LIMIT;
+  expect(await runMorningBriefTick(at('2026-10-24T08:20:00'))).toBe(1);
+});
+
+it('сводка просить у моделі не більше трьох пропозицій', async () => {
+  await runMorningBriefTick(at('2026-10-24T08:05:00'));
+  expect(mocks.assistant.mock.calls[0][0].manager.maxProposals).toBe(3);
+});
+
+it('некоректний часовий пояс клубу: пропуск із попередженням, решта клубів працюють', async () => {
+  const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+  const good = owner();
+  const bad = { ...owner({ id: 'c2', timezone: 'Mars/Olympus' }), id: 'u2', tgChatId: '1002' };
+  mocks.findMany.mockResolvedValue([bad, good]);
+  expect(await runMorningBriefTick(at('2026-10-24T08:05:00'))).toBe(1);
+  expect(warn).toHaveBeenCalled();
+  warn.mockRestore();
+});

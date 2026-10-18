@@ -65,3 +65,10 @@ it('ADMIN і далі зберігає решту налаштувань, якщ
   expect((await request(app).patch('/club').send({ name: 'Клуб' })).status).toBe(200);
   expect(prisma.club.update.mock.calls[0][0].data).not.toHaveProperty('analyticsThresholds');
 });
+
+it.each([['Europe/Kyiv', 200], ['Mars/Olympus', 400], ['не зона', 400]])('часовий пояс %s → %i', async (timezone, status) => {
+  prisma.club.findUnique.mockResolvedValue({ id: 'club', timezone: 'Europe/Kyiv' });
+  prisma.club.update.mockResolvedValue({ id: 'club' });
+  expect((await request(app).patch('/club').send({ timezone })).status).toBe(status);
+  if (status === 400) expect(prisma.club.update).not.toHaveBeenCalled();
+});

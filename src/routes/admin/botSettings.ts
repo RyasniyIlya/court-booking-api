@@ -161,12 +161,16 @@ botSettingsRouter.put('/bot-settings', async (req, res) => {
 
   /* briefSentOn — службова позначка «сводку за цей день уже надіслано» (див.
      lib/morningBrief.ts). Нормалізація її відкидає, тож без перенесення кожне
-     збереження форми стирало б її й давало друге повідомлення того ж ранку. */
-  const sentOn = (club.botSettings as { briefSentOn?: unknown } | null)?.briefSentOn;
-  await prisma.club.update({
-    where: { id: clubId },
-    data: { botSettings: typeof sentOn === 'string' ? { ...settings, briefSentOn: sentOn } : settings },
-  });
+     збереження форми стирало б її й давало друге повідомлення того ж ранку.
+     Планувальник може поставити свіжу позначку між нашим читанням і записом, тому
+     беремо її з ПОТОЧНОГО рядка прямо в UPDATE (jsonb-злиття), а не з копії. */
+  await prisma.$executeRaw`
+    UPDATE "Club"
+    SET "botSettings" = ${JSON.stringify(settings)}::jsonb || CASE
+      WHEN jsonb_typeof("botSettings") = 'object' AND jsonb_typeof("botSettings"->'briefSentOn') = 'string'
+      THEN jsonb_build_object('briefSentOn', "botSettings"->'briefSentOn')
+      ELSE '{}'::jsonb END
+    WHERE "id" = ${clubId}::uuid`;
 
   res.json({ settings });
 });

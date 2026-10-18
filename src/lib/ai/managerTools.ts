@@ -38,7 +38,16 @@ export type ManagerContext = {
   requester: { id: string | null; role: UserRole };
   /** Кожну пропозицію віддаємо кабінету карткою під відповіддю. */
   collect(action: ProposedAction): void;
+  /**
+   * Скільки пропозицій модель може створити за один запит. Без стелі «три кроки» з
+   * промпту — лише прохання: вона могла б завалити чергу власника десятками дій.
+   * Не задано — без обмеження (тести, старі виклики).
+   */
+  maxProposals?: number;
 };
+
+/** Стеля пропозицій за один запит у чаті кабінету; сводка в Telegram бере 3 (MORNING_BRIEF_MAX_PROPOSALS). */
+export const CHAT_MAX_PROPOSALS = 5;
 
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -104,7 +113,12 @@ export function managerTools(club: OwnerClub, perms: EffectivePermissions, ctx: 
   const dateProp = { type: 'string', description: 'Дата YYYY-MM-DD за часом клубу' };
   const timeProp = (what: string) => ({ type: 'string', description: `${what}, HH:mm за часом клубу` });
 
+  let proposed = 0;
   async function propose(kind: string, payload: unknown) {
+    if (ctx.maxProposals !== undefined && proposed >= ctx.maxProposals) {
+      throw new ToolInputError(`Ліміт пропозицій на цей запит (${ctx.maxProposals}) вичерпано. Нових дій не пропонуй — скажи, що решту можна запропонувати окремо.`);
+    }
+    proposed += 1;
     try {
       const row = await proposeAction({ clubId: club.id, kind, payload, requester: ctx.requester });
       ctx.collect({ id: row.id, kind: row.kind, summary: row.summary, status: row.status, error: row.error, payload: row.payload, result: row.result });

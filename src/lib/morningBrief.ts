@@ -41,6 +41,9 @@ const TG_BRIEF_REQUEST = `${BRIEF_REQUEST}
 
 Це повідомлення піде власнику в Telegram, тож стисло: до 2500 символів. Пункт 4 не розписуй текстом — натомість запропонуй цими діями через інструменти не більше трьох конкретних кроків (лише ті, що справді мають сенс за цифрами); якщо очевидних дій немає, не пропонуй жодної. Про кожну запропоновану дію одним рядком скажи, чому вона.`;
 
+/** Скільки дій сводка може запропонувати: стільки ж показуємо кнопками. */
+export const MORNING_BRIEF_MAX_PROPOSALS = 3;
+
 const FAILED_TEXT = 'ℹ️ Ранкову сводку ІІ сьогодні зібрати не вдалося. Спробуйте відкрити її в кабінеті → ІІ.';
 
 /** Дата-мітка дня за часом клубу. */
@@ -55,9 +58,11 @@ const dayKey = (local: DateTime) => local.toFormat('yyyy-MM-dd');
 export async function claimBriefDay(clubId: string, day: string): Promise<boolean> {
   const n = await prisma.$executeRaw`
     UPDATE "Club"
-    SET "botSettings" = jsonb_set(COALESCE("botSettings", '{}'::jsonb), '{briefSentOn}', to_jsonb(${day}::text))
+    SET "botSettings" = jsonb_set("botSettings", '{briefSentOn}', to_jsonb(${day}::text))
     WHERE "id" = ${clubId}::uuid
-      AND COALESCE("botSettings"->>'briefSentOn', '') < ${day}`;
+      AND jsonb_typeof("botSettings") = 'object'
+      AND CASE WHEN jsonb_typeof("botSettings"->'briefSentOn') = 'string'
+               THEN "botSettings"->>'briefSentOn' ELSE '' END < ${day}`;
   return n === 1;
 }
 
@@ -84,11 +89,6 @@ async function composeAndSend(
     return ok;
   };
 
-  if (!takeQuota('owner', club.id, envLimit('AI_OWNER_DAILY_LIMIT', 100))) {
-    console.log('[brief] добовий ліміт ІІ вичерпано — сводку пропущено', club.id);
-    return false;
-  }
-
   const proposed: ShownAction[] = [];
   let reply: string;
   try {
@@ -98,7 +98,7 @@ async function composeAndSend(
       messages: [{ role: 'user', content: TG_BRIEF_REQUEST }],
       perms,
       role: 'OWNER',
-      manager: { requester: { id: ownerId, role: 'OWNER' } },
+      manager: { requester: { id: ownerId, role: 'OWNER' }, maxProposals: MORNING_BRIEF_MAX_PROPOSALS },
     });
     reply = out.reply;
     for (const a of out.actions) proposed.push({ id: a.id, summary: a.summary, status: a.status, error: a.error });
@@ -140,9 +140,20 @@ async function runTick(now: DateTime = DateTime.now()): Promise<number> {
     if (!settings.enabled) continue;
 
     const local = now.setZone(club.timezone);
+    /* Зіпсована зона в БД дає Invalid DateTime: година NaN — без перевірки клуб мовчки випав би з розсилки. */
+    if (!local.isValid) {
+      console.warn('[brief] некоректний часовий пояс клубу — пропущено', club.id);
+      continue;
+    }
     if (local.hour < settings.hour || local.hour >= settings.hour + CATCHUP_HOURS) continue;
 
     try {
+      /* Ліміт беремо ДО позначки дня: вичерпана квота не має «спалювати» день,
+         інакше сводка не прийшла б і після того, як ліміт оновиться. */
+      if (!takeQuota('owner', club.id, envLimit('AI_OWNER_DAILY_LIMIT', 100))) {
+        console.log('[brief] добовий ліміт ІІ вичерпано — сводку пропущено', club.id);
+        continue;
+      }
       if (!(await claimBriefDay(club.id, dayKey(local)))) continue;
       if (await composeAndSend(club, owners[0].id, owners.map((o) => o.chat))) delivered += 1;
     } catch (e) {

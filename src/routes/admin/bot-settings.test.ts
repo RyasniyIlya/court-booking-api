@@ -10,7 +10,8 @@ import request from 'supertest';
  */
 
 const prisma = {
-  club: { findUnique: vi.fn(), update: vi.fn() },
+  club: { findUnique: vi.fn() },
+  $executeRaw: vi.fn(),
   promo: { findMany: vi.fn() },
   trainer: { findMany: vi.fn() },
   customer: { count: vi.fn() },
@@ -66,7 +67,7 @@ beforeEach(() => {
   botIsReady = true;
   process.env.TELEGRAM_BOT_USERNAME = 'kort_bot';
   prisma.club.findUnique.mockResolvedValue(clubRow());
-  prisma.club.update.mockResolvedValue({});
+  prisma.$executeRaw.mockResolvedValue(1);
   prisma.promo.findMany.mockResolvedValue([]);
   prisma.trainer.findMany.mockResolvedValue([]);
   prisma.customer.count.mockResolvedValue(0);
@@ -79,7 +80,7 @@ describe('доступ', () => {
     expect((await request(app).put('/api/admin/bot-settings').set('x-role', role).send(defaultBotSettings())).status).toBe(403);
     expect((await request(app).post('/api/admin/bot-settings/preview').set('x-role', role)
       .send({ settings: defaultBotSettings(), kind: 'home' })).status).toBe(403);
-    expect(prisma.club.update).not.toHaveBeenCalled();
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
   });
 });
 
@@ -184,10 +185,11 @@ describe('PUT /bot-settings', () => {
 
     expect(res.status).toBe(200);
     expect(res.body.settings).toMatchObject({ displayName: 'Арена', welcome: 'Привіт, {name}!', showPhone: false });
-    expect(prisma.club.update).toHaveBeenCalledWith({
-      where: { id: 'club-1' },
-      data: { botSettings: res.body.settings },
-    });
+    /* Запис — одним UPDATE (jsonb-злиття з поточною briefSentOn): [шаблон, json, clubId] */
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    const [, json, clubId] = prisma.$executeRaw.mock.calls[0];
+    expect(JSON.parse(json)).toEqual(res.body.settings);
+    expect(clubId).toBe('club-1');
   });
 
   it('порожня назва стає null (назва клубу)', async () => {
@@ -201,7 +203,7 @@ describe('PUT /bot-settings', () => {
     const res = await request(app).put('/api/admin/bot-settings').send(body());
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({ error: 'PLAN_REQUIRED', feature: 'telegram' });
-    expect(prisma.club.update).not.toHaveBeenCalled();
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
   });
 
   it('«Броні»: зберегти налаштування можна, а увімкнути повернення клієнтів — ні', async () => {
@@ -210,13 +212,13 @@ describe('PUT /bot-settings', () => {
     const ok = await request(app).put('/api/admin/bot-settings').send(body({ showPhone: false }));
     expect(ok.status).toBe(200);
 
-    prisma.club.update.mockClear();
+    prisma.$executeRaw.mockClear();
     const res = await request(app).put('/api/admin/bot-settings').send(body({
       winback: { ...defaultBotSettings().winback, enabled: true },
     }));
     expect(res.status).toBe(403);
     expect(res.body).toMatchObject({ error: 'PLAN_REQUIRED', feature: 'analytics' });
-    expect(prisma.club.update).not.toHaveBeenCalled();
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
   });
 
   it('«Аналітика»: повернення клієнтів вмикається', async () => {
@@ -283,7 +285,7 @@ describe('PUT /bot-settings', () => {
   ])('невалідне тіло (%s) — 400', async (_n, over) => {
     const res = await request(app).put('/api/admin/bot-settings').send(body(over));
     expect(res.status).toBe(400);
-    expect(prisma.club.update).not.toHaveBeenCalled();
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
   });
 
   it('неповне тіло — 400', async () => {
@@ -347,7 +349,7 @@ describe('POST /bot-settings/preview', () => {
     prisma.club.findUnique.mockResolvedValue(clubRow({ plan: { ...PLAN3, tier: 1 } }));
     const res = await request(app).post('/api/admin/bot-settings/preview').send({ settings: defaultBotSettings(), kind: 'home' });
     expect(res.status).toBe(200);
-    expect(prisma.club.update).not.toHaveBeenCalled();
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -378,7 +380,7 @@ describe('PUT /bot-settings: ІІ (етап 3)', () => {
     const no = await request(app).put('/api/admin/bot-settings').send({ ...legacy, morningBrief: { enabled: true, hour: 8 } });
     expect(no.status).toBe(403);
     expect(no.body).toMatchObject({ error: 'PLAN_REQUIRED', feature: 'ai' });
-    expect(prisma.club.update).not.toHaveBeenCalled();
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
     expect((await request(app).put('/api/admin/bot-settings').send({ ...legacy, morningBrief: { enabled: false, hour: 8 } })).status).toBe(200);
   });
 
@@ -389,9 +391,13 @@ describe('PUT /bot-settings: ІІ (етап 3)', () => {
     expect(res.body.settings).toMatchObject({ morningBrief: { enabled: true, hour: 10 }, actionAlerts: false });
   });
 
-  it('збереження форми не стирає позначку «сводку за день надіслано»', async () => {
-    prisma.club.findUnique.mockResolvedValue(clubRow({ botSettings: { briefSentOn: '2026-10-18' } }));
+  it('збереження форми не стирає позначку «сводку за день надіслано» і не бере її зі застарілого читання', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow({ botSettings: { briefSentOn: '2026-10-17' } }));
     await request(app).put('/api/admin/bot-settings').send(legacy);
-    expect(prisma.club.update.mock.calls[0][0].data.botSettings.briefSentOn).toBe('2026-10-18');
+    const [strings, json] = prisma.$executeRaw.mock.calls[0];
+    const sql = strings.join('?');
+    /* позначка береться з поточного рядка в самому UPDATE; прочитана раніше копія в запис не йде */
+    expect(sql).toContain("jsonb_build_object('briefSentOn', \"botSettings\"->'briefSentOn')");
+    expect(json).not.toContain('briefSentOn');
   });
 });

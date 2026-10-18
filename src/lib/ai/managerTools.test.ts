@@ -215,3 +215,25 @@ describe('ownerAssistant з менеджером', () => {
     expect(generate.mock.calls[0][0].systemInstruction.parts[0].text).not.toMatch(/propose_/);
   });
 });
+
+describe('стеля пропозицій за запит (maxProposals)', () => {
+  const booking = { court_id: COURT, date: '2026-10-23', start_time: '18:00', end_time: '19:00', customer_name: 'Олена' };
+  const limited = (max: number | undefined) => ownerTools(club, undefined, perms({}), { ...ctx(), maxProposals: max }).find((t) => t.decl.name === 'propose_booking')!;
+
+  it('після ліміту інструмент відмовляє, і нової дії в журналі не створюється', async () => {
+    proposeAction.mockResolvedValue({ id: 'a1', kind: 'booking.create', summary: 'x', status: 'PENDING', error: null });
+    const t = limited(2);
+    await t.run(booking);
+    await t.run(booking);
+    await expect(t.run(booking)).rejects.toThrow(/Ліміт пропозицій/);
+    expect(proposeAction).toHaveBeenCalledTimes(2);
+    expect(collected).toHaveLength(2);
+  });
+
+  it('без maxProposals обмеження немає', async () => {
+    proposeAction.mockResolvedValue({ id: 'a1', kind: 'booking.create', summary: 'x', status: 'PENDING', error: null });
+    const t = limited(undefined);
+    for (let i = 0; i < 8; i++) await t.run(booking);
+    expect(proposeAction).toHaveBeenCalledTimes(8);
+  });
+});

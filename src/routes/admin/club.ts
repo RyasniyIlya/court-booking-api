@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { DateTime } from 'luxon';
 import { z } from 'zod';
 import { sportsSchema } from '../../lib/sport';
 
@@ -225,6 +226,9 @@ clubRouter.patch(
           z.string()
             .trim()
             .max(64)
+            /* IANA-зона має бути справжньою: з довільним рядком luxon дає Invalid DateTime, і розклад, зведення
+               та ранкова сводка клубу ламаються мовчки. */
+            .refine((tz) => DateTime.local().setZone(tz).isValid, 'invalid timezone')
             .optional(),
 
         /* Види спорту клубу (Падел/Теніс/Сквош). */
