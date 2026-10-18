@@ -14,7 +14,7 @@ import { ownerAssistant } from './ai/ownerAssistant';
 import { CHAT_MAX_PROPOSALS } from './ai/managerTools';
 import { effectivePermissions } from './ai/policy';
 import { loadPolicy } from './ai/policyStore';
-import { envLimit, takeQuota } from './ai/quota';
+import { envLimit, refundQuota, takeQuota } from './ai/quota';
 import { loadContext, saveTurn } from './ai/chatContext';
 import './ai/executors';
 
@@ -117,6 +117,12 @@ export async function settleAiTasks(): Promise<void> {
   await Promise.allSettled([...tasks]);
 }
 
+/*
+ * Компроміс: якщо процес перезапуститься посеред виклику моделі, ця одна відповідь
+ * загублена — Telegram її вже не повторить (вебхук відповів 200). Це свідомо дешевше
+ * за альтернативу: тримати вебхук відкритим на десятки секунд, дочекатись повтору
+ * від Telegram і заплатити за модель двічі.
+ */
 function background(job: Promise<void>): void {
   const p = job.catch(() => { console.error('[ai] bot background task failed'); });
   tasks.add(p);
@@ -275,9 +281,12 @@ export async function handlePlayerAiText(chatId: string, text: string): Promise<
   let started = false;
   try {
     const tz = { timezone: club.timezone };
-    /* Спершу свій ліміт гравця (захист від одного балакуна), потім стеля клубу, спільна з віджетом. */
-    const ok = await takeQuota(`bot:player:${pick.customerId}`, club.id, envLimit('AI_BOT_PLAYER_DAILY', 20), tz)
-      && await takeQuota('client', club.id, envLimit('AI_CLIENT_DAILY_LIMIT', 300), tz);
+    /* Спершу стеля клубу (спільна з віджетом), потім особистий ліміт гравця: вичерпана стеля клубу
+       не має спалювати добовий запас гравця. Якщо впав другий — перше місце повертаємо. */
+    const playerScope = `bot:player:${pick.customerId}`;
+    const clubOk = await takeQuota('client', club.id, envLimit('AI_CLIENT_DAILY_LIMIT', 300), tz);
+    const ok = clubOk && await takeQuota(playerScope, club.id, envLimit('AI_BOT_PLAYER_DAILY', 20), tz);
+    if (clubOk && !ok) await refundQuota('client', club.id, tz);
     if (!ok) { await sendMessage(chatId, TEXT.limitPlayer); return true; }
 
     started = true;

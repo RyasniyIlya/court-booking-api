@@ -19,6 +19,7 @@ const CARD_B = 'c0000000-0000-4000-8000-00000000000b';
 const CHAT = 777;
 
 const state = vi.hoisted(() => ({
+  refunds: [] as string[],
   staff: null as Row | null,
   cards: [] as Row[],
   clubs: {} as Record<string, Row>,
@@ -100,6 +101,7 @@ vi.mock('./ai/quota', async (orig) => ({
     state.quotaCalls.push({ scope, clubId, limit, timezone: opts.timezone });
     return !state.quotaDeny.has(scope);
   }),
+  refundQuota: vi.fn(async (scope: string) => { state.refunds.push(scope); }),
 }));
 vi.mock('./aiTelegram', async (orig) => ({ ...(await orig<typeof import('./aiTelegram')>()), queueActionAlert: ai.alert }));
 
@@ -144,6 +146,7 @@ beforeEach(() => {
   state.turns = [];
   state.policy = { bookings: 'ASK', roleAccess: {} };
   state.quotaCalls = [];
+  state.refunds = [];
   state.quotaDeny.clear();
   state.configured = true;
   resetAiGuard();
@@ -311,7 +314,8 @@ describe('гравець → помічник клубу', () => {
     const args = ai.client.mock.calls[0][0];
     expect(args).toMatchObject({ slug: 'squash', clubName: 'Squash Arena', channel: 'telegram' });
     expect(args.messages).toEqual([{ role: 'user', content: 'які ціни?' }]);
-    expect(state.quotaCalls.map((c) => [c.scope, c.limit])).toEqual([[`bot:player:${CARD_A}`, 20], ['client', 300]]);
+    expect(state.quotaCalls.map((c) => [c.scope, c.limit])).toEqual([['client', 300], [`bot:player:${CARD_A}`, 20]]);
+    expect(state.refunds).toEqual([]);
     expect(allText()).toContain('У клубі 3 корти.');
   });
 
@@ -319,15 +323,24 @@ describe('гравець → помічник клубу', () => {
     process.env.AI_BOT_PLAYER_DAILY = '5';
     await sayAndWait('привіт');
     delete process.env.AI_BOT_PLAYER_DAILY;
-    expect(state.quotaCalls[0]).toMatchObject({ scope: `bot:player:${CARD_A}`, limit: 5 });
+    expect(state.quotaCalls[1]).toMatchObject({ scope: `bot:player:${CARD_A}`, limit: 5 });
   });
 
-  it('ліміт гравця вичерпано → модель не викликається, ліміт клубу не чіпається', async () => {
+  it('ліміт гравця вичерпано → модель не викликається, місце в стелі клубу повертається', async () => {
     state.quotaDeny.add(`bot:player:${CARD_A}`);
     await sayAndWait('ще питання');
     expect(ai.client).not.toHaveBeenCalled();
-    expect(state.quotaCalls.map((c) => c.scope)).toEqual([`bot:player:${CARD_A}`]);
+    expect(state.quotaCalls.map((c) => c.scope)).toEqual(['client', `bot:player:${CARD_A}`]);
+    expect(state.refunds).toEqual(['client']);
     expect(allText()).toContain('ліміт');
+  });
+
+  it('стелю клубу вичерпано → особистий запас гравця не чіпається і повертати нічого', async () => {
+    state.quotaDeny.add('client');
+    await sayAndWait('ще питання');
+    expect(ai.client).not.toHaveBeenCalled();
+    expect(state.quotaCalls.map((c) => c.scope)).toEqual(['client']);
+    expect(state.refunds).toEqual([]);
   });
 
   it('кілька клубів: береться той, де гравець був останнім', async () => {
@@ -337,7 +350,7 @@ describe('гравець → помічник клубу', () => {
     ];
     await sayAndWait('які ціни?');
     expect(ai.client.mock.calls[0][0]).toMatchObject({ slug: 'padel', clubName: 'Padel Club' });
-    expect(state.quotaCalls[0].scope).toBe(`bot:player:${CARD_B}`);
+    expect(state.quotaCalls[1].scope).toBe(`bot:player:${CARD_B}`);
   });
 
   it('модель підібрала слот: бронь НЕ створюється, є лише кнопка на розклад клубу з поясненням', async () => {
@@ -463,6 +476,14 @@ describe('контекст розмови', () => {
     const { saveTurn } = await import('./ai/chatContext');
     await saveTurn('1', CLUB_A, 'staff', 'x'.repeat(5000), 'y'.repeat(5000), new Date());
     expect(state.turns.every((t) => t.content.length === 2000)).toBe(true);
+  });
+
+  it('/profile <клуб> (вхід в інший клуб) скидає контекст', async () => {
+    const { saveTurn } = await import('./ai/chatContext');
+    state.staff = null;
+    await saveTurn(String(CHAT), CLUB_A, 'player', 'q', 'a', new Date());
+    await say('/profile padel');
+    expect(state.turns).toHaveLength(0);
   });
 
   it('/start, /logout і зміна клубу скидають контекст', async () => {

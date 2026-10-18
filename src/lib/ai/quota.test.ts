@@ -10,7 +10,7 @@ import { pglitePrisma } from '../../../tests/helpers/pglitePrisma';
 const kit = vi.hoisted(() => ({ prisma: null as any }));
 vi.mock('../db', () => ({ get prisma() { return kit.prisma; } }));
 
-const { takeQuota, quotaDay, purgeOldUsage, envLimit } = await import('./quota');
+const { takeQuota, refundQuota, quotaDay, purgeOldUsage, envLimit } = await import('./quota');
 
 let pg: Awaited<ReturnType<typeof pglitePrisma>>;
 const CLUB = randomUUID();
@@ -86,6 +86,19 @@ describe('takeQuota (SQL)', () => {
     expect(await takeQuota('x', CLUB, 5)).toBe(false);
     err.mockRestore();
     kit.prisma = real;
+  });
+});
+
+describe('refundQuota', () => {
+  it('повертає одне місце, але не нижче нуля', async () => {
+    const o = at('2026-10-05T10:00:00Z');
+    expect(await takeQuota('refund', CLUB, 1, o)).toBe(true);
+    expect(await takeQuota('refund', CLUB, 1, o)).toBe(false);
+    await refundQuota('refund', CLUB, o);
+    expect(await used(CLUB, 'refund', '2026-10-05')).toBe(0);
+    await refundQuota('refund', CLUB, o);
+    expect(await used(CLUB, 'refund', '2026-10-05')).toBe(0);
+    expect(await takeQuota('refund', CLUB, 1, o)).toBe(true);
   });
 });
 

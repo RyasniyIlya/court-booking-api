@@ -69,6 +69,25 @@ export async function takeQuota(
   }
 }
 
+/**
+ * Повернути одне взяте місце (атомарно, не нижче нуля). Потрібне, коли запит
+ * пройшов один ліміт, але впав на другому: перший не має «згоріти» дарма.
+ */
+export async function refundQuota(
+  scope: string,
+  clubId: string,
+  opts: { timezone?: string; now?: Date } = {},
+): Promise<void> {
+  const day = quotaDay(opts.timezone, opts.now);
+  try {
+    await prisma.$executeRaw`
+      UPDATE "AiUsage" SET "count" = GREATEST("count" - 1, 0)
+      WHERE "clubId" = ${clubId}::uuid AND "scope" = ${scope} AND "day" = ${day}`;
+  } catch {
+    console.error('[ai] quota refund failed');
+  }
+}
+
 export const envLimit = (name: string, fallback: number) => {
   const n = Number(process.env[name]);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;

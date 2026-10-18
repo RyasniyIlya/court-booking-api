@@ -589,6 +589,8 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
      чаті — ділитись номером у груповому чаті клубу ніхто не має. */
   const loginSlug = cmd === '/start' ? loginSlugFromStartPayload(args[0]) : null;
   if (loginSlug || cmd === '/profile') {
+    /* Вхід в інший клуб — теж зміна клубу: розмова з ІІ починається заново. */
+    await resetContext(chatId);
     if (msg.chat.type !== 'private') {
       await sendMessage(chatId, 'Вхід гравця працює тільки в особистому чаті з ботом.');
       return;

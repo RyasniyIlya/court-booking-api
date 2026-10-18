@@ -159,16 +159,13 @@ export function editMessageText(
  * стає підсумком («✅ Виконано»). editMessageText тут не годиться — Telegram
  * відхиляє його, якщо текст не змінився.
  */
-/**
- * Індикатор «друкує…» у чаті (живе ~5 с). Потрібен відповідям ІІ, які йдуть десятки секунд:
- * без нього людина думає, що бот завис, і шле те саме вдруге. Помилку ковтаємо — це лише декор.
- */
-export function sendChatAction(chatId: string | number, action: 'typing' = 'typing') {
-  return call<boolean>('sendChatAction', { chat_id: chatId, action }).catch(() => null);
-}
-
 export function editMessageReplyMarkup(chatId: string | number, messageId: number, markup: unknown) {
   return call<unknown>('editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: markup });
+}
+
+/** Індикатор «друкує…» (живе ~5 с) на час довгої відповіді ІІ; помилку ковтаємо — це лише декор. */
+export function sendChatAction(chatId: string | number, action: 'typing' = 'typing') {
+  return call<boolean>('sendChatAction', { chat_id: chatId, action }).catch(() => null);
 }
 
 /**

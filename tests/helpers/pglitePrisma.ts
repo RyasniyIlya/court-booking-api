@@ -30,6 +30,10 @@ export async function pglitePrisma() {
 
   const prisma = {
     $queryRaw: run,
+    $executeRaw: async (strings: TemplateStringsArray, ...values: unknown[]) => {
+      const text = strings.reduce((acc, part, i) => acc + (i === 0 ? '' : `$${i}`) + part, '');
+      return (await db.query(text, values)).affectedRows ?? 0;
+    },
     aiUsage: {
       deleteMany: async ({ where }: { where: { day: { lt: string } } }) => {
         const res = await db.query('DELETE FROM "AiUsage" WHERE "day" < $1', [where.day.lt]);
