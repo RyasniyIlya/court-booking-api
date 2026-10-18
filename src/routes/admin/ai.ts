@@ -109,7 +109,7 @@ aiRouter.post('/ai/chat', aiAccess, async (req, res) => {
 
   const club = await ownerClub(req.auth!.clubId);
   if (!club) return res.status(404).json({ error: 'CLUB_NOT_FOUND' });
-  if (!takeQuota('owner', club.id, envLimit('AI_OWNER_DAILY_LIMIT', 100))) {
+  if (!await takeQuota('owner', club.id, envLimit('AI_OWNER_DAILY_LIMIT', 100), { timezone: club.timezone })) {
     return res.status(429).json({ error: 'AI_DAILY_LIMIT' });
   }
 
@@ -143,7 +143,7 @@ aiRouter.post('/ai/brief', aiAccess, async (req, res) => {
   if (cached && !fresh && Date.now() - cached.at < BRIEF_TTL_MS) {
     return res.json({ reply: cached.reply, cached: true });
   }
-  if (!takeQuota('owner', club.id, envLimit('AI_OWNER_DAILY_LIMIT', 100))) {
+  if (!await takeQuota('owner', club.id, envLimit('AI_OWNER_DAILY_LIMIT', 100), { timezone: club.timezone })) {
     return res.status(429).json({ error: 'AI_DAILY_LIMIT' });
   }
 

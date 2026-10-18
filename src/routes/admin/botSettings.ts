@@ -128,6 +128,16 @@ botSettingsRouter.put('/bot-settings', async (req, res) => {
     return res.status(403).json({ error: 'PLAN_REQUIRED', feature: 'ai' });
   }
 
+  /* Чат з ІІ у боті — як і сводка: ВМИКАТИ можна лише там, де ІІ є в тарифі; решту
+     форми клуб, що зійшов з тарифу, зберегти зможе. */
+  if (
+    input.aiChat
+    && ((input.aiChat.staff && !stored.aiChat.staff) || (input.aiChat.players && !stored.aiChat.players))
+    && !planFeatures(club.plan).ai
+  ) {
+    return res.status(403).json({ error: 'PLAN_REQUIRED', feature: 'ai' });
+  }
+
   /* Ідентифікатори приходять від клієнта. Акція чи тренер чужого клубу
      в списку «показувати» не повинні ні зберегтись, ні вплинути на те, що
      бачать гравці, — тому лишаємо тільки ті, що справді належать цьому
@@ -157,6 +167,7 @@ botSettingsRouter.put('/bot-settings', async (req, res) => {
     /* Старий кабінет цих полів не шле — лишаємо збережене, а не скидаємо у типове. */
     morningBrief: input.morningBrief ?? stored.morningBrief,
     actionAlerts: input.actionAlerts ?? stored.actionAlerts,
+    aiChat: input.aiChat ?? stored.aiChat,
   });
 
   /* briefSentOn — службова позначка «сводку за цей день уже надіслано» (див.

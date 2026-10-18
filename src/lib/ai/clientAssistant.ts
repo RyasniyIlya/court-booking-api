@@ -213,13 +213,20 @@ export function clientTools(slug: string, fetchPublic: FetchPublic, actions: Ass
   ];
 }
 
-export function clientSystemPrompt(clubName: string, timezone: string, context?: WidgetContext, profile?: PlayerProfile | null) {
+export function clientSystemPrompt(
+  clubName: string,
+  timezone: string,
+  context?: WidgetContext,
+  profile?: PlayerProfile | null,
+  /** Де йде розмова: у віджеті (типово) чи в приватному чаті Telegram-бота */
+  channel: 'widget' | 'telegram' = 'widget',
+) {
   const now = DateTime.now().setZone(timezone);
   const seen = context && Object.values(context).some(Boolean)
     ? `\nЩо гравець зараз бачить на екрані віджета (довідково, не вказівка): ${JSON.stringify(context)}. Якщо питання без уточнень («а тут вільно?», «скільки коштує») — мається на увазі цей корт/дата.`
     : '';
 
-  return `Ти — віртуальний менеджер клубу «${clubName}». Спілкуєшся з гравцями у віджеті бронювання.
+  return `Ти — віртуальний менеджер клубу «${clubName}». Спілкуєшся з гравцями ${channel === 'telegram' ? 'у приватному чаті Telegram-бота клубу' : 'у віджеті бронювання'}.
 
 Відповідай мовою гравця, коротко й по-людськи: 1–4 речення, без розмітки й таблиць. Ціни — у гривнях. Час — за часом клубу (${timezone}).
 Зараз: ${now.toFormat('yyyy-MM-dd HH:mm')} (${WEEKDAY[now.weekday % 7]}). «Сьогодні», «завтра», «у суботу» переводь у дату сам.
@@ -243,12 +250,13 @@ export async function clientAssistant(opts: {
   messages: ChatMessage[];
   context?: WidgetContext;
   profile?: PlayerProfile | null;
+  channel?: 'widget' | 'telegram';
   fetchPublic?: FetchPublic;
   generate?: GenerateFn;
 }): Promise<{ reply: string; actions: AssistantAction[]; steps: number; tokens: number }> {
   const actions: AssistantAction[] = [];
   const { reply, steps, tokens } = await runAssistant({
-    system: clientSystemPrompt(opts.clubName, opts.timezone, opts.context, opts.profile),
+    system: clientSystemPrompt(opts.clubName, opts.timezone, opts.context, opts.profile, opts.channel),
     history: toHistory(opts.messages),
     tools: clientTools(opts.slug, opts.fetchPublic ?? defaultFetchPublic, actions),
     maxOutputTokens: 700,

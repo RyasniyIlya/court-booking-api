@@ -404,3 +404,23 @@ describe('ІІ-налаштування (етап 3)', () => {
     expect(botSettingsSchema.safeParse({ ...legacy, morningBrief: { enabled: true, hour: 8, x: 1 } }).success).toBe(false);
   });
 });
+
+describe('ІІ-чат у боті (етап 5)', () => {
+  it('типово: персонал так, гравці ні', () => {
+    expect(normalizeBotSettings({}).aiChat).toEqual({ staff: true, players: false });
+  });
+
+  it('сміття в полях повертається до типових, окремі поля незалежні', () => {
+    expect(normalizeBotSettings({ aiChat: { staff: 'так', players: true } }).aiChat).toEqual({ staff: true, players: true });
+    expect(normalizeBotSettings({ aiChat: 5 }).aiChat).toEqual({ staff: true, players: false });
+    expect(normalizeBotSettings({ aiChat: { staff: false } }).aiChat).toEqual({ staff: false, players: false });
+  });
+
+  it('PUT: aiChat необовʼязковий, але суворий', () => {
+    const { aiChat: _ai, ...legacy } = defaultBotSettings();
+    expect(botSettingsSchema.safeParse(legacy).success).toBe(true);
+    expect(botSettingsSchema.safeParse({ ...legacy, aiChat: { staff: true, players: true } }).success).toBe(true);
+    expect(botSettingsSchema.safeParse({ ...legacy, aiChat: { staff: true } }).success).toBe(false);
+    expect(botSettingsSchema.safeParse({ ...legacy, aiChat: { staff: true, players: true, x: 1 } }).success).toBe(false);
+  });
+});

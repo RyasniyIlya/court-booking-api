@@ -4,7 +4,7 @@ const del = () => ({ create: vi.fn(async () => ({})), deleteMany: vi.fn(async ()
 const MODELS = [
   'bookingLedgerEntry', 'customerReward', 'bookingRental', 'booking', 'customer', 'waitlistEntry', 'pass',
   'passPlan', 'payment', 'block', 'promo', 'inventoryItem', 'clubExpense', 'shiftClose', 'changeLog',
-  'passwordReset', 'trainer', 'user', 'court', 'clubHours', 'crmActivity', 'tgDialog',
+  'passwordReset', 'trainer', 'user', 'court', 'clubHours', 'crmActivity', 'tgDialog', 'aiChatTurn', 'aiUsage',
 ];
 
 let tx: any;

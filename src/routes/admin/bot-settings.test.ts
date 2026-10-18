@@ -401,3 +401,37 @@ describe('PUT /bot-settings: ІІ (етап 3)', () => {
     expect(json).not.toContain('briefSentOn');
   });
 });
+
+describe('PUT /bot-settings: ІІ-чат у боті (етап 5)', () => {
+  const { aiChat: _ai, ...legacy } = defaultBotSettings();
+
+  it('зберігається й повертається', async () => {
+    const res = await request(app).put('/api/admin/bot-settings').send({ ...legacy, aiChat: { staff: false, players: true } });
+    expect(res.status).toBe(200);
+    expect(res.body.settings.aiChat).toEqual({ staff: false, players: true });
+  });
+
+  it('тариф без ІІ: увімкнути гравців не можна (403 ai), вимкнути й зберегти решту — можна', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow({ plan: PLAN1 }));
+    const no = await request(app).put('/api/admin/bot-settings').send({ ...legacy, aiChat: { staff: true, players: true } });
+    expect(no.status).toBe(403);
+    expect(no.body).toMatchObject({ error: 'PLAN_REQUIRED', feature: 'ai' });
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
+    /* staff: true — типове значення, яке вже «стоїть»: не нове вмикання */
+    const ok = await request(app).put('/api/admin/bot-settings').send({ ...legacy, aiChat: { staff: true, players: false } });
+    expect(ok.status).toBe(200);
+  });
+
+  it('старий кабінет без aiChat не скидає збережене', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow({ botSettings: { aiChat: { staff: false, players: true } } }));
+    const res = await request(app).put('/api/admin/bot-settings').send(legacy);
+    expect(res.status).toBe(200);
+    expect(res.body.settings.aiChat).toEqual({ staff: false, players: true });
+  });
+
+  it('briefSentOn і далі переноситься з поточного рядка (SQL не змінився)', async () => {
+    await request(app).put('/api/admin/bot-settings').send({ ...legacy, aiChat: { staff: true, players: true } });
+    const [strings] = prisma.$executeRaw.mock.calls[0];
+    expect(strings.join('?')).toContain("jsonb_build_object('briefSentOn'");
+  });
+});

@@ -45,6 +45,8 @@ import {
 } from './playerLogin';
 import { handleHomeCallback, loadClubHome, sendClubHome, sendOwnClubHome } from './playerHome';
 import { handleAiCallback } from './aiTelegram';
+import { handlePlayerAiText, handleStaffAiText, UNKNOWN_HINT } from './botAi';
+import { resetContext } from './ai/chatContext';
 
 /**
  * Що бот відповідає на команди.
@@ -344,6 +346,9 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
   const chatId = String(q.message?.chat.id ?? q.from?.id ?? '');
   if (!chatId) return;
 
+  /* Змінив клуб — розмова з ІІ починається з чистого аркуша (контекст і так окремий на клуб, це другий замок). */
+  if (q.data?.startsWith('homeclub:') || q.data?.startsWith('bookclub:')) await resetContext(chatId);
+
   /* Кнопки гравця (нагадування, черга) — першими: гравцем буває і той, хто
      в клубі працює, і його «Прийду» не має впиратись у перевірку ролі. */
   if (await handlePlayerCallback(q)) return;
@@ -501,6 +506,8 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
     }
 
     const reply = await loginByPassword(chatId, creds.email, creds.password);
+    /* Інший акаунт у тому ж чаті не має успадкувати розмову попереднього. */
+    await resetContext(chatId);
     const me = await userByChat(chatId);
 
     if (me) {
@@ -556,6 +563,7 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
 
   /* Перший /start гравця: один рядок із посиланням на Політику. */
   if (cmd === '/start' && msg.chat.type === 'private') {
+    await resetContext(chatId);
     await sendPrivacyNoticeOnce(chatId).catch((e) => console.warn('[bot] privacy notice', (e as Error).message));
   }
 
@@ -645,6 +653,12 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
       await sendMessage(chatId, await linkByCode(chatId, raw.toUpperCase()));
       return;
     }
+    /* Вільний текст від чужого чату: людина, що пише «привіт», не просила довідку на екран — підказуємо лише вхід.
+       Це не звернення до ІІ. Гравець із привʼязаною карткою потрапляє до помічника (якщо клуб його ввімкнув). */
+    if (!text.startsWith('/')) {
+      if (!await handlePlayerAiText(chatId, raw)) await sendMessage(chatId, UNKNOWN_HINT);
+      return;
+    }
     await sendMessage(chatId, HELP);
     return;
   }
@@ -696,6 +710,7 @@ export async function handleUpdate(u: TgUpdate): Promise<void> {
 
   if (cmd === '/logout') {
     await logout(chatId);
+    await resetContext(chatId);
     /* Разом із чатом прибираємо і клавіатуру, і меню команд: лишити
        кнопки, які більше нічого не роблять, гірше, ніж не мати їх. */
     await setMyCommands(COMMANDS_GUEST, chatId);
@@ -753,6 +768,12 @@ ${menu}`, keyboard);
     const section = cmd === '/staff' ? 'staff' : cmd === '/revenue' ? 'money' : 'week';
     const m = await periodMessage(me.club, section, 7);
     await sendMessage(chatId, m.text, m.markup);
+    return;
+  }
+
+  /* Не команда й не підпис кнопки — вільне запитання до ІІ-менеджера (з правами цієї ролі). */
+  if (!text.startsWith('/')) {
+    await handleStaffAiText(chatId, raw, me, { menu, keyboard });
     return;
   }
 

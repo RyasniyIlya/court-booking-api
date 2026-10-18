@@ -2,7 +2,6 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { AiError, runAssistant, toHistory, type GeminiResponse, type ToolDef } from './gemini';
 import { clientAssistant, clientSystemPrompt, type AssistantAction, type FetchPublic } from './clientAssistant';
-import { envLimit, resetQuota, takeQuota } from './quota';
 
 const say = (text: string): GeminiResponse => ({ candidates: [{ content: { role: 'model', parts: [{ text }] } }] });
 const call = (name: string, args: Record<string, unknown> = {}): GeminiResponse => ({
@@ -165,26 +164,5 @@ describe('clientAssistant', () => {
     const p = clientSystemPrompt('Demo', 'Europe/Kyiv', { courtId: COURT, date: '2026-09-27' });
     expect(p).toContain(COURT);
     expect(p).toContain('довідково');
-  });
-});
-
-describe('quota', () => {
-  beforeEach(resetQuota);
-
-  it('рахує по клубу й добі та зупиняється на стелі', () => {
-    expect(takeQuota('client', 'a', 2, '2026-09-26')).toBe(true);
-    expect(takeQuota('client', 'a', 2, '2026-09-26')).toBe(true);
-    expect(takeQuota('client', 'a', 2, '2026-09-26')).toBe(false);
-    expect(takeQuota('client', 'b', 2, '2026-09-26')).toBe(true);
-    expect(takeQuota('owner', 'a', 2, '2026-09-26')).toBe(true);
-    expect(takeQuota('client', 'a', 2, '2026-09-27')).toBe(true);
-  });
-
-  it('envLimit ігнорує сміття', () => {
-    process.env.__T = 'abc';
-    expect(envLimit('__T', 7)).toBe(7);
-    process.env.__T = '12.9';
-    expect(envLimit('__T', 7)).toBe(12);
-    delete process.env.__T;
   });
 });

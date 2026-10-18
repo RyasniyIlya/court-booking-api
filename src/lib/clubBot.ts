@@ -53,6 +53,14 @@ export type BotSettings = {
   morningBrief: MorningBriefSettings;
   /** Повідомляти власника про нові пропозиції ІІ, що чекають рішення */
   actionAlerts: boolean;
+  /** Вільний текст у приватному чаті бота йде до ІІ (етап 5): персоналу — менеджер, гравцям — помічник клубу */
+  aiChat: AiChatSettings;
+};
+
+export type AiChatSettings = {
+  staff: boolean;
+  /** Типово вимкнено: кожне повідомлення гравця — платний виклик моделі за рахунок клубу */
+  players: boolean;
 };
 
 export const BRIEF_HOURS = [5, 6, 7, 8, 9, 10, 11, 12] as const;
@@ -98,6 +106,7 @@ export const defaultBotSettings = (): BotSettings => ({
      вмикаємо: пропозиція без відповіді просто спливає за 48 годин. */
   morningBrief: { enabled: false, hour: 8 },
   actionAlerts: true,
+  aiChat: { staff: true, players: false },
 });
 
 /* ── Валідація ─────────────────────────────────────────────────────────── */
@@ -135,6 +144,7 @@ export const botSettingsSchema = z.strictObject({
     hour: z.number().int().min(BRIEF_HOURS[0]).max(BRIEF_HOURS[BRIEF_HOURS.length - 1]),
   }).optional(),
   actionAlerts: z.boolean().optional(),
+  aiChat: z.strictObject({ staff: z.boolean(), players: z.boolean() }).optional(),
 });
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -171,6 +181,7 @@ export function normalizeBotSettings(raw: unknown): BotSettings {
   const r = isObj(raw) ? raw : {};
   const w = isObj(r.winback) ? r.winback : {};
   const mb = isObj(r.morningBrief) ? r.morningBrief : {};
+  const ai = isObj(r.aiChat) ? r.aiChat : {};
 
   const name = typeof r.displayName === 'string' ? r.displayName.trim().slice(0, MAX_NAME) : '';
 
@@ -196,6 +207,10 @@ export function normalizeBotSettings(raw: unknown): BotSettings {
       hour: pick(mb.hour, BRIEF_HOURS, def.morningBrief.hour),
     },
     actionAlerts: bool(r.actionAlerts, def.actionAlerts),
+    aiChat: {
+      staff: bool(ai.staff, def.aiChat.staff),
+      players: bool(ai.players, def.aiChat.players),
+    },
   };
 }
 

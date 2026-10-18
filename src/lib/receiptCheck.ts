@@ -145,12 +145,12 @@ export async function runReceiptCheck(
   try {
     const row = await prisma.paymentReceipt.findUnique({
       where: { id: receiptId },
-      select: { clubId: true, mime: true, fileData: true },
+      select: { clubId: true, mime: true, fileData: true, club: { select: { timezone: true } } },
     });
     if (!row) return;
 
     if (!opts.generate && !aiConfigured()) { await done({ aiStatus: 'SKIPPED' }); return; }
-    if (!takeQuota('receipt', row.clubId, envLimit('AI_RECEIPT_DAILY_LIMIT', 50))) {
+    if (!await takeQuota('receipt', row.clubId, envLimit('AI_RECEIPT_DAILY_LIMIT', 50), { timezone: row.club?.timezone })) {
       await done({ aiStatus: 'SKIPPED' });
       return;
     }

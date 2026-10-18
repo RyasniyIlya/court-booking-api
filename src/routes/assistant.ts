@@ -97,7 +97,7 @@ assistantRouter.post('/clubs/:slug/assistant', chatLimiter, async (req, res) => 
   if (!club.ai) return res.status(402).json({ error: 'PLAN_REQUIRED', feature: 'ai' });
   if (!aiConfigured()) return res.status(503).json({ error: 'AI_NOT_CONFIGURED' });
 
-  if (!takeQuota('client', club.id, envLimit('AI_CLIENT_DAILY_LIMIT', 300))) {
+  if (!await takeQuota('client', club.id, envLimit('AI_CLIENT_DAILY_LIMIT', 300), { timezone: club.timezone })) {
     return res.status(429).json({ error: 'AI_DAILY_LIMIT' });
   }
 

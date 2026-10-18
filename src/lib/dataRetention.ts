@@ -110,6 +110,10 @@ const PURGE_STEPS: { key: string; model: string; where?: Record<string, unknown>
   { key: 'courts', model: 'court' },
   { key: 'hours', model: 'clubHours' },
   { key: 'crmActivities', model: 'crmActivity' },
+  // Розмови з ІІ у Telegram: текст запитань персоналу й гравців. Рядок Club знеособлюється, а не
+  // видаляється, тож каскад від нього тут не спрацює — чистимо явно.
+  { key: 'aiChatTurns', model: 'aiChatTurn' },
+  { key: 'aiUsage', model: 'aiUsage' },
 ];
 
 export type PurgeCounts = Record<string, number>;

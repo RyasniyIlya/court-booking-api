@@ -97,6 +97,8 @@ model Club {
   /// Права ІІ-менеджера (один рядок на клуб; немає рядка = типові) і журнал його дій.
   aiPolicy               AiAgentPolicy?
   aiActions              AiAction[]
+  aiUsage                AiUsage[]
+  aiChatTurns            AiChatTurn[]
 
   // ── Юридичні дані й оферта (docs/legal) ──────────────────────────────
   /// Коли власник прийняв оферту й умови обробки ПД, і яку версію (lib/legal.ts).
@@ -2686,4 +2688,38 @@ model AiAction {
   expiresAt     DateTime       @db.Timestamptz(3)
 
   @@index([clubId, status, createdAt])
+}
+
+/// Добові лічильники запитів до ІІ (замість памʼяті процесу): один рядок на клуб + ключ + добу клубу.
+/// Приріст — одним атомарним INSERT … ON CONFLICT … WHERE count < limit (lib/ai/quota.ts).
+/// scope містить суб'єкта ліміту: "owner", "client", "receipt", "bot:player:<customerId>".
+model AiUsage {
+  id     String @id @default(uuid()) @db.Uuid
+  clubId String @db.Uuid
+  club   Club   @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  scope  String
+  /// yyyy-MM-dd за часовим поясом клубу
+  day    String
+  count  Int    @default(0)
+
+  @@unique([clubId, scope, day])
+  @@index([day])
+}
+
+/// Короткий контекст розмови з ІІ у приватному чаті Telegram (≤10 ходів, 24 год).
+/// mode розводить розмову персоналу й гравця, clubId — клуби між собою; на /start, виході й зміні клубу чиститься.
+model AiChatTurn {
+  id        String   @id @default(uuid()) @db.Uuid
+  chatId    String
+  clubId    String   @db.Uuid
+  club      Club     @relation(fields: [clubId], references: [id], onDelete: Cascade)
+  /// "staff" | "player"
+  mode      String
+  /// "user" | "assistant"
+  role      String
+  content   String
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([chatId, clubId, mode, createdAt])
+  @@index([createdAt])
 }

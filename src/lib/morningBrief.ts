@@ -10,7 +10,8 @@ import { AiError, aiConfigured } from './ai/gemini';
 import { BRIEF_REQUEST, ownerAssistant } from './ai/ownerAssistant';
 import { effectivePermissions } from './ai/policy';
 import { loadPolicy } from './ai/policyStore';
-import { envLimit, takeQuota } from './ai/quota';
+import { envLimit, purgeOldUsage, takeQuota } from './ai/quota';
+import { purgeOldTurns } from './ai/chatContext';
 import './ai/executors';
 
 /**
@@ -120,7 +121,30 @@ async function composeAndSend(
 /** Один прохід. Винесено з інтервалу, щоб тест міг покликати напряму. */
 export const runMorningBriefTick = (now?: DateTime) => withSendSummary('morning-brief', () => runTick(now));
 
+/** Прибирання лічильників і контексту ІІ — раз на кілька годин, а не на кожен 15-хвилинний тік. */
+const HOUSEKEEPING_EVERY_MS = 6 * 3600_000;
+let housekeptAt = 0;
+
+async function housekeeping(now: DateTime): Promise<void> {
+  if (now.toMillis() - housekeptAt < HOUSEKEEPING_EVERY_MS) return;
+  housekeptAt = now.toMillis();
+  try {
+    await purgeOldUsage(now.toJSDate());
+    await purgeOldTurns(now.toJSDate());
+  } catch {
+    /* Не вдалось — повторимо за наступного проходу; сводці це не заважає. */
+    housekeptAt = 0;
+    console.warn('[ai] housekeeping failed');
+  }
+}
+
+/** Для тестів. */
+export const resetHousekeeping = () => { housekeptAt = 0; };
+
 async function runTick(now: DateTime = DateTime.now()): Promise<number> {
+  /* Старі рядки ліміту й розмов чистимо незалежно від того, чи є ключ Gemini: таблиці ростуть і без нього. */
+  await housekeeping(now);
+
   /* Без ключа Gemini в БД не ходимо взагалі. */
   if (!aiConfigured()) return 0;
 
@@ -150,7 +174,7 @@ async function runTick(now: DateTime = DateTime.now()): Promise<number> {
     try {
       /* Ліміт беремо ДО позначки дня: вичерпана квота не має «спалювати» день,
          інакше сводка не прийшла б і після того, як ліміт оновиться. */
-      if (!takeQuota('owner', club.id, envLimit('AI_OWNER_DAILY_LIMIT', 100))) {
+      if (!await takeQuota('owner', club.id, envLimit('AI_OWNER_DAILY_LIMIT', 100), { timezone: club.timezone })) {
         console.log('[brief] добовий ліміт ІІ вичерпано — сводку пропущено', club.id);
         continue;
       }

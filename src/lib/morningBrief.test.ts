@@ -8,16 +8,32 @@ const mocks = vi.hoisted(() => ({
   configured: vi.fn(() => true),
   /** Імітація БД-позначки: clubId → остання дата. Спільна для «обох інстансів». */
   marks: new Map<string, string>(),
+  /** Імітація AiUsage: ключ → скільки взято (атомарність самого SQL перевіряє quota.test.ts на PGlite). */
+  used: new Map<string, number>(),
+  purgeUsage: vi.fn(async () => ({ count: 0 })),
+  purgeTurns: vi.fn(async () => ({ count: 0 })),
 }));
 
 vi.mock('./db', () => ({
   prisma: {
     user: { findMany: mocks.findMany },
+    aiUsage: { deleteMany: mocks.purgeUsage },
+    aiChatTurn: { deleteMany: mocks.purgeTurns },
     /* Той самий умовний UPDATE, що й у SQL: бере день, лише якщо позначка менша. */
     $executeRaw: vi.fn(async (_s: TemplateStringsArray, day: string, clubId: string) => {
       if ((mocks.marks.get(clubId) ?? '') < day) { mocks.marks.set(clubId, day); return 1; }
       return 0;
     }),
+  },
+}));
+vi.mock('./ai/quota', async (orig) => ({
+  ...(await orig<typeof import('./ai/quota')>()),
+  takeQuota: async (scope: string, clubId: string, limit: number) => {
+    const key = `${scope}:${clubId}`;
+    const n = mocks.used.get(key) ?? 0;
+    if (n >= limit) return false;
+    mocks.used.set(key, n + 1);
+    return true;
   },
 }));
 vi.mock('./telegram', () => ({ sendMessage: mocks.send }));
@@ -26,8 +42,8 @@ vi.mock('./ai/ownerAssistant', () => ({ BRIEF_REQUEST: 'brief', ownerAssistant: 
 vi.mock('./ai/policyStore', () => ({ loadPolicy: vi.fn(async () => ({ bookings: 'ASK', roleAccess: {} })) }));
 vi.mock('./ai/executors', () => ({}));
 
-const { runMorningBriefTick } = await import('./morningBrief');
-const { resetQuota, takeQuota } = await import('./ai/quota');
+const { runMorningBriefTick, resetHousekeeping } = await import('./morningBrief');
+const { takeQuota } = await import('./ai/quota');
 const { AiError } = await import('./ai/gemini');
 
 const plan = (tier: number) => ({ tier, featTrainers: true, featGroups: true, featAnalytics: true });
@@ -41,7 +57,8 @@ const at = (iso: string, zone = 'Europe/Kyiv') => DateTime.fromISO(iso, { zone }
 beforeEach(() => {
   vi.clearAllMocks();
   mocks.marks.clear();
-  resetQuota();
+  mocks.used.clear();
+  resetHousekeeping();
   mocks.configured.mockReturnValue(true);
   mocks.findMany.mockResolvedValue([owner()]);
   mocks.send.mockResolvedValue({ message_id: 1 });
@@ -151,7 +168,7 @@ it('пропозиції: PENDING — кнопки ok/no, AUTO — «викон�
 
 it('добовий ліміт запитів до ІІ вичерпано — сводка не збирається', async () => {
   process.env.AI_OWNER_DAILY_LIMIT = '1';
-  takeQuota('owner', 'c1', 1);
+  await takeQuota('owner', 'c1', 1);
   expect(await runMorningBriefTick(at('2026-10-24T08:05:00'))).toBe(0);
   expect(mocks.assistant).not.toHaveBeenCalled();
   delete process.env.AI_OWNER_DAILY_LIMIT;
@@ -159,7 +176,7 @@ it('добовий ліміт запитів до ІІ вичерпано — с
 
 it('вичерпана квота НЕ спалює день: після її відновлення сводка приходить', async () => {
   process.env.AI_OWNER_DAILY_LIMIT = '1';
-  takeQuota('owner', 'c1', 1);
+  await takeQuota('owner', 'c1', 1);
   expect(await runMorningBriefTick(at('2026-10-24T08:05:00'))).toBe(0);
   expect(mocks.marks.size).toBe(0);
   delete process.env.AI_OWNER_DAILY_LIMIT;
@@ -179,4 +196,14 @@ it('некоректний часовий пояс клубу: пропуск і
   expect(await runMorningBriefTick(at('2026-10-24T08:05:00'))).toBe(1);
   expect(warn).toHaveBeenCalled();
   warn.mockRestore();
+});
+
+it('прибирає старі лічильники ІІ та контекст розмов раз на кілька годин, навіть без ключа Gemini', async () => {
+  mocks.configured.mockReturnValue(false);
+  await runMorningBriefTick(at('2026-10-24T08:05:00'));
+  await runMorningBriefTick(at('2026-10-24T08:20:00'));
+  expect(mocks.purgeUsage).toHaveBeenCalledTimes(1);
+  expect(mocks.purgeTurns).toHaveBeenCalledTimes(1);
+  await runMorningBriefTick(at('2026-10-24T15:00:00'));
+  expect(mocks.purgeUsage).toHaveBeenCalledTimes(2);
 });

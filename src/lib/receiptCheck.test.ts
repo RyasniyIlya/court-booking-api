@@ -5,9 +5,14 @@ const prisma = {
   sellerProfile: { findMany: vi.fn() },
 };
 vi.mock('./db', () => ({ prisma }));
+/* Ліміт у БД перевіряє quota.test.ts на PGlite; тут важлива лише розгалуга «дозволено / вичерпано». */
+const quota = vi.hoisted(() => ({ allow: true }));
+vi.mock('./ai/quota', async (orig) => ({
+  ...(await orig<typeof import('./ai/quota')>()),
+  takeQuota: async () => quota.allow,
+}));
 
 const { applyRules, combineVerdicts, runReceiptCheck, buildPrompt, SYSTEM_PROMPT } = await import('./receiptCheck');
-const { resetQuota } = await import('./ai/quota');
 
 const IBAN = 'UA213223130000026007233566001';
 const OTHER = 'UA903052992990004149123456789';
@@ -82,7 +87,7 @@ const modelJson = (over: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   vi.resetAllMocks();
-  resetQuota();
+  quota.allow = true;
   delete process.env.GEMINI_API_KEY;
   prisma.paymentReceipt.update.mockResolvedValue({});
   prisma.sellerProfile.findMany.mockResolvedValue([{ legalName: 'Інший', iban: OTHER, bankName: null }]);
