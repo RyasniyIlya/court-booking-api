@@ -3,7 +3,7 @@ import { Prisma, type UserRole } from '@prisma/client';
 import { prisma } from '../db';
 import { DateTime } from 'luxon';
 
-import { effectivePermissions, scopeMode, type ActionScope } from './policy';
+import { OPERATING_ROLES, effectivePermissions, scopeMode, type ActionScope } from './policy';
 import { loadPolicy } from './policyStore';
 import { envLimit } from './quota';
 
@@ -134,6 +134,9 @@ export async function proposeAction(opts: {
   const perms = effectivePermissions(policy, opts.requester.role);
   const mode = modeOf(perms, executor.scope);
   if (!perms.access || mode === 'OFF') throw new AiActionError('AI_ACTION_FORBIDDEN');
+  /* Дії (не звіти) пропонують лише ролі, що й руками керують клубом. Це держить сервер, а не лише
+     фільтр інструментів: інакше прямий виклик proposeAction обійшов би його. */
+  if (executor.scope !== 'reports' && !OPERATING_ROLES.includes(opts.requester.role)) throw new AiActionError('AI_ACTION_FORBIDDEN');
 
   let payload = opts.payload;
   let summary = opts.summary ?? opts.kind;
@@ -199,6 +202,7 @@ async function runClaimed(id: string, clubId: string) {
   const policy = await loadPolicy(action.clubId);
   const perms = effectivePermissions(policy, action.requestedRole);
   if (!perms.access || modeOf(perms, executor.scope) === 'OFF') return fail('AI_ACTION_FORBIDDEN');
+  if (executor.scope !== 'reports' && !OPERATING_ROLES.includes(action.requestedRole)) return fail('AI_ACTION_FORBIDDEN');
 
   try {
     const result = await executor.execute(action.clubId, action.payload, {

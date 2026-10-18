@@ -35,6 +35,17 @@ export const SEND_FROM_HOUR = 11;
 export const SEND_TO_HOUR = 20;
 /** Скільки листів на клуб за один тік — щоб налаштування «вмикаю» не стало розсилкою на тисячу людей за секунду */
 export const MAX_PER_TICK = 25;
+/** Вікно «одного тіку» для стелі: довше за інтервал черги ІІ (10 хв), щоб два проходи поспіль не давали 50 */
+export const TICK_WINDOW_MS = 10 * 60_000;
+
+/**
+ * Скільки листів повернення клуб надіслав відтоді (шаблонних і ІІ разом).
+ * Стелі «за тік» і «за добу» рахуємо з бази, а не з памʼяті виклику: їх ділять
+ * шаблонний тік, кілька затверджених кампаній і кілька інстансів.
+ */
+export async function lettersSentSince(clubId: string, since: Date): Promise<number> {
+  return prisma.customer.count({ where: { clubId, winbackLastAt: { gte: since } } });
+}
 
 const DAY_MS = 86_400_000;
 
@@ -343,10 +354,15 @@ async function runWinbackTickInner(now: Date = new Date()): Promise<number> {
     /* Повернення клієнтів — сегментна автоматизація, шар «Аналітики». */
     if (!telegramAnalytics(club.plan)) continue;
     const settings = normalizeBotSettings(club.botSettings);
+    /* Шаблонне повернення керується ЛИШЕ winback.enabled — політика ІІ (messaging) його не вмикає й не вимикає.
+       Листи ІІ, навпаки, не залежать від winback.enabled (див. ai/winbackCampaign.ts). */
     if (!settings.winback.enabled) continue;
     if (!inSendWindow(now, club.timezone)) continue;
 
-    const pool = await eligiblePool(club.id, settings.winback, now, MAX_PER_TICK);
+    /* Стеля тіку — на клуб: листи ІІ, надіслані щойно, зменшують квоту шаблонного тіку. */
+    const room = MAX_PER_TICK - await lettersSentSince(club.id, new Date(now.getTime() - TICK_WINDOW_MS));
+    if (room <= 0) continue;
+    const pool = await eligiblePool(club.id, settings.winback, now, room);
     if (pool.length === 0) continue;
 
     const promo = settings.winback.promoId

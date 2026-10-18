@@ -166,11 +166,19 @@ describe('booking.create', () => {
     expect(createAdminBooking).not.toHaveBeenCalled();
   });
 
-  it('виконання від імені ролі, що не керує бронями — FAILED', async () => {
+  it('роль, що не керує клубом, не може запропонувати дію — відмова на сервері, не лише у фільтрі інструментів', async () => {
     state.policy = { roleAccess: { TRAINER: { enabled: true, bookings: 'ASK' } } };
-    const a = await propose('booking.create', payload(), { id: 'u-tr', role: 'TRAINER' });
+    expect(await code(propose('booking.create', payload(), { id: 'u-tr', role: 'TRAINER' }))).toEqual(['AI_ACTION_FORBIDDEN', undefined]);
+    expect(state.actions).toHaveLength(0);
+  });
+
+  it('те саме при виконанні: рядок журналу від ролі без прав керування — FAILED', async () => {
+    state.policy = { roleAccess: { TRAINER: { enabled: true, bookings: 'ASK' } } };
+    const a = await propose('booking.create', payload());
+    state.actions[0].requestedRole = 'TRAINER';
     state.user = { id: 'u-tr', role: 'TRAINER' };
-    expect(await approveAction(a.id, OWNER)).toMatchObject({ status: 'FAILED', error: 'Ця роль не може створювати чи змінювати бронювання.' });
+    expect(await approveAction(a.id, OWNER)).toMatchObject({ status: 'FAILED', error: 'AI_ACTION_FORBIDDEN' });
+    expect(createAdminBooking).not.toHaveBeenCalled();
   });
 
   it('AUTO виконує одразу, без рішення людини', async () => {

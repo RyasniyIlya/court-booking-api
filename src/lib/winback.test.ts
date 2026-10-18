@@ -2,7 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const prisma = {
   club: { findMany: vi.fn(), findUnique: vi.fn() },
-  customer: { findMany: vi.fn(), updateMany: vi.fn(), update: vi.fn() },
+  customer: { findMany: vi.fn(), updateMany: vi.fn(), update: vi.fn(), count: vi.fn() },
   booking: { groupBy: vi.fn(), findMany: vi.fn() },
   bookingSeat: { findMany: vi.fn() },
   promo: { findFirst: vi.fn() },
@@ -113,6 +113,7 @@ beforeEach(() => {
   prisma.club.findMany.mockResolvedValue([club()]);
   prisma.customer.findMany.mockResolvedValue([person('a')]);
   prisma.customer.updateMany.mockResolvedValue({ count: 1 });
+  prisma.customer.count.mockResolvedValue(0);
   prisma.customer.update.mockResolvedValue({});
   prisma.booking.groupBy.mockResolvedValue([{ customerId: 'a', _max: { endTime: ago(40) } }]);
   prisma.bookingSeat.findMany.mockResolvedValue([]);

@@ -3,7 +3,7 @@ import { DateTime } from 'luxon';
 import { prisma } from '../db';
 import { tierOf } from '../customerRoster';
 import { normalizeBotSettings, plainWinbackText, promoSummary, type BotSettings } from '../clubBot';
-import { judgeCustomers, type Judged } from '../winback';
+import { judgeCustomers, lettersSentSince, type Judged } from '../winback';
 import { AiError, callGemini, type GenerateFn } from './gemini';
 import { sanitizeName, usualSlot } from './playerContext';
 import { envLimit } from './quota';
@@ -30,13 +30,18 @@ import { envLimit } from './quota';
 export const MAX_CAMPAIGN = 25;
 export const LETTER_MAX = 600;
 
-/** Добовий стелю листів повернення на клуб (шаблонні й ІІ разом); див. sentTodayCount. */
+/**
+ * Добовий стеля листів повернення на клуб (AI_WINBACK_DAILY_CAP, типово 50).
+ * Перевіряють його лише листи ІІ; шаблонний тік цей стеля НЕ перевіряє, але його
+ * листи в нього ЗАРАХОВУЮТЬСЯ (лічильник — спільне поле картки). Тож багато
+ * шаблонних листів за день може вичерпати квоту ІІ, а не навпаки.
+ */
 export const winbackDailyCap = () => envLimit('AI_WINBACK_DAILY_CAP', 50);
 
 /** Скільки листів клуб уже відправив сьогодні (за часом клубу). Лічильник — поле картки, спільне з шаблонним поверненням. */
 export async function sentTodayCount(clubId: string, tz: string, now: Date): Promise<number> {
   const dayStart = DateTime.fromJSDate(now).setZone(tz).startOf('day').toJSDate();
-  return prisma.customer.count({ where: { clubId, winbackLastAt: { gte: dayStart } } });
+  return lettersSentSince(clubId, dayStart);
 }
 
 /* ── Перевірка тексту ────────────────────────────────────────────────────── */

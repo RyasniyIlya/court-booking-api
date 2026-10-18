@@ -50,7 +50,10 @@ const matches = (row: Row, where: Row) => Object.entries(where).every(([k, v]) =
   return same(row[k], v);
 });
 
-const prisma = {
+const locks: string[] = [];
+const prisma: Record<string, any> = {
+  $executeRaw: vi.fn(async (strings: TemplateStringsArray, ...vals: unknown[]) => { locks.push(strings.join('?') + '|' + vals.join(',')); return 1; }),
+  $transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(prisma)),
   club: {
     findUnique: vi.fn(async () => state.club),
     findMany: vi.fn(async () => [state.club]),
@@ -158,6 +161,7 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ['Date'] });
   vi.setSystemTime(NOW);
   vi.clearAllMocks();
+  locks.length = 0;
   state.customers = []; state.visits = []; state.upcoming = new Set(); state.actions = []; state.policy = null; state.promo = null; state.seq = 0;
   state.club = clubRow();
   sendReminderMessage.mockResolvedValue('sent');
@@ -208,12 +212,21 @@ describe('prepare: правила на етапі пропозиції', () => {
     expect(await invalid(prepareCampaign('club-1', payloadFor([1]), NOW))).toContain('не знайдено');
   });
 
-  it('текст із посиланням, телефоном чи @ не проходить; шаблон клубу (fallback) — свій текст', async () => {
+  it('текст із посиланням, телефоном, @ чи чужою знижкою замінюється шаблоном клубу; fallback з payload не береться на віру', async () => {
+    state.club = clubRow({ botSettings: { winback: { enabled: false, afterDays: 30, everyDays: 7, maxMessages: 3, text: 'Привіт, {name}! Давно не бачились.' } } });
     seed(1);
     for (const bad of ['Заходьте https://x.ua', 'Телефонуйте 0671112233', 'Пишіть @manager', 'Є знижка 20%']) {
-      expect(await invalid(prepareCampaign('club-1', payloadFor([1], bad), NOW))).toContain('не пройшов перевірку');
+      /* навіть із підробленим fallback:false */
+      const { payload } = await prepareCampaign('club-1', { recipients: [{ customerId: UUID(1), text: bad, fallback: false }] }, NOW);
+      expect(payload.recipients[0]).toMatchObject({ text: 'Привіт, Олена! Давно не бачились.', fallback: true });
     }
-    await expect(prepareCampaign('club-1', { recipients: [{ customerId: UUID(1), text: 'Знижка 20% за посиланням', fallback: true }] }, NOW)).resolves.toBeTruthy();
+    /* і навпаки: fallback:true не рятує небезпечний текст */
+    const { payload } = await prepareCampaign('club-1', { recipients: [{ customerId: UUID(1), text: 'Знижка 20% за посиланням https://x.ua', fallback: true }] }, NOW);
+    expect(payload.recipients[0].text).not.toMatch(/https|20%/);
+    /* добрий текст без підробленого прапорця лишається своїм */
+    const ok = await prepareCampaign('club-1', { recipients: [{ customerId: UUID(1), text: goodText, fallback: true }] }, NOW);
+    expect(ok.payload.recipients[0]).toMatchObject({ text: goodText });
+    expect(ok.payload.recipients[0].fallback).toBeUndefined();
   });
 
   it('понад 25 адресатів і дублі — некоректний payload', async () => {
@@ -279,11 +292,18 @@ describe('execute: повторна перевірка кожного одерж
     expect(sendReminderMessage).not.toHaveBeenCalled();
   });
 
-  it('payload із забороненим текстом на виконанні — skipped bad_text, без відправки', async () => {
-    seed(1);
-    const res = await executeCampaign('club-1', payloadFor([1], 'Заходьте на https://x.ua'), NOW);
-    expect(res.recipients[0]).toMatchObject({ status: 'skipped', reason: 'bad_text' });
-    expect(sendReminderMessage).not.toHaveBeenCalled();
+  it('збережений текст не пройшов перевірку на виконанні (навіть із fallback:true) — іде шаблон клубу, не він', async () => {
+    seed(1); seed(2);
+    const res = await executeCampaign('club-1', { recipients: [
+      { customerId: UUID(1), text: 'Заходьте на https://x.ua', fallback: true },
+      { customerId: UUID(2), text: 'Дзвоніть 0671112233' },
+    ] }, NOW);
+    expect(res.sent).toBe(2);
+    for (const call of sendReminderMessage.mock.calls) {
+      expect(call[1]).not.toMatch(/x\.ua|0671112233/);
+      expect(call[1]).toContain('вже 40 днів');
+      expect(JSON.stringify(call[2])).toContain('wb:off:');
+    }
   });
 
   it('Telegram: бот заблоковано — skipped bot_blocked і згоду знято; тимчасова помилка — лишається в черзі, лічильник повернуто', async () => {
@@ -684,5 +704,106 @@ describe('сводка в Telegram', () => {
     expect(text).toContain('Ігор: «');
     expect(text).not.toContain('Марта: «');
     expect(JSON.stringify(keyboard)).toContain(`ai:ok:${row.id}`);
+  });
+});
+
+/* ── Спільні стелі, безпечне злиття результату, строк черги ──────────────── */
+
+describe('стелі на клуб з бази', () => {
+  const recentTemplate = (from: number, count: number) => {
+    for (let i = 0; i < count; i++) state.customers.push(customer(from + i, { winbackCount: 1, winbackLastAt: new Date(NOW.getTime() - 60_000) }));
+  };
+
+  it('стеля тіку спільна: листи, надіслані щойно іншою кампанією чи шаблонним тіком, зменшують квоту', async () => {
+    recentTemplate(100, 24);
+    seed(1); seed(2);
+    const res = await executeCampaign('club-1', payloadFor([1, 2]), NOW);
+    expect(res.recipients.map((r) => [r.status, r.reason])).toEqual([['sent', undefined], ['queued', 'tick_cap']]);
+  });
+
+  it('шаблонний тік теж бачить листи ІІ: квота вичерпана — не шле нічого', async () => {
+    recentTemplate(100, 25);
+    seed(1);
+    state.club = clubRow({ botSettings: { winback: { enabled: true, afterDays: 30, everyDays: 7, maxMessages: 3 } } });
+    expect(await runWinbackTick(NOW)).toBe(0);
+    expect(sendReminderMessage).not.toHaveBeenCalled();
+  });
+
+  it('добовий стеля читається свіжо перед кожним листом: чужий лист посеред виклику зупиняє наступні', async () => {
+    process.env.AI_WINBACK_DAILY_CAP = '2';
+    seedMany(3);
+    state.customers.push(customer(50, { winbackCount: 0 }));
+    let first = true;
+    sendReminderMessage.mockImplementation(async () => {
+      if (first) { first = false; state.customers.find((c) => c.id === UUID(50))!.winbackLastAt = new Date(NOW.getTime() - 3 * 3600_000); }
+      return 'sent';
+    });
+    const res = await executeCampaign('club-1', payloadFor([1, 2, 3]), NOW);
+    /* свій перший + чужий = 2 → другий і третій відкладено */
+    expect(res.recipients.map((r) => [r.status, r.reason])).toEqual([['sent', undefined], ['queued', 'daily_cap'], ['queued', 'daily_cap']]);
+  });
+});
+
+describe('злиття результату черги', () => {
+  const queuedAction = async (ids: number[], over: Row = {}) => {
+    for (const n of ids) seed(n);
+    const night = await executeCampaign('club-1', payloadFor(ids), NIGHT);
+    const row = { id: UUID(901), clubId: 'club-1', kind: 'winback.campaign', status: 'EXECUTED', requestedRole: 'OWNER', executedAt: NIGHT, payload: payloadFor(ids), result: night, ...over };
+    state.actions.push(row);
+    return row;
+  };
+
+  it('запис іде під advisory-блокуванням дії, а злиття не затирає чужі зміни: інший інстанс встиг надіслати другому', async () => {
+    const row = await queuedAction([1, 2]);
+    sendReminderMessage.mockImplementationOnce(async () => {
+      /* «другий інстанс» дописав у result, поки ми шлемо */
+      row.result = { ...row.result, recipients: row.result.recipients.map((r: Row) => (r.customerId === UUID(2) ? { ...r, status: 'sent' } : r)) };
+      return 'sent';
+    });
+    await runWinbackQueue(NOW);
+    expect(locks.some((l) => l.includes('pg_advisory_xact_lock'))).toBe(true);
+    expect(row.result.recipients.map((r: Row) => r.status)).toEqual(['sent', 'sent']);
+    expect(row.result).toMatchObject({ sent: 2, queued: 0, skipped: 0 });
+  });
+
+  it('sent не знижується до skipped, а запізнілий sent виправляє чужий skipped', async () => {
+    const row = await queuedAction([1, 2]);
+    /* інший інстанс уже записав: 1 — sent, 2 — skipped(changed) через програш гонки лічильника */
+    row.result = tally2([{ customerId: UUID(1), name: 'Олена', status: 'sent' }, { customerId: UUID(2), name: 'Ігор', status: 'skipped', reason: 'changed' }]);
+    state.customers[1].tgMarketingAt = null; // нам лист другому вже не піде
+    // повертаємо один queued, щоб прохід дійшов до злиття
+    row.result.recipients[0].status = 'queued'; row.result.queued = 1;
+    await runWinbackQueue(NOW);
+    expect(row.result.recipients[1]).toMatchObject({ status: 'skipped', reason: 'changed' });
+    expect(row.result.recipients[0].status).toBe('sent');
+  });
+
+  it('клуб без ІІ в тарифі або неактивний: чекає, але строк 48 годин усе одно знімає чергу', async () => {
+    const fresh = await queuedAction([1], { executedAt: NIGHT });
+    const old = await queuedAction([2], { id: UUID(902), executedAt: ago(3) });
+    state.club = clubRow({ isActive: false });
+    await runWinbackQueue(NOW);
+    expect(fresh.result.recipients[0].status).toBe('queued'); // ще не прострочено — чекає
+    expect(old.result.recipients[0]).toMatchObject({ status: 'skipped', reason: 'expired' });
+    expect(sendReminderMessage).not.toHaveBeenCalled();
+  });
+});
+
+const tally2 = (recipients: Row[]) => ({
+  recipients,
+  sent: recipients.filter((r) => r.status === 'sent').length,
+  queued: recipients.filter((r) => r.status === 'queued').length,
+  skipped: recipients.filter((r) => r.status === 'skipped').length,
+});
+
+describe('ролі на сервері', () => {
+  it('TRAINER/ACCOUNTANT з відкритим messaging не можуть запропонувати листи (винятково OWNER/ADMIN)', async () => {
+    seed(1);
+    const open = { enabled: true, readFinance: true, readCustomers: true, readStaff: true, reports: true, bookings: 'ASK', groupSessions: 'ASK', tournaments: 'ASK', messaging: 'ASK' };
+    state.policy = { messaging: 'ASK', roleAccess: { TRAINER: open, ACCOUNTANT: open } };
+    for (const role of ['TRAINER', 'ACCOUNTANT'] as const) {
+      await expect(proposeAction({ clubId: 'club-1', kind: 'winback.campaign', payload: payloadFor([1]), requester: requester(role) })).rejects.toMatchObject({ code: 'AI_ACTION_FORBIDDEN' });
+    }
+    expect(state.actions).toHaveLength(0);
   });
 });

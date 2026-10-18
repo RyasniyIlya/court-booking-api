@@ -2,11 +2,12 @@ import { z } from 'zod';
 
 import { prisma } from '../db';
 import { planFeatures } from '../plans';
-import { renderWinback } from '../clubBot';
+import { plainWinbackText, renderWinback } from '../clubBot';
 import { botReady } from '../telegram';
 import { playerSchedulerEnabled } from '../playerRemind';
 import { withSendSummary } from '../telegramSafety';
-import { MAX_PER_TICK, inSendWindow, judgeCustomers, sendClaimed, type Eligibility } from '../winback';
+import { DateTime } from 'luxon';
+import { MAX_PER_TICK, TICK_WINDOW_MS, inSendWindow, judgeCustomers, lettersSentSince, sendClaimed, type Eligibility } from '../winback';
 import { ActionInvalidError } from './actions';
 import { effectivePermissions } from './policy';
 import { loadPolicy } from './policyStore';
@@ -20,6 +21,13 @@ import type { GenerateFn } from './gemini';
 /**
  * Кампанія повернення від ІІ: payload дії, відправка за правилами winback.ts і
  * черга на денне вікно.
+ *
+ * ── Два незалежні вмикачі ────────────────────────────────────────────────
+ * Шаблонне повернення керується ЛИШЕ winback.enabled у налаштуваннях бота
+ * (політика ІІ його не вмикає й не вимикає). Листи ІІ керуються ЛИШЕ режимом
+ * messaging у політиці ІІ (OFF/ASK/AUTO) і НЕ залежать від winback.enabled:
+ * затвердження власника (чи AUTO) — і є дозвіл. Спільні в обох каналів лише
+ * ліміти й лічильники листів на людину.
  *
  * ── Чому нових полів у базі нема ─────────────────────────────────────────
  * Лічильники «скільки листів поспіль / коли останній» — ті самі
@@ -132,10 +140,12 @@ export async function prepareCampaign(clubId: string, raw: unknown, now: Date = 
     /* Клієнт з іншого клубу не знайдеться тут так само, як неіснуючий. */
     if (!j) throw new ActionInvalidError('Клієнта не знайдено в цьому клубі.');
     if (!j.verdict.ok) throw new ActionInvalidError(`Клієнту ${sanitizeName(j.name) ?? 'без імені'} зараз не можна писати (${reasonLabel(j.verdict.reason)}). Обери інших.`);
-    /* Шаблон клубу — його власний текст; текст моделі перевіряємо жорстко. */
-    const text = r.fallback ? r.text : validateLetter(r.text, { hasPromo });
-    if (!text) throw new ActionInvalidError('Текст листа не пройшов перевірку (посилання, телефон, @ або обіцянка знижки). Згенеруй його знову.');
-    recipients.push({ customerId: r.customerId, name: sanitizeName(j.name) ?? 'Клієнт', text, ...(r.fallback ? { fallback: true } : {}) });
+    /* Прапорцю fallback з payload не віримо: перевіряємо текст самі, а не пройшов — підставляємо
+       шаблон клубу. fallback = «іде шаблон», і це визначає сервер. */
+    const first = sanitizeName(j.name);
+    const template = plainWinbackText(club.settings, club.settings.displayName || club.name, first, j.verdict.days).slice(0, LETTER_MAX);
+    const text = validateLetter(r.text, { hasPromo }) ?? template;
+    recipients.push({ customerId: r.customerId, name: first ?? NO_NAME, text, ...(text === template ? { fallback: true } : {}) });
   }
 
   const remainingCap = winbackDailyCap() - (await sentTodayCount(clubId, club.timezone, now));
@@ -162,6 +172,9 @@ const reasonLabel = (code: string) => REASONS[code] ?? code;
 
 /* ── Відправка ───────────────────────────────────────────────────────────── */
 
+/** Імʼя в картці, коли в клієнта його нема (у шаблоні тоді «гостю») */
+const NO_NAME = 'Клієнт';
+
 type Item = { customerId: string; name: string; text: string };
 
 /**
@@ -176,7 +189,6 @@ export async function deliverItems(
   clubId: string,
   items: Item[],
   now: Date,
-  opts: { budget?: number } = {},
 ): Promise<RecipientResult[]> {
   const club = await loadClubForLetters(clubId);
   const queuedAll = (reason?: string): RecipientResult[] => items.map((i) => ({ customerId: i.customerId, name: i.name, status: 'queued', ...(reason ? { reason } : {}) }));
@@ -185,10 +197,10 @@ export async function deliverItems(
 
   const judged = await judgeCustomers(clubId, items.map((i) => i.customerId), club.settings.winback, now);
   const promo = await winbackPromo(clubId, club.settings);
+  const hasPromo = Boolean(promo);
   const clubLine = { name: club.name, slug: club.slug };
-
-  let sentToday = await sentTodayCount(clubId, club.timezone, now);
-  let budget = opts.budget ?? MAX_PER_TICK;
+  const dayStart = DateTime.fromJSDate(now).setZone(club.timezone).startOf('day').toJSDate();
+  const tickSince = new Date(now.getTime() - TICK_WINDOW_MS);
   const out: RecipientResult[] = [];
 
   for (const item of items) {
@@ -199,21 +211,26 @@ export async function deliverItems(
     const verdict: Eligibility = j.verdict;
     if (!verdict.ok) { out.push({ ...base, status: 'skipped', reason: verdict.reason }); continue; }
 
-    /* Тіковий і добовий стелі не скасовують лист, а відкладають: людина лишається в черзі. */
-    if (budget <= 0) { out.push({ ...base, status: 'queued', reason: 'tick_cap' }); continue; }
-    if (sentToday >= winbackDailyCap()) { out.push({ ...base, status: 'queued', reason: 'daily_cap' }); continue; }
+    /* Стелі — на клуб і з бази, СВІЖО перед кожним листом: інша кампанія, шаблонний тік чи другий
+       інстанс могли надіслати щойно. Стеля не скасовує лист, а відкладає: людина лишається в черзі. */
+    const [tickUsed, dayUsed] = await Promise.all([lettersSentSince(clubId, tickSince), lettersSentSince(clubId, dayStart)]);
+    if (tickUsed >= MAX_PER_TICK) { out.push({ ...base, status: 'queued', reason: 'tick_cap' }); continue; }
+    if (dayUsed >= winbackDailyCap()) { out.push({ ...base, status: 'queued', reason: 'daily_cap' }); continue; }
+
+    /* Прапорцю fallback з payload не віримо: збережений текст перевіряємо ще раз саме зараз,
+       не пройшов — шлемо шаблон клубу з актуальними днями. */
+    const text = validateLetter(item.text, { hasPromo })
+      ?? plainWinbackText(club.settings, club.settings.displayName || club.name, item.name === NO_NAME ? null : item.name, verdict.days).slice(0, LETTER_MAX);
 
     const res = await sendClaimed(
       { id: j.id, chatId: j.chatId!, storedCount: j.storedCount, storedLastAt: j.storedLastAt, count: verdict.count },
       now,
       () => renderWinback({
-        club: clubLine, settings: club.settings, playerName: item.name, days: verdict.days, promo, customerId: j.id, bodyText: item.text,
+        club: clubLine, settings: club.settings, playerName: item.name, days: verdict.days, promo, customerId: j.id, bodyText: text,
       }),
     );
 
     if (res === 'sent') {
-      budget -= 1;
-      sentToday += 1;
       out.push({ ...base, status: 'sent', at: now.toISOString() });
     } else if (res === 'retry') {
       /* Тимчасова помилка Telegram: лишаємо в черзі, наступний прохід спробує знову (до кінця строку). */
@@ -225,36 +242,55 @@ export async function deliverItems(
   return out;
 }
 
-/** Виконавець: payload → відправка або черга. Повторно перевіряє payload і політику не тут (це робить actions.ts). */
+/** Виконавець: payload → відправка або черга. Політику повторно перевіряє actions.ts, текст і правила — deliverItems. */
 export async function executeCampaign(clubId: string, raw: unknown, now: Date = new Date()): Promise<CampaignResult> {
   const parsed = campaignPayloadSchema.safeParse(raw);
   if (!parsed.success) throw new ActionInvalidError('Повернення клієнтів: некоректні дані.');
 
-  /* Жорсткі правила тексту перевіряємо й тут: payload міг бути змінений між пропозицією та рішенням. */
-  const club = await loadClubForLetters(clubId);
-  const hasPromo = club ? Boolean(await winbackPromo(clubId, club.settings)) : false;
-  const items: Item[] = parsed.data.recipients.map((r) => {
-    const text = r.fallback ? r.text : validateLetter(r.text, { hasPromo });
-    return { customerId: r.customerId, name: r.name ?? 'Клієнт', text: text ?? '' };
-  });
-  const bad = new Set(items.filter((i) => !i.text).map((i) => i.customerId));
-  const live = items.filter((i) => !bad.has(i.customerId));
-  const delivered = live.length ? await deliverItems(clubId, live, now) : [];
-  const byId = new Map(delivered.map((d) => [d.customerId, d]));
-
-  return tally(items.map((i) => byId.get(i.customerId) ?? { customerId: i.customerId, name: i.name, status: 'skipped', reason: 'bad_text' }));
+  const items: Item[] = parsed.data.recipients.map((r) => ({ customerId: r.customerId, name: r.name ?? NO_NAME, text: r.text }));
+  return tally(await deliverItems(clubId, items, now));
 }
 
 /* ── Черга на вікно ──────────────────────────────────────────────────────── */
+
+/**
+ * Дописати в result дії нові статуси ПІД БЛОКУВАННЯМ дії (pg_advisory_xact_lock):
+ * два інстанси чи два проходи не затирають один одного. Читаємо актуальний
+ * result усередині транзакції й зливаємо по customerId: замінюємо лише те, що ще
+ * «queued»; «sent» не знижується ніколи, а «sent» від запізнілого інстанса
+ * виправляє чужий «skipped» (його дав програш у гонці за лічильник).
+ * Саму відправку під блокування не беремо — транзакція не повинна чекати Telegram,
+ * а від дубля листа рятує умовне займання лічильника в sendClaimed.
+ */
+async function mergeResult(actionId: string, clubId: string, updates: RecipientResult[]): Promise<void> {
+  if (updates.length === 0) return;
+  const byId = new Map(updates.map((u) => [u.customerId, u]));
+  await prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${actionId}))`;
+    const cur = await tx.aiAction.findFirst({ where: { id: actionId, clubId, status: 'EXECUTED' }, select: { result: true } });
+    const recipients = (cur?.result as CampaignResult | null)?.recipients;
+    if (!Array.isArray(recipients)) return;
+    const merged = recipients.map((r) => {
+      const u = byId.get(r.customerId);
+      if (!u) return r;
+      if (r.status === 'queued') return u;
+      return u.status === 'sent' && r.status !== 'sent' ? u : r;
+    });
+    await tx.aiAction.updateMany({
+      where: { id: actionId, clubId, status: 'EXECUTED' },
+      data: { result: tally(merged) as unknown as object },
+    });
+  });
+}
 
 /**
  * Один прохід: дописати те, що чекало вікна (або повтору після помилки
  * Telegram). Діє тільки для вже ВИКОНАНИХ (затверджених) дій: пропозиції, що
  * чекають рішення, сюди не потрапляють.
  *
- * Перед відправкою ще раз перевіряємо політику власника: якщо після
- * підтвердження «розсилку» вимкнули — відкладене знімається, а не йде за
- * вчорашнім дозволом.
+ * Строк 48 годин діє завжди, і для клубу, що втратив ІІ чи став неактивним, —
+ * щоб відкладене не висіло вічно. Перед відправкою ще раз перевіряємо політику
+ * власника: якщо після підтвердження «розсилку» вимкнули — відкладене знімається.
  */
 export const runWinbackQueue = (now?: Date) => withSendSummary('winback-ai', () => runQueueInner(now));
 
@@ -267,15 +303,19 @@ async function runQueueInner(now: Date = new Date()): Promise<number> {
   });
 
   let delivered = 0;
-  /* Тіковий стелю — на клуб, а не на дію: дві затверджені кампанії не дають 50 листів за раз. */
-  const budgets = new Map<string, number>();
-  const clubs = new Map<string, { ok: boolean; messagingOn: boolean } | undefined>();
+  const clubs = new Map<string, { ok: boolean; messagingOn: boolean }>();
+  const skip = (queued: RecipientResult[], reason: string): RecipientResult[] => queued.map((r) => ({ ...r, status: 'skipped' as const, reason }));
 
   for (const row of rows) {
     const prev = (row.result as CampaignResult | null)?.recipients;
     if (!Array.isArray(prev)) continue;
     const queued = prev.filter((r) => r.status === 'queued');
     if (queued.length === 0) continue;
+
+    if (!row.executedAt || now.getTime() - row.executedAt.getTime() > QUEUE_TTL_MS) {
+      await mergeResult(row.id, row.clubId, skip(queued, 'expired'));
+      continue;
+    }
 
     let state = clubs.get(row.clubId);
     if (!state) {
@@ -284,38 +324,23 @@ async function runQueueInner(now: Date = new Date()): Promise<number> {
       state = { ok: Boolean(club?.isActive && club.approvedAt && planFeatures(club.plan).ai), messagingOn: perms.access && perms.messaging !== 'OFF' };
       clubs.set(row.clubId, state);
     }
-    if (!state.ok) continue;
-
-    let next: RecipientResult[];
-    const expired = !row.executedAt || now.getTime() - row.executedAt.getTime() > QUEUE_TTL_MS;
-    if (expired || !state.messagingOn) {
-      next = prev.map((r) => (r.status === 'queued' ? { ...r, status: 'skipped' as const, reason: expired ? 'expired' : 'policy_off' } : r));
-    } else {
-      const club = await loadClubForLetters(row.clubId);
-      if (!club || !inSendWindow(now, club.timezone)) continue;
-      const hasPromo = Boolean(await winbackPromo(row.clubId, club.settings));
-
-      const payload = await prisma.aiAction.findFirst({ where: { id: row.id, clubId: row.clubId }, select: { payload: true } });
-      const texts = new Map<string, string>();
-      const p = campaignPayloadSchema.safeParse(payload?.payload);
-      if (p.success) for (const r of p.data.recipients) texts.set(r.customerId, r.fallback ? r.text : (validateLetter(r.text, { hasPromo }) ?? ''));
-
-      const budget = budgets.get(row.clubId) ?? MAX_PER_TICK;
-      if (budget <= 0) continue;
-      const items = queued.map((r) => ({ customerId: r.customerId, name: r.name, text: texts.get(r.customerId) ?? '' }));
-      const ready = items.filter((i) => i.text);
-      const res = ready.length ? await deliverItems(row.clubId, ready, now, { budget }) : [];
-      const byId = new Map(res.map((r) => [r.customerId, r]));
-      const sent = res.filter((r) => r.status === 'sent').length;
-      delivered += sent;
-      budgets.set(row.clubId, budget - sent);
-      next = prev.map((r) => (r.status === 'queued' ? (byId.get(r.customerId) ?? { ...r, status: 'skipped' as const, reason: 'bad_text' }) : r));
+    if (!state.ok) continue; // чекає до кінця строку
+    if (!state.messagingOn) {
+      await mergeResult(row.id, row.clubId, skip(queued, 'policy_off'));
+      continue;
     }
 
-    await prisma.aiAction.updateMany({
-      where: { id: row.id, clubId: row.clubId, status: 'EXECUTED' },
-      data: { result: tally(next) as unknown as object },
-    });
+    const club = await loadClubForLetters(row.clubId);
+    if (!club || !inSendWindow(now, club.timezone)) continue;
+
+    const payload = await prisma.aiAction.findFirst({ where: { id: row.id, clubId: row.clubId }, select: { payload: true } });
+    const texts = new Map<string, string>();
+    const p = campaignPayloadSchema.safeParse(payload?.payload);
+    if (p.success) for (const r of p.data.recipients) texts.set(r.customerId, r.text);
+
+    const res = await deliverItems(row.clubId, queued.map((r) => ({ customerId: r.customerId, name: r.name, text: texts.get(r.customerId) ?? '' })), now);
+    delivered += res.filter((r) => r.status === 'sent').length;
+    await mergeResult(row.id, row.clubId, res);
   }
   return delivered;
 }
