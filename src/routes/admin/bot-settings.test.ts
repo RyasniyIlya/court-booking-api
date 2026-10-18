@@ -142,11 +142,13 @@ describe('GET /bot-settings', () => {
     prisma.club.findUnique.mockResolvedValue(clubRow({ plan: PLAN1 }));
     const res = await request(app).get('/api/admin/bot-settings');
     expect(res.body).toMatchObject({ planAllows: true, analyticsAllowed: false });
+    expect(res.body.aiAllowed).toBe(false);
   });
 
   it('«Аналітика» (tier 3): analyticsAllowed=true', async () => {
     const res = await request(app).get('/api/admin/bot-settings');
     expect(res.body).toMatchObject({ planAllows: true, analyticsAllowed: true });
+    expect(res.body.aiAllowed).toBe(true);
   });
 
   it('бот не підключений: botReady=false, clubLink=null', async () => {

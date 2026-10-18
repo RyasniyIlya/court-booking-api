@@ -82,6 +82,7 @@ botSettingsRouter.get('/bot-settings', async (req, res) => {
     settings: normalizeBotSettings(club.botSettings),
     planAllows: planFeatures(club.plan).telegram,
     analyticsAllowed: telegramAnalytics(club.plan),
+    aiAllowed: planFeatures(club.plan).ai,
     botReady: botReady() && Boolean(username),
     botUsername: username,
     clubLink: username ? `https://t.me/${username}?start=${clubStartPayload(club.slug)}` : null,
