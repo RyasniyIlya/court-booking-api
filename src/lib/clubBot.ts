@@ -49,6 +49,18 @@ export type BotSettings = {
   /** null — усі активні */
   trainerIds: string[] | null;
   winback: WinbackSettings;
+  /** Ранкова сводка ІІ-менеджера власнику в Telegram (етап 3). Типово вимкнена: платний виклик моделі. */
+  morningBrief: MorningBriefSettings;
+  /** Повідомляти власника про нові пропозиції ІІ, що чекають рішення */
+  actionAlerts: boolean;
+};
+
+export const BRIEF_HOURS = [5, 6, 7, 8, 9, 10, 11, 12] as const;
+
+export type MorningBriefSettings = {
+  enabled: boolean;
+  /** Година за часом клубу */
+  hour: (typeof BRIEF_HOURS)[number];
 };
 
 export const DEFAULT_WELCOME =
@@ -81,6 +93,11 @@ export const defaultBotSettings = (): BotSettings => ({
     text: DEFAULT_WINBACK,
     promoId: null,
   },
+  /* Вимкнено навмисно: сводка коштує грошей, а несподіване повідомлення вранці
+     власник має ввімкнути сам. Сповіщення про пропозиції — навпаки, типово
+     вмикаємо: пропозиція без відповіді просто спливає за 48 годин. */
+  morningBrief: { enabled: false, hour: 8 },
+  actionAlerts: true,
 });
 
 /* ── Валідація ─────────────────────────────────────────────────────────── */
@@ -111,6 +128,13 @@ export const botSettingsSchema = z.strictObject({
     text: z.string().trim().max(MAX_TEXT),
     promoId: z.string().uuid().nullable(),
   }),
+  /* Необовʼязкові: старий кабінет (без цих полів) не має отримувати 400 —
+     відсутнє поле означає «лишити як було», це робить роут. */
+  morningBrief: z.strictObject({
+    enabled: z.boolean(),
+    hour: z.number().int().min(BRIEF_HOURS[0]).max(BRIEF_HOURS[BRIEF_HOURS.length - 1]),
+  }).optional(),
+  actionAlerts: z.boolean().optional(),
 });
 
 const isObj = (v: unknown): v is Record<string, unknown> =>
@@ -146,6 +170,7 @@ export function normalizeBotSettings(raw: unknown): BotSettings {
   const def = defaultBotSettings();
   const r = isObj(raw) ? raw : {};
   const w = isObj(r.winback) ? r.winback : {};
+  const mb = isObj(r.morningBrief) ? r.morningBrief : {};
 
   const name = typeof r.displayName === 'string' ? r.displayName.trim().slice(0, MAX_NAME) : '';
 
@@ -166,6 +191,11 @@ export function normalizeBotSettings(raw: unknown): BotSettings {
       text: text(w.text, MAX_TEXT, def.winback.text),
       promoId: typeof w.promoId === 'string' && w.promoId ? w.promoId : null,
     },
+    morningBrief: {
+      enabled: bool(mb.enabled, def.morningBrief.enabled),
+      hour: pick(mb.hour, BRIEF_HOURS, def.morningBrief.hour),
+    },
+    actionAlerts: bool(r.actionAlerts, def.actionAlerts),
   };
 }
 

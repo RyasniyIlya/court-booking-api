@@ -29,7 +29,7 @@ export class TelegramDeliveryError extends Error {
 }
 
 /** Методи, що доходять до людини або чату: їх стосується TELEGRAM_SEND_MODE. */
-const GATED = new Set(['sendMessage', 'editMessageText', 'deleteMessage', 'answerCallbackQuery', 'setMyCommands']);
+const GATED = new Set(['sendMessage', 'editMessageText', 'editMessageReplyMarkup', 'deleteMessage', 'answerCallbackQuery', 'setMyCommands']);
 /** З них у підсумок sent/skipped/failed іде лише те, що бачить людина. */
 const COUNTED = new Set(['sendMessage', 'editMessageText']);
 
@@ -153,6 +153,17 @@ export function editMessageText(
 }
 
 /**
+ * Замінити лише кнопки під повідомленням, не чіпаючи текст.
+ *
+ * Для рішення по пропозиції ІІ: текст сводки лишається, а ряд кнопок цієї дії
+ * стає підсумком («✅ Виконано»). editMessageText тут не годиться — Telegram
+ * відхиляє його, якщо текст не змінився.
+ */
+export function editMessageReplyMarkup(chatId: string | number, messageId: number, markup: unknown) {
+  return call<unknown>('editMessageReplyMarkup', { chat_id: chatId, message_id: messageId, reply_markup: markup });
+}
+
+/**
  * Погасити «годинник» на натиснутій кнопці.
  *
  * Telegram крутить його, доки бот не відповів, і без цього виклику кнопка
@@ -199,7 +210,12 @@ export type TgUpdate = {
   callback_query?: {
     id: string;
     data?: string;
-    message?: { message_id: number; chat: { id: number } };
+    message?: {
+      message_id: number;
+      chat: { id: number };
+      /** Кнопки, що були під повідомленням, коли її натиснули */
+      reply_markup?: { inline_keyboard?: { text: string; callback_data?: string; url?: string }[][] };
+    };
     from?: { id: number };
   };
 };

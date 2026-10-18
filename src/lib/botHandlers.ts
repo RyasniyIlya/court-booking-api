@@ -44,6 +44,7 @@ import {
   startPlayerLogin,
 } from './playerLogin';
 import { handleHomeCallback, loadClubHome, sendClubHome, sendOwnClubHome } from './playerHome';
+import { handleAiCallback } from './aiTelegram';
 
 /**
  * Що бот відповідає на команди.
@@ -349,6 +350,8 @@ async function handleCallback(q: NonNullable<TgUpdate['callback_query']>): Promi
   /* Головна клубу, згода на акції, відписка від листів повернення — теж до
      перевірки ролі: гравцем буває й людина з персоналу. */
   if (await handleHomeCallback(q)) return;
+  /* Кнопки ІІ-менеджера («Підтвердити / Відхилити») — рішення власника; роль перевіряє сам обробник. */
+  if (await handleAiCallback(q)) return;
 
   if (q.data?.startsWith('plogin:')) {
     if (!q.from || String(q.from.id) !== chatId) {

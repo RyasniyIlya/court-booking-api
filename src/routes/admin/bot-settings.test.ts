@@ -361,3 +361,35 @@ describe('POST /bot-settings/preview', () => {
     expect((await request(app).post('/api/admin/bot-settings/preview').send({ settings: defaultBotSettings(), kind: 'home' })).status).toBe(404);
   });
 });
+
+describe('PUT /bot-settings: ІІ (етап 3)', () => {
+  const { morningBrief: _m, actionAlerts: _a, ...legacy } = defaultBotSettings();
+
+  it('сводка вмикається на «Аналітика» і зберігається разом із годиною та сповіщеннями', async () => {
+    const res = await request(app).put('/api/admin/bot-settings').send({ ...legacy, morningBrief: { enabled: true, hour: 9 }, actionAlerts: false });
+    expect(res.status).toBe(200);
+    expect(res.body.settings).toMatchObject({ morningBrief: { enabled: true, hour: 9 }, actionAlerts: false });
+  });
+
+  it('тариф без ІІ: увімкнути сводку не можна (403 ai), решту зберегти можна', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow({ plan: PLAN1 }));
+    const no = await request(app).put('/api/admin/bot-settings').send({ ...legacy, morningBrief: { enabled: true, hour: 8 } });
+    expect(no.status).toBe(403);
+    expect(no.body).toMatchObject({ error: 'PLAN_REQUIRED', feature: 'ai' });
+    expect(prisma.club.update).not.toHaveBeenCalled();
+    expect((await request(app).put('/api/admin/bot-settings').send({ ...legacy, morningBrief: { enabled: false, hour: 8 } })).status).toBe(200);
+  });
+
+  it('старий кабінет без нових полів не скидає збережені ІІ-налаштування', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow({ botSettings: { morningBrief: { enabled: true, hour: 10 }, actionAlerts: false } }));
+    const res = await request(app).put('/api/admin/bot-settings').send(legacy);
+    expect(res.status).toBe(200);
+    expect(res.body.settings).toMatchObject({ morningBrief: { enabled: true, hour: 10 }, actionAlerts: false });
+  });
+
+  it('збереження форми не стирає позначку «сводку за день надіслано»', async () => {
+    prisma.club.findUnique.mockResolvedValue(clubRow({ botSettings: { briefSentOn: '2026-10-18' } }));
+    await request(app).put('/api/admin/bot-settings').send(legacy);
+    expect(prisma.club.update.mock.calls[0][0].data.botSettings.briefSentOn).toBe('2026-10-18');
+  });
+});

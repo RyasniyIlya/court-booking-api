@@ -382,3 +382,25 @@ describe('describeKeyboard', () => {
     ]);
   });
 });
+
+describe('ІІ-налаштування (етап 3)', () => {
+  it('типово: сводка вимкнена о 8:00, сповіщення про пропозиції ввімкнені', () => {
+    expect(normalizeBotSettings({})).toMatchObject({ morningBrief: { enabled: false, hour: 8 }, actionAlerts: true });
+  });
+
+  it('година поза 5..12 і сміття повертаються до типових; службова briefSentOn відкидається', () => {
+    const s = normalizeBotSettings({ morningBrief: { enabled: true, hour: 3 }, actionAlerts: 'так', briefSentOn: '2026-10-18' });
+    expect(s.morningBrief).toEqual({ enabled: true, hour: 8 });
+    expect(s.actionAlerts).toBe(true);
+    expect(s).not.toHaveProperty('briefSentOn');
+    expect(normalizeBotSettings({ morningBrief: { enabled: true, hour: 11 }, actionAlerts: false })).toMatchObject({ morningBrief: { hour: 11 }, actionAlerts: false });
+  });
+
+  it('PUT: поля необовʼязкові (старий кабінет), година лише 5..12, зайвого немає', () => {
+    const { morningBrief: _m, actionAlerts: _a, ...legacy } = defaultBotSettings();
+    expect(botSettingsSchema.safeParse(legacy).success).toBe(true);
+    expect(botSettingsSchema.safeParse({ ...legacy, morningBrief: { enabled: true, hour: 12 } }).success).toBe(true);
+    expect(botSettingsSchema.safeParse({ ...legacy, morningBrief: { enabled: true, hour: 13 } }).success).toBe(false);
+    expect(botSettingsSchema.safeParse({ ...legacy, morningBrief: { enabled: true, hour: 8, x: 1 } }).success).toBe(false);
+  });
+});

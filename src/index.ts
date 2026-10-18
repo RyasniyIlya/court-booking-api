@@ -24,6 +24,7 @@ import { demoRouter } from './routes/demo';
 import { startExpirySweeper } from './lib/expire';
 import { startBot, telegramWebhookSecret } from './lib/botRunner';
 import { startDigestScheduler } from './lib/digestScheduler';
+import { startMorningBriefScheduler } from './lib/morningBrief';
 import { startReminderScheduler } from './lib/remind';
 import { startPlayerScheduler } from './lib/playerRemind';
 import { startWinbackScheduler } from './lib/winback';
@@ -233,6 +234,9 @@ app.listen(port, () => {
 
     // Щоденне зведення власнику о DIGEST_HOUR за часом клубу.
     startDigestScheduler();
+
+    // Ранкова сводка ІІ-менеджера власнику (вимкнена, поки власник не ввімкне в налаштуваннях бота).
+    startMorningBriefScheduler();
 
     // Нагадування перед заняттям.
     startReminderScheduler();
