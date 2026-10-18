@@ -99,26 +99,11 @@ type Pool = {
 };
 
 /**
- * Кому клуб може написати просто зараз (без урахування денного вікна).
- *
- * Спершу відсікаємо базою все, що відсікається без історії візитів —
- * згода, чат, блокування, — і лише для решти читаємо візити й майбутні
- * записи двома запитами на всіх разом, а не по одному на людину.
+ * Останній візит і наявність майбутнього запису для набору людей: чотири запити
+ * на всіх разом. Спільне для шаблонного повернення й листів ІІ — «давно не
+ * грав» і «має запис» рахуються в обох випадках однаково.
  */
-async function eligiblePool(clubId: string, settings: WinbackSettings, now: Date, limit: number): Promise<Pool[]> {
-  const people = await prisma.customer.findMany({
-    where: {
-      clubId,
-      telegramChatId: { not: null },
-      tgMarketingAt: { not: null },
-      isBlocked: false,
-    },
-    select: { id: true, name: true, telegramChatId: true, winbackCount: true, winbackLastAt: true },
-    take: 5000,
-  });
-  if (people.length === 0) return [];
-
-  const ids = people.map((p) => p.id);
+export async function loadVisitFacts(clubId: string, ids: string[], now: Date): Promise<{ lastVisit: Map<string, Date>; upcoming: Set<string> }> {
   const live = ['PENDING', 'CONFIRMED'] as const;
 
   const [bookingVisits, seatVisits, upBookings, upSeats] = await Promise.all([
@@ -166,6 +151,31 @@ async function eligiblePool(clubId: string, settings: WinbackSettings, now: Date
   const upcoming = new Set<string>();
   for (const u of [...upBookings, ...upSeats]) if (u.customerId) upcoming.add(u.customerId);
 
+  return { lastVisit, upcoming };
+}
+
+/**
+ * Кому клуб може написати просто зараз (без урахування денного вікна).
+ *
+ * Спершу відсікаємо базою все, що відсікається без історії візитів —
+ * згода, чат, блокування, — і лише для решти читаємо візити й майбутні
+ * записи двома запитами на всіх разом, а не по одному на людину.
+ */
+async function eligiblePool(clubId: string, settings: WinbackSettings, now: Date, limit: number): Promise<Pool[]> {
+  const people = await prisma.customer.findMany({
+    where: {
+      clubId,
+      telegramChatId: { not: null },
+      tgMarketingAt: { not: null },
+      isBlocked: false,
+    },
+    select: { id: true, name: true, telegramChatId: true, winbackCount: true, winbackLastAt: true },
+    take: 5000,
+  });
+  if (people.length === 0) return [];
+
+  const { lastVisit, upcoming } = await loadVisitFacts(clubId, people.map((p) => p.id), now);
+
   const out: Pool[] = [];
   for (const p of people) {
     const verdict = winbackEligibility({
@@ -192,6 +202,121 @@ async function eligiblePool(clubId: string, settings: WinbackSettings, now: Date
     if (out.length >= limit) break;
   }
   return out;
+}
+
+export type Judged = {
+  id: string;
+  name: string;
+  chatId: string | null;
+  storedCount: number;
+  storedLastAt: Date | null;
+  createdAt: Date;
+  lastVisit: Date | null;
+  verdict: Eligibility;
+};
+
+/**
+ * Те саме правило winbackEligibility, але для конкретних людей і з причиною
+ * відмови — для листів ІІ: і при пропозиції, і в момент відправки. Клієнт з
+ * іншого клубу (чи неіснуючий id) просто не знайдеться — запит завжди в межах
+ * clubId, тому «чужого» в мапі нема.
+ *
+ * Згоду, чат і блокування читаємо з картки як є (на відміну від eligiblePool,
+ * який відсікає їх у where): ІІ має сказати власнику, ЧОМУ людині не написали.
+ */
+export async function judgeCustomers(
+  clubId: string,
+  ids: string[],
+  settings: Pick<WinbackSettings, 'afterDays' | 'everyDays' | 'maxMessages'>,
+  now: Date,
+): Promise<Map<string, Judged>> {
+  const out = new Map<string, Judged>();
+  if (ids.length === 0) return out;
+
+  const people = await prisma.customer.findMany({
+    where: { clubId, id: { in: ids } },
+    select: { id: true, name: true, createdAt: true, telegramChatId: true, tgMarketingAt: true, isBlocked: true, winbackCount: true, winbackLastAt: true },
+  });
+  const { lastVisit, upcoming } = await loadVisitFacts(clubId, people.map((p) => p.id), now);
+
+  for (const p of people) {
+    const last = lastVisit.get(p.id) ?? null;
+    out.set(p.id, {
+      id: p.id,
+      name: p.name,
+      chatId: p.telegramChatId,
+      storedCount: p.winbackCount,
+      storedLastAt: p.winbackLastAt,
+      createdAt: p.createdAt,
+      lastVisit: last,
+      verdict: winbackEligibility({
+        now,
+        hasChat: Boolean(p.telegramChatId),
+        marketingOk: p.tgMarketingAt !== null,
+        blocked: p.isBlocked,
+        lastVisit: last,
+        hasUpcoming: upcoming.has(p.id),
+        winbackCount: p.winbackCount,
+        winbackLastAt: p.winbackLastAt,
+        settings,
+      }),
+    });
+  }
+  return out;
+}
+
+/** Людина, якій збираємось писати: усе, що потрібно, щоб зайняти слот лічильника й надіслати. */
+export type Claimable = {
+  id: string;
+  chatId: string;
+  /** Що лежало в Customer.winbackCount / winbackLastAt, коли ми вирішували */
+  storedCount: number;
+  storedLastAt: Date | null;
+  /** Скільки листів «в історії» після скидання при новому візиті */
+  count: number;
+};
+
+/**
+ * Один лист повернення: зайняти слот лічильника → надіслати → при помилці
+ * розібратись з міткою. ЄДИНЕ місце, де росте winbackCount, і для шаблонного
+ * тіку, і для листів ІІ: тому клієнт не отримає двох листів поспіль, а ліміти
+ * (інтервал, «N листів») діють на обидва канали як на один.
+ *
+ *   sent      — доставлено, лічильник виріс;
+ *   raced     — слот уже зайняв інший процес або людина зняла згоду між
+ *               перевіркою та відправкою: нічого не шлемо;
+ *   permanent — бот заблоковано, згоду знято;
+ *   retry     — тимчасова помилка, мітку повернуто.
+ */
+export async function sendClaimed(
+  p: Claimable,
+  now: Date,
+  buildView: () => { text: string; keyboard: unknown },
+): Promise<'sent' | 'raced' | 'permanent' | 'retry'> {
+  /* Займаємо слот ДО відправки умовним оновленням: другий процес, що
+     дійшов до тієї ж людини, бачить уже нову мітку й пропускає її.
+     Дубль маркетингового листа гірший за один непотрапивший. */
+  const claim = await prisma.customer.updateMany({
+    where: { id: p.id, tgMarketingAt: { not: null }, winbackLastAt: p.storedLastAt, winbackCount: p.storedCount },
+    data: { winbackCount: p.count + 1, winbackLastAt: now },
+  });
+  if (claim.count === 0) return 'raced';
+
+  const view = buildView();
+  const result = await sendReminderMessage(p.chatId, view.text, { inline_keyboard: view.keyboard });
+
+  if (result === 'sent') return 'sent';
+  if (result === 'permanent') {
+    /* Бота заблоковано — надалі писати нікуди й нема сенсу. */
+    await prisma.customer.update({ where: { id: p.id }, data: { tgMarketingAt: null } });
+    return 'permanent';
+  }
+  /* Тимчасова помилка: повертаємо мітку, спробуємо наступного разу. */
+  await prisma.customer.updateMany({
+    where: { id: p.id, winbackLastAt: now },
+    data: { winbackCount: p.storedCount, winbackLastAt: p.storedLastAt },
+  });
+  return 'retry';
 }
 
 /** Скільки гравців клуб отримає в листі повернення — для екрана налаштувань */
@@ -230,32 +355,10 @@ async function runWinbackTickInner(now: Date = new Date()): Promise<number> {
     const promoView = promo ? { title: promo.title, summary: promoSummary(promo) } : null;
 
     for (const p of pool) {
-      /* Займаємо слот ДО відправки умовним оновленням: другий процес, що
-         дійшов до тієї ж людини, бачить уже нову мітку й пропускає її.
-         Дубль маркетингового листа гірший за один непотрапивший. */
-      const claim = await prisma.customer.updateMany({
-        where: { id: p.id, tgMarketingAt: { not: null }, winbackLastAt: p.storedLastAt, winbackCount: p.storedCount },
-        data: { winbackCount: p.count + 1, winbackLastAt: now },
-      });
-      if (claim.count === 0) continue;
-
-      const view = renderWinback({
+      const result = await sendClaimed(p, now, () => renderWinback({
         club, settings, playerName: p.name, days: p.days, promo: promoView, customerId: p.id,
-      });
-      const result = await sendReminderMessage(p.chatId, view.text, { inline_keyboard: view.keyboard });
-
-      if (result === 'sent') {
-        delivered += 1;
-      } else if (result === 'permanent') {
-        /* Бота заблоковано — надалі писати нікуди й нема сенсу. */
-        await prisma.customer.update({ where: { id: p.id }, data: { tgMarketingAt: null } });
-      } else {
-        /* Тимчасова помилка: повертаємо мітку, спробуємо наступного тіку. */
-        await prisma.customer.updateMany({
-          where: { id: p.id, winbackLastAt: now },
-          data: { winbackCount: p.storedCount, winbackLastAt: p.storedLastAt },
-        });
-      }
+      }));
+      if (result === 'sent') delivered += 1;
     }
   }
 

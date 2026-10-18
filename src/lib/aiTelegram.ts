@@ -4,6 +4,7 @@ import { prisma } from './db';
 import { planFeatures } from './plans';
 import { escapeHtml, normalizeBotSettings } from './clubBot';
 import { AiActionError, approveAction, rejectAction } from './ai/actions';
+import type { ProposedAction } from './ai/managerTools';
 import { answerCallback, editMessageReplyMarkup, sendMessage, type TgUpdate } from './telegram';
 
 /**
@@ -93,7 +94,37 @@ export function splitTelegram(html: string, max = CHUNK): string[] {
 
 /* ── Пропозиції: текст і кнопки ──────────────────────────────────────────── */
 
-export type ShownAction = { id: string; summary: string; status: string; error: string | null };
+export type ShownAction = {
+  id: string;
+  summary: string;
+  status: string;
+  error: string | null;
+  /** Додаткові рядки під пунктом (приклади листів) — звичайний текст, екрануємо при показі */
+  details?: string[];
+};
+
+/** Скільки прикладів листів показуємо в сводці: власнику треба побачити тон, а не прочитати всі 25. */
+const SAMPLE_LETTERS = 2;
+const SAMPLE_CHARS = 140;
+
+/**
+ * Картка пропозиції для Telegram. Для листів повернення — кількість адресатів
+ * і 1–2 приклади текстів (імена вже лише перші, з payload).
+ */
+export function toShownAction(a: ProposedAction): ShownAction {
+  const shown: ShownAction = { id: a.id, summary: a.summary, status: a.status, error: a.error };
+  if (a.kind === 'winback.campaign') {
+    const recipients = (a.payload as { recipients?: Array<{ name?: unknown; text?: unknown }> } | null)?.recipients;
+    if (Array.isArray(recipients) && recipients.length) {
+      const sample = recipients.slice(0, SAMPLE_LETTERS).map((r) => {
+        const text = String(r.text ?? '').replace(/\s+/g, ' ').trim();
+        return `${String(r.name ?? 'Клієнт')}: «${text.length > SAMPLE_CHARS ? `${text.slice(0, SAMPLE_CHARS)}…` : text}»`;
+      });
+      shown.details = [`Адресатів: ${recipients.length}. Приклади:`, ...sample];
+    }
+  }
+  return shown;
+}
 
 /** Пояснення збою для власника: тут лише відомий український текст (див. actions.ts), не сирий виняток. */
 const failedLine = (a: ShownAction) => `⚠️ не виконано${a.error ? `: ${escapeHtml(a.error.slice(0, 200))}` : ''}`;
@@ -110,7 +141,9 @@ export function actionsBlock(
   const pending = visible.filter((a) => a.status === 'PENDING');
   const lines = visible.map((a, i) => {
     const tail = a.status === 'PENDING' ? 'чекає вашого рішення' : a.status === 'EXECUTED' ? '✅ виконано автоматично' : failedLine(a);
-    return `${i + 1}. ${escapeHtml(a.summary)} — ${tail}`;
+    const head = `${i + 1}. ${escapeHtml(a.summary)} — ${tail}`;
+    const extra = (a.details ?? []).map((d) => `   ${escapeHtml(d)}`);
+    return [head, ...extra].join('\n');
   });
   const more = live.length - visible.length;
   if (more > 0) lines.push(`…ще ${more} у черзі дій у кабінеті.`);

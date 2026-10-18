@@ -14,7 +14,7 @@ import { XLSX_CONTENT_TYPE } from '../../lib/xlsx';
 import { recordChanges } from '../../lib/changeLog';
 import { effectivePermissions, policyBodySchema, type EffectivePermissions } from '../../lib/ai/policy';
 import { loadPolicy, savePolicy } from '../../lib/ai/policyStore';
-import { queueActionAlert } from '../../lib/aiTelegram';
+import { queueActionAlert, toShownAction } from '../../lib/aiTelegram';
 import { param, requireAuth, requireFeature, requireRole } from './shared';
 
 /**
@@ -120,7 +120,7 @@ aiRouter.post('/ai/chat', aiAccess, async (req, res) => {
     });
     console.log(`[ai] owner chat steps=${steps} tokens=${tokens} actions=${actions.length}`);
     /* Нова пропозиція, що чекає рішення, — і власнику в Telegram (згруповано, якщо налаштовано). */
-    queueActionAlert(club.id, req.auth!.role as UserRole, actions);
+    queueActionAlert(club.id, req.auth!.role as UserRole, actions.map(toShownAction));
     /* actions — картки пропозицій під відповіддю: кабінет показує статус і кнопки. */
     res.json({ reply, actions });
   } catch (e) {

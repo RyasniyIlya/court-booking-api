@@ -468,6 +468,16 @@ export function renderClubHome(input: {
 }
 
 /**
+ * Шаблонний лист повернення як ЗВИЧАЙНИЙ текст (підстановки без екранування):
+ * запасний варіант для ІІ-листа, коли текст моделі не пройшов перевірку. Він
+ * лежить у пропозиції як є, а екранується вже в renderWinback({ bodyText }).
+ */
+export function plainWinbackText(settings: BotSettings, clubName: string, playerName: string | null, days: number): string {
+  const vars: Record<string, string> = { name: playerName ?? GUEST_NAME, club: clubName, days: String(days) };
+  return settings.winback.text.replace(/\{(\w+)\}/g, (whole, key: string) => (Object.hasOwn(vars, key) ? vars[key] : whole));
+}
+
+/**
  * Лист тому, хто давно не грав.
  *
  * «Не надсилати таке» — обовʼязкова кнопка: відписка одним натисканням
@@ -480,16 +490,24 @@ export function renderWinback(input: {
   days: number;
   promo: { title: string; summary: string } | null;
   customerId: string;
+  /**
+   * Готовий звичайний текст листа (без HTML) замість шаблону клубу — для листа,
+   * який написав ІІ. Екрануємо тут, а не в викликача: Telegram HTML не повинен
+   * побачити жодного сирого «<» від моделі. Кнопки й відписка ті самі.
+   */
+  bodyText?: string;
   env?: NodeJS.ProcessEnv;
 }): HomeView {
   const { club, settings, env } = input;
   const name = shownName(club, settings);
 
-  const body = fillTemplate(settings.winback.text, {
-    name: input.playerName ?? GUEST_NAME,
-    club: name,
-    days: String(input.days),
-  });
+  const body = input.bodyText !== undefined
+    ? escapeHtml(input.bodyText)
+    : fillTemplate(settings.winback.text, {
+      name: input.playerName ?? GUEST_NAME,
+      club: name,
+      days: String(input.days),
+    });
   const promo = input.promo
     ? `\n\n🔥 ${escapeHtml(input.promo.title)} — ${escapeHtml(input.promo.summary)}`
     : '';

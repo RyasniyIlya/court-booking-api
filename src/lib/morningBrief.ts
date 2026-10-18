@@ -5,7 +5,7 @@ import { planFeatures } from './plans';
 import { normalizeBotSettings } from './clubBot';
 import { sendMessage } from './telegram';
 import { withSendSummary } from './telegramSafety';
-import { actionsBlock, briefToTelegramHtml, splitTelegram, type ShownAction } from './aiTelegram';
+import { actionsBlock, briefToTelegramHtml, splitTelegram, toShownAction, type ShownAction } from './aiTelegram';
 import { AiError, aiConfigured } from './ai/gemini';
 import { BRIEF_REQUEST, ownerAssistant } from './ai/ownerAssistant';
 import { effectivePermissions } from './ai/policy';
@@ -39,7 +39,7 @@ const CATCHUP_HOURS = 2;
 /* Додаток до готового завдання: ліміт у три дії і заборона вигадувати. */
 const TG_BRIEF_REQUEST = `${BRIEF_REQUEST}
 
-Це повідомлення піде власнику в Telegram, тож стисло: до 2500 символів. Пункт 4 не розписуй текстом — натомість запропонуй цими діями через інструменти не більше трьох конкретних кроків (лише ті, що справді мають сенс за цифрами); якщо очевидних дій немає, не пропонуй жодної. Про кожну запропоновану дію одним рядком скажи, чому вона.`;
+Це повідомлення піде власнику в Telegram, тож стисло: до 2500 символів. Пункт 4 не розписуй текстом — натомість запропонуй цими діями через інструменти не більше трьох конкретних кроків (лише ті, що справді мають сенс за цифрами); якщо очевидних дій немає, не пропонуй жодної. Якщо за get_customer_health під ризиком є клієнти, одним із кроків можеш запропонувати листи повернення (propose_winback, не більше однієї партії): імена й тексти складає система, ти їх не наводиш. Про кожну запропоновану дію одним рядком скажи, чому вона.`;
 
 /** Скільки дій сводка може запропонувати: стільки ж показуємо кнопками. */
 export const MORNING_BRIEF_MAX_PROPOSALS = 3;
@@ -101,7 +101,7 @@ async function composeAndSend(
       manager: { requester: { id: ownerId, role: 'OWNER' }, maxProposals: MORNING_BRIEF_MAX_PROPOSALS },
     });
     reply = out.reply;
-    for (const a of out.actions) proposed.push({ id: a.id, summary: a.summary, status: a.status, error: a.error });
+    for (const a of out.actions) proposed.push(toShownAction(a));
   } catch (e) {
     /* Сирий виняток (мережа, ключ, відмова моделі) власнику не показуємо: лише код у лог. */
     console.error('[brief] не вдалося зібрати сводку', club.id, e instanceof AiError ? e.code : 'unexpected');

@@ -5,10 +5,13 @@ import { searchCondition } from '../customerRoster';
 import { prisma } from '../db';
 import { TOURNAMENT_PREFIX, isTournament } from '../tournamentPay';
 import { AiActionError, proposeAction } from './actions';
-import { ToolInputError, type ToolDef } from './gemini';
+import { ToolInputError, type GenerateFn, type ToolDef } from './gemini';
 import type { OwnerClub } from './outlook';
 import { REPORT_LABELS, REPORT_TYPES, reportRefusal, type ReportType } from './reportFile';
 import type { EffectivePermissions } from './policy';
+import { MAX_CAMPAIGN } from './winbackLetters';
+import { buildCampaignPayload, type CampaignResult } from './winbackCampaign';
+import { ActionInvalidError } from './actions';
 
 /**
  * Інструменти ІІ-менеджера (етап 2): довідники для точних дій і самі дії.
@@ -94,7 +97,9 @@ function outcome(row: { id: string; kind: string; summary: string; status: strin
       ...base,
       note: row.kind === 'report.xlsx'
         ? 'Файл готовий: власник бачить кнопку «Завантажити» під твоєю відповіддю. Не вигадуй посилань.'
-        : 'Дію виконано.',
+        : row.kind === 'winback.campaign'
+          ? winbackNote(row.result)
+          : 'Дію виконано.',
     };
   }
   if (row.status === 'FAILED') {
@@ -108,12 +113,24 @@ function outcome(row: { id: string; kind: string; summary: string; status: strin
   };
 }
 
-export function managerTools(club: OwnerClub, perms: EffectivePermissions, ctx: ManagerContext): ToolDef[] {
+/** Листи повернення виконані «одразу», але частина може чекати денного вікна 11:00–20:00 — модель не має казати «надіслано» про відкладене. */
+function winbackNote(result: unknown): string {
+  const r = result as Partial<CampaignResult> | null;
+  const sent = r?.sent ?? 0;
+  const queued = r?.queued ?? 0;
+  const skipped = r?.skipped ?? 0;
+  if (queued > 0) return `Листи затверджено: надіслано ${sent}, ${queued} відправляться в денне вікно 11:00–20:00 за часом клубу, пропущено ${skipped}. Не пиши, що всі вже надіслані.`;
+  return `Листи оброблено: надіслано ${sent}, пропущено ${skipped} (клієнт передумав чи змінились умови).`;
+}
+
+export function managerTools(club: OwnerClub, perms: EffectivePermissions, ctx: ManagerContext, generate?: GenerateFn): ToolDef[] {
   const tz = club.timezone;
   const dateProp = { type: 'string', description: 'Дата YYYY-MM-DD за часом клубу' };
   const timeProp = (what: string) => ({ type: 'string', description: `${what}, HH:mm за часом клубу` });
 
   let proposed = 0;
+  /* Одна партія листів повернення на запит: друга тільки дублювала б першу й пекла квоту Gemini. */
+  let winbackProposed = false;
   async function propose(kind: string, payload: unknown) {
     if (ctx.maxProposals !== undefined && proposed >= ctx.maxProposals) {
       throw new ToolInputError(`Ліміт пропозицій на цей запит (${ctx.maxProposals}) вичерпано. Нових дій не пропонуй — скажи, що решту можна запропонувати окремо.`);
@@ -348,6 +365,36 @@ export function managerTools(club: OwnerClub, perms: EffectivePermissions, ctx: 
         seeding: a.seeding === 'shuffle' ? 'shuffle' : 'keep',
         thirdPlace: a.third_place === true,
       }),
+    },
+    {
+      decl: {
+        name: 'propose_winback',
+        description: `Запропонувати листи в Telegram клієнтам «під ризиком» (давно не грали): код сам вибирає лише тих, хто дав згоду на розсилку, має Telegram і до кого за лімітами клубу вже можна писати, а кожному пишеться короткий особистий лист. Імен і текстів ти не складаєш і не передаєш. До ${MAX_CAMPAIGN} листів; один виклик на запит. Вдень (11:00–20:00 за часом клубу) листи йдуть після рішення, в інший час чекають вікна. Відповідь каже, ЧИ ВІДПРАВЛЕНО.`,
+        parameters: {
+          type: 'object',
+          properties: {
+            limit: { type: 'integer', description: `Скільки листів, 1–${MAX_CAMPAIGN}; без значення — 10` },
+            min_days_since_visit: { type: 'integer', description: 'Не писати тим, хто був пізніше ніж стільки днів тому' },
+          },
+        },
+      },
+      run: async (a) => {
+        if (winbackProposed) throw new ToolInputError('Партію листів повернення вже запропоновано в цьому запиті. Нової не пропонуй.');
+        const limit = a.limit === undefined ? undefined : Number(a.limit);
+        const minDays = a.min_days_since_visit === undefined ? undefined : Number(a.min_days_since_visit);
+        if ((limit !== undefined && (!Number.isInteger(limit) || limit < 1)) || (minDays !== undefined && (!Number.isInteger(minDays) || minDays < 0))) {
+          throw new ToolInputError('limit and min_days_since_visit must be positive integers');
+        }
+        let payload;
+        try {
+          payload = await buildCampaignPayload(club.id, { limit, minDays, generate });
+        } catch (e) {
+          if (e instanceof ActionInvalidError) throw new ToolInputError(e.message);
+          throw e;
+        }
+        winbackProposed = true;
+        return propose('winback.campaign', payload);
+      },
     },
     {
       decl: {

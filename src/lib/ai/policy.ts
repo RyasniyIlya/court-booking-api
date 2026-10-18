@@ -169,6 +169,8 @@ export const toolScope: Record<string, ReadScope | null> = {
   propose_group_session: null,
   propose_cancel_group_session: null,
   propose_tournament_bracket: null,
+  /* Листи клієнтам: сама дія гейтиться режимом messaging, але кандидатів вона бере з бази клієнтів — тож потрібне й читання клієнтів. */
+  propose_winback: 'readCustomers',
   make_report: null,
 };
 
@@ -180,6 +182,7 @@ export const actionToolScope: Record<string, ActionScope | 'reports'> = {
   propose_group_session: 'groupSessions',
   propose_cancel_group_session: 'groupSessions',
   propose_tournament_bracket: 'tournaments',
+  propose_winback: 'messaging',
   make_report: 'reports',
 };
 

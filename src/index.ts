@@ -28,6 +28,7 @@ import { startMorningBriefScheduler } from './lib/morningBrief';
 import { startReminderScheduler } from './lib/remind';
 import { startPlayerScheduler } from './lib/playerRemind';
 import { startWinbackScheduler } from './lib/winback';
+import { startWinbackQueueScheduler } from './lib/ai/winbackCampaign';
 import { startRetentionScheduler } from './lib/dataRetention';
 import { handleUpdate } from './lib/botHandlers';
 import { processTelegramUpdate } from './lib/telegramReceipt';
@@ -247,6 +248,9 @@ app.listen(port, () => {
     // Повернення тих, хто давно не грав: раз на годину, вдень за часом клубу,
     // тільки за згодою гравця й лише там, де клуб це ввімкнув.
     startWinbackScheduler();
+
+    // Листи повернення від ІІ, що чекали денного вікна після затвердження власником.
+    startWinbackQueueScheduler();
 
     // Видалення даних клубів через 90 днів після розірвання (оферта п. 13.1).
     // Вимкнено без DATA_RETENTION_ENABLED=true; без DATA_RETENTION_DRY_RUN=false нічого не видаляє.
